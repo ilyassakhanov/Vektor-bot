@@ -11,11 +11,14 @@ from llm.ollama import OllamaLLM
 
 def _make_client(response: httpx.Response | Exception) -> httpx.Client:
     if isinstance(response, Exception):
+
         def handler(req: httpx.Request) -> httpx.Response:
             raise response
     else:
+
         def handler(req: httpx.Request) -> httpx.Response:
             return response
+
     return httpx.Client(transport=httpx.MockTransport(handler), timeout=5.0)
 
 

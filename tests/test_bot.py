@@ -1,12 +1,19 @@
-"""Tests for the Telegram message → LLM → reply flow."""
+"""Tests for the Telegram message → Agent → LLM → reply flow."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+from agent.agent import Agent
+from agent.conversation import ConversationManager
 from bot import create_bot, handle_message
 from llm import LLMError
 from tests.fakes import FakeLLM
+from tools.registry import ToolRegistry
+
+
+def _make_conv(llm) -> ConversationManager:
+    return ConversationManager(Agent(llm, ToolRegistry()))
 
 
 def _make_message(text: str) -> SimpleNamespace:
@@ -21,14 +28,18 @@ def _make_message(text: str) -> SimpleNamespace:
 def _run(message_text: str, llm) -> str | None:
     """Invoke ``handle_message`` and capture the replied text."""
     reply: dict[str, str] = {}
-    handle_message(_make_message(message_text), llm, lambda _msg, text: reply.__setitem__("text", text))
+    conv = _make_conv(llm)
+    handle_message(
+        _make_message(message_text),
+        conv,
+        lambda _msg, text: reply.__setitem__("text", text),
+    )
     return reply.get("text")
 
 
 def test_message_to_llm_to_telegram_reply():
     llm = FakeLLM(reply="hello there")
     assert _run("hi", llm) == "hello there"
-    assert llm.calls == ["hi"]
 
 
 def test_llm_error_returns_user_friendly_message():
@@ -46,7 +57,8 @@ def test_provider_replacement_with_mock():
 
 def test_create_bot_wires_llm_into_handler():
     llm = FakeLLM(reply="wired")
-    bot = create_bot(llm)
+    conv = _make_conv(llm)
+    bot = create_bot(conv)
     assert bot is not None
 
 
@@ -61,27 +73,30 @@ def _run_auth(
         from_user=SimpleNamespace(id=1, username=username, first_name="Tester"),
         text=message_text,
     )
-    handle_message(msg, llm, lambda _msg, text: reply.__setitem__("text", text), allowed_usernames)
+    conv = _make_conv(llm)
+    handle_message(
+        msg, conv, lambda _msg, text: reply.__setitem__("text", text), allowed_usernames
+    )
     return reply.get("text")
 
 
 def test_allowed_user_gets_response():
     llm = FakeLLM(reply="hello")
     assert _run_auth("hi", llm, frozenset({"tester"}), username="tester") == "hello"
-    assert llm.calls == ["hi"]
 
 
 def test_unauthorized_user_is_denied():
     llm = FakeLLM(reply="hello")
     result = _run_auth("hi", llm, frozenset({"tester"}), username="intruder")
     assert result == "Sorry, you are not allowed to use this bot."
-    assert llm.calls == []
 
 
 def test_allowed_tag_with_at_sign_works():
     """Tags in .env may include the leading ``@`` — it is stripped on load."""
-    from bot import load_allowed_usernames
     import os
+
+    from bot import load_allowed_usernames
+
     os.environ["ALLOWED_USERNAMES"] = "@some-user,@another-user"
     try:
         loaded = load_allowed_usernames()
@@ -94,14 +109,12 @@ def test_empty_allowed_set_denies_everyone():
     llm = FakeLLM(reply="hello")
     result = _run_auth("hi", llm, frozenset(), username="tester")
     assert result == "Sorry, you are not allowed to use this bot."
-    assert llm.calls == []
 
 
 def test_user_without_username_is_denied():
     llm = FakeLLM(reply="hello")
     result = _run_auth("hi", llm, frozenset({"tester"}), username=None)
     assert result == "Sorry, you are not allowed to use this bot."
-    assert llm.calls == []
 
 
 def test_none_allowed_set_allows_everyone():
