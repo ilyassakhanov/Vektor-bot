@@ -6,14 +6,14 @@ fields, and selects the correct CVE per the task rules.
 
 Algorithm:
 1. Extract CVEInfo from each raw record.
-2. Filter out CVEs without CVSS data (they cannot win).
-3. Find the latest publication timestamp among the remaining CVEs.
-4. Latest window = CVEs published within 5 minutes of that timestamp.
-5. Within the window, select the highest CVSS baseScore.
+2. Find the latest publication timestamp among ALL records.
+3. Latest window = CVEs published within 5 minutes of that timestamp.
+4. Within the window, ignore CVEs without CVSS data (they cannot win).
+5. Select the highest CVSS baseScore in the window.
 6. If scores tie, select the most recently published.
-7. Return the selected CVEInfo, or None if no CVE with CVSS exists.
+7. Return the selected CVEInfo, or None if no CVE with CVSS exists in the latest window.
 
-CVEs without CVSS are excluded before windowing — they don't participate.
+CVEs without CVSS may still define the latest window, but cannot be selected.
 """
 
 from __future__ import annotations
