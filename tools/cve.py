@@ -55,7 +55,10 @@ class CveTool(Tool):
         max_records: int = _DEFAULT_MAX_RECORDS,
     ) -> None:
         self._timeout = timeout
-        self._client = client or httpx.Client(timeout=timeout)
+        self._client = client or httpx.Client(
+            timeout=timeout,
+            headers={"User-Agent": "vektor-bot"},
+        )
         self._commit_count = commit_count
         self._max_records = max_records
 
