@@ -1,7 +1,7 @@
 # Vektor
 
 A simple Telegram bot that bridges chats to a local LLM (via [Ollama](https://ollama.com)). Uses long-polling — no webhook or server required.
-Has an extra ability to summarise latest CVE using build-in agent
+Includes a CVE summarizer that retrieves and summarizes the latest high-scoring CVE using the built-in agent.
 
 ## Features
 
