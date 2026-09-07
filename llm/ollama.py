@@ -169,6 +169,8 @@ def _parse_tool_call(raw: Any) -> ToolCall:
         raise LLMError("Malformed tool call in LLM response.")
     call_id = raw.get("id") or f"call_{uuid.uuid4().hex[:8]}"
     func = raw.get("function") or raw  # some providers nest, some don't
+    if not isinstance(func, dict):
+        func = {}
     name = func.get("name", "")
     args = func.get("arguments", {})
     if isinstance(args, str):
