@@ -210,7 +210,7 @@ def test_all_missing_cvss_returns_message():
     result = tool.execute()
 
     assert "none" in result.lower() or "no" in result.lower()
-    assert "CVSS" in result or "CVSS" not in result
+    assert "CVSS" in result
 
 
 def test_missing_cvss_cannot_win():
