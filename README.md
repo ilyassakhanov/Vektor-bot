@@ -1,6 +1,7 @@
 # Vektor
 
 A simple Telegram bot that bridges chats to a local LLM (via [Ollama](https://ollama.com)). Uses long-polling — no webhook or server required.
+Includes a CVE summarizer that retrieves and summarizes the latest high-scoring CVE using the built-in agent.
 
 ## Features
 
@@ -60,6 +61,15 @@ The Telegram handler depends only on the `LLM` interface (`llm/base.py`), never 
 
 1. Create `llm/<provider>.py` implementing `LLM`.
 2. Swap it in via `build_llm()` in `bot.py`.
+
+
+## Usage
+```
+/new - starta a new chat
+
+Mention <<using CVE skill>>
+example: Bring me up to speed with latest CVEs with cve skill
+```
 
 ### Project structure
 
