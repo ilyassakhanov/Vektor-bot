@@ -1,0 +1,21 @@
+# Prometheus POC values — official prometheus-community/prometheus chart.
+# External access via Traefik ingress; the host encodes the Traefik
+# LoadBalancer IP (nip.io). Change to your own DNS name if you have one.
+# Defaults kept: alertmanager, node-exporter, kube-state-metrics, pushgateway.
+# No persistence — POC only.
+
+server:
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - prometheus.192.168.5.15.nip.io
+
+# Scrape the Vektor bot running on the Rancher Desktop host. From inside the
+# cluster the macOS host is reachable at the Lima gateway IP (192.168.5.2).
+# The bot serves /metrics on METRICS_PORT (9101; 9100 is taken by node-exporter,
+# which Rancher Desktop forwards to the host).
+extraScrapeConfigs: |
+  - job_name: vektor-bot
+    static_configs:
+      - targets: ['192.168.5.2:9101']

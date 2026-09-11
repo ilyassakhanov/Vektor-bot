@@ -1,0 +1,47 @@
+# Loki POC values — official grafana/loki chart (6.x), single-binary mode.
+# auth_enabled: false → single-tenant; outside apps push/query without
+# an X-Scope-OrgID header. External access via Traefik ingress on the
+# gateway service; host encodes the Traefik LoadBalancer IP (nip.io).
+# Filesystem storage, no persistence — POC only.
+
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  # Minimal schema for a throwaway POC with no object storage
+  useTestSchema: true
+
+singleBinary:
+  replicas: 1
+
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+# Node has no memory headroom for memcached sidecars; not needed for a
+# single-binary POC.
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+
+gateway:
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - host: loki.192.168.5.15.nip.io
+        paths:
+          - path: /
+            pathType: Prefix
