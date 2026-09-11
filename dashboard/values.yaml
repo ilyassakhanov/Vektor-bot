@@ -1,0 +1,163 @@
+# Minimal Grafana POC values
+# Prometheus and Loki are external/out-of-scope; the URLs below follow the
+# default Service names of the prometheus-community/prometheus and grafana/loki
+# charts deployed into the "monitoring" namespace. Adjust if those teams
+# override their Service names.
+
+# No persistence, no exporters, no auth providers — POC only. One dashboard
+# (vektor-bot) is provisioned from inline JSON below.
+persistence:
+  enabled: false
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        url: http://prometheus-server.monitoring.svc.cluster.local:80
+        access: proxy
+        isDefault: true
+        editable: false
+      - name: Loki
+        uid: loki
+        type: loki
+        url: http://loki-gateway.monitoring.svc.cluster.local:80
+        access: proxy
+        isDefault: false
+        editable: false
+
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: false
+        editable: true
+        updateIntervalSeconds: 10
+        options:
+          path: /var/lib/grafana/dashboards/default
+
+dashboards:
+  default:
+    vektor-bot:
+      json: |
+        {
+          "annotations": { "list": [] },
+          "editable": true,
+          "graphTooltip": 0,
+          "refresh": "30s",
+          "schemaVersion": 39,
+          "tags": ["vektor"],
+          "time": { "from": "now-1h", "to": "now" },
+          "title": "Vektor Bot",
+          "uid": "vektor-bot",
+          "version": 1,
+          "panels": [
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+              "id": 1,
+              "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "sum by (model, direction) (rate(vektor_llm_tokens_total[5m]))",
+                  "legendFormat": "{{model}} {{direction}}",
+                  "refId": "A"
+                }
+              ],
+              "title": "LLM tokens/s by model and direction",
+              "type": "timeseries"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+              "id": 2,
+              "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "histogram_quantile(0.95, sum by (le, model) (rate(vektor_llm_latency_seconds_bucket[5m])))",
+                  "legendFormat": "{{model}} p95",
+                  "refId": "A"
+                }
+              ],
+              "title": "LLM call latency p95 by model",
+              "type": "timeseries"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+              "id": 3,
+              "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "sum by (tool_name, status) (rate(vektor_tool_calls_total[5m]))",
+                  "legendFormat": "{{tool_name}} {{status}}",
+                  "refId": "A"
+                }
+              ],
+              "title": "Tool calls/s by tool and status",
+              "type": "timeseries"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+              "id": 4,
+              "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "histogram_quantile(0.95, sum by (le) (rate(vektor_agent_iterations_bucket[5m])))",
+                  "legendFormat": "p95 iterations",
+                  "refId": "A"
+                }
+              ],
+              "title": "Agent loop iterations p95",
+              "type": "timeseries"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+              "gridPos": { "h": 4, "w": 24, "x": 0, "y": 16 },
+              "id": 5,
+              "options": { "colorMode": "value", "graphMode": "none" },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "sum(vektor_agent_max_iterations_reached_total)",
+                  "refId": "A"
+                }
+              ],
+              "title": "Agent runs that hit the max iteration limit (total)",
+              "type": "stat"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+              "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+              "id": 6,
+              "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "sum by (model) (rate(vektor_llm_cost_total[5m]))",
+                  "legendFormat": "{{model}}",
+                  "refId": "A"
+                }
+              ],
+              "title": "Notional LLM cost/s by model (USD)",
+              "type": "timeseries"
+            }
+          ]
+        }

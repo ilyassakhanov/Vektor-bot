@@ -16,10 +16,22 @@ class LLMError(Exception):
 
 
 @dataclass(frozen=True)
+class TokenUsage:
+    """Token / latency metadata reported by the provider for a single call."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    model: str = ""
+    latency_ns: int = 0
+
+
+@dataclass(frozen=True)
 class LLMResponse:
     """Provider-agnostic response returned by :meth:`LLM.generate`."""
 
     text: str
+    usage: TokenUsage | None = None
 
 
 # --- Conversation / tool-call types -----------------------------------------
@@ -68,6 +80,7 @@ class ChatResponse:
 
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: TokenUsage | None = None
 
 
 class LLM(ABC):

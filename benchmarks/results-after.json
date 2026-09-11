@@ -1,0 +1,331 @@
+[
+  {
+    "id": "chat-explain-cve",
+    "category": "chat",
+    "prompt": "Explain what a CVE is in two sentences.",
+    "reply_len": 435,
+    "input_tokens": 362,
+    "output_tokens": 151,
+    "cached_tokens": 0,
+    "llm_calls": 1,
+    "tool_calls": 0,
+    "latency_s": 8.2287,
+    "ok": true,
+    "failure": "",
+    "cost": 0.00031545,
+    "turns": 1,
+    "per_call": [
+      {
+        "input_tokens": 362,
+        "output_tokens": 151,
+        "cached_tokens": 0,
+        "latency_ns": 8226409583,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {}
+  },
+  {
+    "id": "chat-summarize",
+    "category": "chat",
+    "prompt": "Summarize how CVSS base scores work.",
+    "reply_len": 1592,
+    "input_tokens": 362,
+    "output_tokens": 501,
+    "cached_tokens": 0,
+    "llm_calls": 1,
+    "tool_calls": 0,
+    "latency_s": 24.145,
+    "ok": true,
+    "failure": "",
+    "cost": 0.00075295,
+    "turns": 1,
+    "per_call": [
+      {
+        "input_tokens": 362,
+        "output_tokens": 501,
+        "cached_tokens": 0,
+        "latency_ns": 24140699209,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {}
+  },
+  {
+    "id": "chat-risk-advice",
+    "category": "chat",
+    "prompt": "What should a small team do first when a critical vulnerability is announced for software they run?",
+    "reply_len": 1830,
+    "input_tokens": 370,
+    "output_tokens": 680,
+    "cached_tokens": 0,
+    "llm_calls": 1,
+    "tool_calls": 0,
+    "latency_s": 32.6714,
+    "ok": true,
+    "failure": "",
+    "cost": 0.0009795,
+    "turns": 1,
+    "per_call": [
+      {
+        "input_tokens": 370,
+        "output_tokens": 680,
+        "cached_tokens": 0,
+        "latency_ns": 32667355333,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {}
+  },
+  {
+    "id": "cve-latest-critical",
+    "category": "cve_tool",
+    "prompt": "What is the latest critical CVE? Give me its ID and score.",
+    "reply_len": 280,
+    "input_tokens": 1015,
+    "output_tokens": 165,
+    "cached_tokens": 362,
+    "llm_calls": 2,
+    "tool_calls": 1,
+    "latency_s": 11.1074,
+    "ok": true,
+    "failure": "",
+    "cost": 0.0004348,
+    "turns": 2,
+    "per_call": [
+      {
+        "input_tokens": 366,
+        "output_tokens": 91,
+        "cached_tokens": 0,
+        "latency_ns": 5506119625,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 649,
+        "output_tokens": 74,
+        "cached_tokens": 362,
+        "latency_ns": 4405083000,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {
+      "get_latest_cve": 842
+    }
+  },
+  {
+    "id": "cve-highest-score",
+    "category": "cve_tool",
+    "prompt": "Find the most severe recently published vulnerability and describe its impact.",
+    "reply_len": 1214,
+    "input_tokens": 1011,
+    "output_tokens": 862,
+    "cached_tokens": 360,
+    "llm_calls": 2,
+    "tool_calls": 1,
+    "latency_s": 42.8991,
+    "ok": true,
+    "failure": "",
+    "cost": 0.00130535,
+    "turns": 2,
+    "per_call": [
+      {
+        "input_tokens": 364,
+        "output_tokens": 90,
+        "cached_tokens": 0,
+        "latency_ns": 5441776667,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 647,
+        "output_tokens": 772,
+        "cached_tokens": 360,
+        "latency_ns": 36575212500,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {
+      "get_latest_cve": 842
+    }
+  },
+  {
+    "id": "cve-attack-vector",
+    "category": "cve_tool",
+    "prompt": "What is the attack vector of the newest high-severity CVE?",
+    "reply_len": 700,
+    "input_tokens": 1013,
+    "output_tokens": 531,
+    "cached_tokens": 361,
+    "llm_calls": 2,
+    "tool_calls": 1,
+    "latency_s": 28.9737,
+    "ok": true,
+    "failure": "",
+    "cost": 0.00089195,
+    "turns": 2,
+    "per_call": [
+      {
+        "input_tokens": 365,
+        "output_tokens": 90,
+        "cached_tokens": 0,
+        "latency_ns": 5532491083,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 648,
+        "output_tokens": 441,
+        "cached_tokens": 361,
+        "latency_ns": 21432710333,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {
+      "get_latest_cve": 842
+    }
+  },
+  {
+    "id": "tool-curl-check",
+    "category": "tool_chain",
+    "prompt": "Use curl to check that https://cve.org is reachable and tell me the status.",
+    "reply_len": 405,
+    "input_tokens": 817,
+    "output_tokens": 352,
+    "cached_tokens": 366,
+    "llm_calls": 2,
+    "tool_calls": 1,
+    "latency_s": 32.1866,
+    "ok": true,
+    "failure": "",
+    "cost": 0.00059785,
+    "turns": 2,
+    "per_call": [
+      {
+        "input_tokens": 370,
+        "output_tokens": 169,
+        "cached_tokens": 0,
+        "latency_ns": 13786713125,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 447,
+        "output_tokens": 183,
+        "cached_tokens": 366,
+        "latency_ns": 18183926834,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {
+      "exec": 33
+    }
+  },
+  {
+    "id": "tool-multi-step",
+    "category": "tool_chain",
+    "prompt": "Fetch the latest CVE and then verify the site you got it from is online.",
+    "reply_len": 696,
+    "input_tokens": 3057,
+    "output_tokens": 740,
+    "cached_tokens": 1902,
+    "llm_calls": 4,
+    "tool_calls": 3,
+    "latency_s": 39.1944,
+    "ok": true,
+    "failure": "",
+    "cost": 0.00132925,
+    "turns": 4,
+    "per_call": [
+      {
+        "input_tokens": 368,
+        "output_tokens": 248,
+        "cached_tokens": 0,
+        "latency_ns": 12371320458,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 651,
+        "output_tokens": 170,
+        "cached_tokens": 364,
+        "latency_ns": 8531452458,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 895,
+        "output_tokens": 69,
+        "cached_tokens": 647,
+        "latency_ns": 3935760125,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 1143,
+        "output_tokens": 253,
+        "cached_tokens": 891,
+        "latency_ns": 12212409584,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {
+      "get_latest_cve": 842,
+      "exec": 992
+    }
+  },
+  {
+    "id": "edge-one-word",
+    "category": "edge",
+    "prompt": "Hi.",
+    "reply_len": 32,
+    "input_tokens": 354,
+    "output_tokens": 53,
+    "cached_tokens": 0,
+    "llm_calls": 1,
+    "tool_calls": 0,
+    "latency_s": 3.8956,
+    "ok": true,
+    "failure": "",
+    "cost": 0.00019015,
+    "turns": 1,
+    "per_call": [
+      {
+        "input_tokens": 354,
+        "output_tokens": 53,
+        "cached_tokens": 0,
+        "latency_ns": 3894323416,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {}
+  },
+  {
+    "id": "edge-long",
+    "category": "edge",
+    "prompt": "I am trying to understand vulnerability trends for our quarterly security review. Please analyze how the landscape of published vulnerabilities has been evolving, what kinds of products and vendors appear most often in recent high-severity CVEs, which attack vectors seem most common, and what that suggests about where our small infrastructure team should focus its patching and monitoring effort over the next quarter. Keep the analysis factual.",
+    "reply_len": 3390,
+    "input_tokens": 1141,
+    "output_tokens": 1156,
+    "cached_tokens": 425,
+    "llm_calls": 2,
+    "tool_calls": 1,
+    "latency_s": 56.0766,
+    "ok": true,
+    "failure": "",
+    "cost": 0.0016956,
+    "turns": 2,
+    "per_call": [
+      {
+        "input_tokens": 429,
+        "output_tokens": 156,
+        "cached_tokens": 0,
+        "latency_ns": 8354887375,
+        "model": "qwen3.5:9b"
+      },
+      {
+        "input_tokens": 712,
+        "output_tokens": 1000,
+        "cached_tokens": 425,
+        "latency_ns": 46484747458,
+        "model": "qwen3.5:9b"
+      }
+    ],
+    "tool_result_chars": {
+      "get_latest_cve": 842
+    }
+  }
+]

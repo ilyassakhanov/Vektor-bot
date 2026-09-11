@@ -27,9 +27,18 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `TELEGRAM_BOT_TOKEN` | yes | Telegram bot token (must contain a colon — TeleBot validates) |
 | `OLLAMA_BASE_URL` | no | Ollama HTTP base URL (default `http://localhost:11434`) |
 | `OLLAMA_MODEL` | no | Ollama model name (default `llama3.2`) |
+| `OLLAMA_NUM_CTX` | no | Ollama context window size sent as payload `options.num_ctx`; unset = Ollama's own default (a too-small value silently truncates context — set only if prompts approach the default window) |
+| `OLLAMA_KEEP_ALIVE` | no | Ollama model keep-alive duration (e.g. `30m`) sent as payload `keep_alive` — keeps the model (and its prompt cache) loaded between calls; unset = Ollama default |
 | `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed) |
 | `EXEC_TIMEOUT` | no | Timeout in seconds for the `exec` tool (default `30`) |
+| `EXEC_MAX_OUTPUT_CHARS` | no | Cap for tool output (combined exec stdout/stderr body and CVE fact sheet); over-cap output keeps head+tail with a `... [truncated N chars] ...` marker, exit-code line always preserved (default `4000`) |
 | `AGENT_MAX_ITERATIONS` | no | Maximum agent loop iterations (default `8`) |
+| `CONVERSATION_MAX_MESSAGES` | no | Maximum messages kept per chat conversation; oldest trimmed after each agent run, latest user message always kept (default `12`) |
+| `LLM_PRICE_IN_PER_1M` | no | Notional input price in $/1M tokens for `estimate_cost` (default table value `0.35`; prices are notional — local Ollama costs $0) |
+| `LLM_PRICE_OUT_PER_1M` | no | Notional output price in $/1M tokens for `estimate_cost` (default table value `1.25`; prices are notional — local Ollama costs $0) |
+| `METRICS_PORT` | no | Prometheus metrics port (default `9100`; use `9101` when the dashboard stack is up — Rancher Desktop forwards node-exporter's 9100 to the host) |
+| `LOKI_PUSH_URL` | no | Loki push endpoint; empty = logs only to stderr |
+| `LOG_LEVEL` | no | Log level (default `INFO`) |
 
 ## Project structure
 
@@ -48,8 +57,15 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `tools/registry.py` | `ToolRegistry` — agent invokes tools via registry |
 | `tools/exec.py` | `ExecTool` — generic shell execution with timeout, returns stdout/stderr/exit code |
 | `tools/cve.py` | `CveTool` — retrieves recent CVE records and selects the most critical one programmatically |
+| `tools/truncation.py` | `truncate()` — shared head+tail tool-output truncation; `EXEC_MAX_OUTPUT_CHARS` resolution |
 | `skills/loader.py` | `SkillLoader` — discovers `.md` skill files dynamically |
 | `skills/cve.md` | CVE workflow skill — instructions for using the `get_latest_cve` tool |
+| `metrics.py` | Prometheus metric definitions (`vektor_*`) and metrics server startup |
+| `logging_config.py` | JSON logging, sensitive-data redaction, optional Loki wiring |
+| `loki_handler.py` | `LokiPushHandler` — batches log records and pushes them to Loki |
+| `llm/instrumented.py` | `InstrumentedLLM` — records token/latency/cost metrics around an LLM |
+| `tools/instrumented_registry.py` | `InstrumentedToolRegistry` — records tool call/duration metrics |
+| `benchmarks/` | LLM benchmark prompts (`prompts.json`) and runner (`run.py`) — requires Ollama |
 | `mypy.ini` | mypy configuration |
 
 ## Architecture
@@ -84,8 +100,8 @@ The agent receives a user message, calls the LLM with conversation history, tool
 
 The Agent invokes tools through the `ToolRegistry`, never directly. Adding a tool requires only implementing `Tool` and registering it — the agent loop does not change.
 
-- `ExecTool` — executes a shell command, returns stdout/stderr/exit code, enforces a configurable timeout. Generic — no CVE-specific logic.
-- `CveTool` — retrieves recent CVE records from official CVE.org endpoints and selects the most critical one programmatically (via `select_cve()`). Returns a compact fact sheet so the LLM only needs to summarize — no JSON parsing, score comparison, or windowing on the LLM side.
+- `ExecTool` — executes a shell command, returns stdout/stderr/exit code, enforces a configurable timeout. Generic — no CVE-specific logic. Combined stdout/stderr is capped at `EXEC_MAX_OUTPUT_CHARS` (head+tail with a truncation marker; the `exit_code:` line is always preserved).
+- `CveTool` — retrieves recent CVE records from official CVE.org endpoints and selects the most critical one programmatically (via `select_cve()`). Returns a compact fact sheet so the LLM only needs to summarize — no JSON parsing, score comparison, or windowing on the LLM side. The fact sheet is capped with the same `EXEC_MAX_OUTPUT_CHARS` truncation.
 
 ### Skills
 
@@ -106,6 +122,10 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 5. Within the window, select the highest CVSS baseScore.
 6. If scores tie, select the most recently published.
 7. Returns None if no CVE with CVSS exists in the latest window.
+
+### Observability
+
+`build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
 
 ## Code conventions
 
@@ -135,6 +155,7 @@ python -m pytest
 - CVE selector tests use raw CVE record dicts — no network access needed.
 - CveTool tests use `httpx.MockTransport` — no network access needed.
 - Integration tests (`tests/test_cve_integration.py`) are skipped when CVE.org is unreachable.
+- Benchmarks run via `python -m benchmarks.run` (requires a running Ollama) and are excluded from pytest.
 
 ### Test coverage
 

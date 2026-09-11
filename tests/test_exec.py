@@ -114,3 +114,73 @@ def test_exec_custom_timeout():
     tool = ExecTool(timeout=1.0)
     result = tool.execute(command="echo fast")
     assert "fast" in result
+
+
+# --- Output truncation ------------------------------------------------------
+
+
+def test_exec_short_output_unchanged():
+    tool = ExecTool(timeout=10.0)
+    result = tool.execute(command="echo hello")
+    assert result == "stdout:\nhello\n\nstderr:\n\nexit_code: 0"
+
+
+def test_exec_long_stdout_truncated_with_marker():
+    tool = ExecTool(timeout=10.0, max_output_chars=200)
+    result = tool.execute(command="python3 -c \"print('x' * 5000)\"")
+    assert "[truncated " in result
+    assert result.startswith("stdout:\nx")
+    assert result.endswith("\nexit_code: 0")
+    body = result[: -len("\nexit_code: 0")]
+    assert len(body) <= 200
+
+
+def test_exec_truncation_preserves_exit_code_line():
+    tool = ExecTool(timeout=10.0, max_output_chars=200)
+    result = tool.execute(
+        command="python3 -c \"print('x' * 5000); import sys; sys.exit(3)\""
+    )
+    assert "[truncated " in result
+    assert result.endswith("\nexit_code: 3")
+    body = result[: -len("\nexit_code: 3")]
+    assert len(body) <= 200
+
+
+def test_exec_stderr_also_truncated():
+    tool = ExecTool(timeout=10.0, max_output_chars=200)
+    result = tool.execute(
+        command="python3 -c \"import sys; sys.stderr.write('e' * 5000)\""
+    )
+    assert "[truncated " in result
+    assert result.startswith("stdout:\n\nstderr:\ne")
+    assert result.endswith("\nexit_code: 0")
+    body = result[: -len("\nexit_code: 0")]
+    assert len(body) <= 200
+
+
+def test_exec_large_cap_disables_truncation():
+    tool = ExecTool(timeout=10.0, max_output_chars=10**7)
+    result = tool.execute(command="python3 -c \"print('x' * 5000)\"")
+    assert "[truncated" not in result
+    stdout = result.split("stdout:\n")[1].split("\nstderr:")[0]
+    assert stdout == "x" * 5000 + "\n"
+
+
+def test_exec_env_cap_applied(monkeypatch):
+    monkeypatch.setenv("EXEC_MAX_OUTPUT_CHARS", "150")
+    tool = ExecTool(timeout=10.0)
+    result = tool.execute(command="python3 -c \"print('x' * 5000)\"")
+    assert "[truncated " in result
+    assert result.endswith("\nexit_code: 0")
+    body = result[: -len("\nexit_code: 0")]
+    assert len(body) <= 150
+
+
+def test_exec_invalid_env_cap_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("EXEC_MAX_OUTPUT_CHARS", "abc")
+    tool = ExecTool(timeout=10.0)
+    result = tool.execute(command="python3 -c \"print('x' * 5000)\"")
+    assert "[truncated " in result
+    assert result.endswith("\nexit_code: 0")
+    body = result[: -len("\nexit_code: 0")]
+    assert len(body) <= 4000

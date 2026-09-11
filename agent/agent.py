@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import logging
 
+import metrics
 from llm.base import LLM, Message
 from tools.registry import ToolRegistry
 
 log = logging.getLogger("vektor.agent")
 
 _DEFAULT_MAX_ITERATIONS = 8
+
+MAX_ITERATIONS_REPLY = (
+    "I reached the maximum number of iterations"
+    " ({max_iterations}) without producing a final answer."
+)
 
 
 class Agent:
@@ -65,6 +71,7 @@ class Agent:
             if not response.tool_calls:
                 log.info("LLM returned final answer at iteration %d", iteration + 1)
                 messages.append(Message(role="assistant", content=response.content))
+                metrics.agent_iterations.observe(iteration + 1)
                 return response.content
 
             assistant_msg = Message(
@@ -76,7 +83,7 @@ class Agent:
 
             for tc in response.tool_calls:
                 result = self._tools.execute(tc.name, **tc.arguments)
-                log.info("tool %s result: %s", tc.name, result[:200])
+                log.info("tool %s executed", tc.name)
                 tool_msg = Message(
                     role="tool",
                     content=result,
@@ -85,9 +92,8 @@ class Agent:
                 messages.append(tool_msg)
 
         log.warning("Max iterations (%d) reached", self._max_iterations)
-        msg = (
-            "I reached the maximum number of iterations"
-            f" ({self._max_iterations}) without producing a final answer."
-        )
+        metrics.agent_iterations.observe(self._max_iterations)
+        metrics.agent_max_iterations_reached_total.inc()
+        msg = MAX_ITERATIONS_REPLY.format(max_iterations=self._max_iterations)
         messages.append(Message(role="assistant", content=msg))
         return msg

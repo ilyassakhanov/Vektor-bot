@@ -1,0 +1,33 @@
+<task>
+Create a minimal Grafana POC deployment in the existing Kubernetes cluster using the official Grafana Helm chart.
+
+<requirements>
+- Use Helm.
+- Create a minimal `values.yaml`.
+- Configure Prometheus and Loki as Grafana datasources.
+- Prometheus must be the default datasource.
+- Use Kubernetes Service DNS names for both datasources.
+- Make the Prometheus and Loki URLs configurable in `values.yaml`.
+- Enable Grafana ingress only if needed to access the POC; keep it minimal.
+- Do not deploy Prometheus or Loki.
+- Do not add persistence, dashboards, exporters, OpenTelemetry, authentication configuration, or other production features unless required for the basic POC.
+</requirements>
+
+<deliverables>
+1. `values.yaml`
+2. Exact Helm commands to:
+   - add/update the Grafana Helm repository
+   - create the namespace
+   - install/upgrade Grafana
+   - verify the deployment
+3. Brief instructions for accessing Grafana and verifying that Prometheus and Loki datasources work.
+
+First inspect the cluster to determine the existing Prometheus and Loki Service names/namespaces. Use those values in the configuration rather than guessing. </deliverables>
+
+<constraints>
+Keep the implementation as small as possible. This is a proof of concept, not a production deployment.
+Do not create unnecessary Kubernetes manifests or application code.
+</constraints>
+
+---Fix-prompt-----
+have a look at @dashboard/ . This bot has to send metrics to this dashboard. What find out why it can't start up when dashboard is running. I have started up the dashboard

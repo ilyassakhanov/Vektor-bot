@@ -9,10 +9,13 @@ All tests use ScriptedLLM / FakeLLM — no Ollama dependency.
 
 from __future__ import annotations
 
-import pytest
+import itertools
 
-from agent.agent import Agent
-from llm.base import ChatResponse, LLMError, ToolCall
+import pytest
+from prometheus_client import REGISTRY
+
+from agent.agent import MAX_ITERATIONS_REPLY, Agent
+from llm.base import ChatResponse, LLMError, Message, ToolCall
 from tests.fakes import ScriptedLLM
 from tools.base import Tool, ToolError
 from tools.registry import ToolRegistry
@@ -227,6 +230,29 @@ def test_agent_max_iterations_configurable():
     assert len(llm.chat_calls) == 3
 
 
+def test_max_iterations_reply_template_constant():
+    reply = MAX_ITERATIONS_REPLY.format(max_iterations=3)
+    assert "3" in reply
+    assert "maximum" in reply.lower()
+
+
+def test_agent_fallback_reply_matches_constant():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id=f"tc{i}", name="echo", arguments={"message": "x"})
+                ],
+            )
+            for i in range(100)
+        ]
+    )
+    agent = Agent(llm, _make_registry(EchoTool()), max_iterations=3)
+    result = agent.run("loop")
+    assert result == MAX_ITERATIONS_REPLY.format(max_iterations=3)
+
+
 def test_agent_stops_when_max_reached_even_without_tool_calls():
     """If the LLM keeps returning empty content without tool calls, the agent
     should not loop forever."""
@@ -372,3 +398,131 @@ def test_agent_works_with_fake_llm():
     agent = Agent(llm, _make_registry())
     result = agent.run("hi")
     assert result == "fake response"
+
+
+# --- Agent iteration metrics -------------------------------------------------
+
+
+def _sample(name: str) -> float:
+    return REGISTRY.get_sample_value(name) or 0.0
+
+
+def test_agent_records_iteration_count():
+    llm = ScriptedLLM([ChatResponse(content="answer")])
+    agent = Agent(llm, _make_registry())
+    count_before = _sample("vektor_agent_iterations_count")
+    sum_before = _sample("vektor_agent_iterations_sum")
+    agent.run("hi")
+    assert _sample("vektor_agent_iterations_count") - count_before == 1.0
+    assert _sample("vektor_agent_iterations_sum") - sum_before == 1.0
+
+
+def test_agent_records_iteration_count_multi():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="tc1", name="echo", arguments={"message": "a"})
+                ],
+            ),
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="tc2", name="echo", arguments={"message": "b"})
+                ],
+            ),
+            ChatResponse(content="done"),
+        ]
+    )
+    agent = Agent(llm, _make_registry(EchoTool()))
+    count_before = _sample("vektor_agent_iterations_count")
+    sum_before = _sample("vektor_agent_iterations_sum")
+    result = agent.run("go")
+    assert result == "done"
+    assert _sample("vektor_agent_iterations_sum") - sum_before == 3.0
+    assert _sample("vektor_agent_iterations_count") - count_before == 1.0
+
+
+def test_agent_records_max_iterations_reached():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id=f"tc{i}", name="echo", arguments={"message": "x"})
+                ],
+            )
+            for i in range(100)
+        ]
+    )
+    agent = Agent(llm, _make_registry(EchoTool()), max_iterations=3)
+    max_before = _sample("vektor_agent_max_iterations_reached_total")
+    sum_before = _sample("vektor_agent_iterations_sum")
+    agent.run("loop")
+    assert _sample("vektor_agent_max_iterations_reached_total") - max_before == 1.0
+    assert _sample("vektor_agent_iterations_sum") - sum_before == 3.0
+
+
+def test_agent_max_iterations_not_reached_on_normal():
+    llm = ScriptedLLM([ChatResponse(content="answer")])
+    agent = Agent(llm, _make_registry())
+    max_before = _sample("vektor_agent_max_iterations_reached_total")
+    agent.run("hi")
+    assert _sample("vektor_agent_max_iterations_reached_total") - max_before == 0.0
+
+
+# --- Prompt-cache prefix stability -------------------------------------------
+
+
+def test_agent_system_prompt_identical_across_turns():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="tc1", name="echo", arguments={"message": "a"})
+                ],
+            ),
+            ChatResponse(content="first answer"),
+            ChatResponse(content="second answer"),
+        ]
+    )
+    agent = Agent(
+        llm,
+        _make_registry(EchoTool()),
+        system_prompt="You are a CVE analyst. Use get_latest_cve. Never fabricate.",
+    )
+    messages: list[Message] = []
+    agent.run("first question", messages)
+    agent.run("second question", messages)
+    assert len(llm.chat_calls) == 3
+    systems = [call[2] for call in llm.chat_calls]
+    assert systems[0] != ""
+    assert systems == [systems[0]] * len(systems)
+
+
+def test_agent_message_prefix_stable_across_iterations():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="tc1", name="echo", arguments={"message": "a"})
+                ],
+            ),
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="tc2", name="echo", arguments={"message": "b"})
+                ],
+            ),
+            ChatResponse(content="done"),
+        ]
+    )
+    agent = Agent(llm, _make_registry(EchoTool()), system_prompt="system")
+    agent.run("go")
+    calls = [call[0] for call in llm.chat_calls]
+    assert len(calls) == 3
+    for prev, cur in itertools.pairwise(calls):
+        assert cur[: len(prev)] == prev

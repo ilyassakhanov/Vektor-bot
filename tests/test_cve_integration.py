@@ -43,7 +43,10 @@ def _is_online(url: str) -> bool:
 
 @pytest.fixture
 def exec_tool() -> ExecTool:
-    return ExecTool(timeout=30.0)
+    # Large cap: these end-to-end tests parse full curl'd CVE JSON records
+    # (~5 KB); truncation behavior is covered deterministically in
+    # tests/test_exec.py.
+    return ExecTool(timeout=30.0, max_output_chars=10**7)
 
 
 @pytest.fixture

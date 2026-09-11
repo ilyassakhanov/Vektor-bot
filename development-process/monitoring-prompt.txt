@@ -1,0 +1,180 @@
+<role>
+Act as a Senior Python/DevOps Engineer. Audit the existing project before implementation of an AI-agent observability and token-optimization layer.
+</role>
+
+<context>
+Grafana, Prometheus, and Loki are already running in the local Rancher/Kubernetes environment.
+
+The application is a Python Telegram AI agent using:
+
+* Ollama as the LLM provider
+* an agentic loop
+* tools
+* skills
+* per-task/chat execution
+
+The next project phase will add monitoring, token accounting, cost estimation, benchmarking, and token optimizations.
+
+Do NOT implement the monitoring or optimization yet. </context>
+
+<objective>
+Verify that the existing project and infrastructure contain everything required to implement the observability subproject cleanly.
+
+Inspect the repository, application architecture, Kubernetes/Rancher environment, and available Grafana/Prometheus/Loki endpoints/configuration.
+
+Identify missing, incompatible, or risky prerequisites. </objective>
+
+<checks>
+
+<application>
+Verify:
+- LLM calls have a central/interceptable execution point suitable for middleware/instrumentation.
+- Ollama calls expose enough information to measure latency and token usage.
+- Agent runs have identifiable task/run boundaries.
+- Agent turns/iterations can be counted.
+- Tool execution has a central registry or execution point that can be instrumented.
+- Tool names, inputs, outputs, and execution duration can be captured.
+- Agent/chat/task context can be identified without exposing sensitive content.
+- Existing tests provide suitable seams for mocking LLM and tool calls.
+</application>
+
+<llm>
+Determine exactly what token metadata Ollama currently provides.
+
+Check whether the implementation can obtain:
+
+* input/prompt tokens
+* output/completion tokens
+* cached tokens, if available
+* reasoning tokens, if available
+* model name
+* latency
+
+Do not assume that Ollama provides every field.
+Document which fields are actually available and which must be estimated or recorded as unavailable. </llm>
+
+<observability>
+Verify application connectivity to:
+- Prometheus
+- Loki
+
+Determine the appropriate integration approach for this Python application.
+
+Verify that:
+
+* Prometheus can scrape application metrics.
+* Loki can receive application logs.
+* labels can identify relevant agent/task/model/tool dimensions without creating excessive cardinality.
+* observability data can survive application restarts using the existing infrastructure.
+
+Do not introduce OpenTelemetry, Tempo, Jaeger, or another tracing system. </observability>
+
+<grafana>
+Verify that Grafana can query:
+- Prometheus
+- Loki
+
+Check whether existing dashboards/data sources can support:
+
+* aggregate token usage
+* estimated cost
+* task/run statistics
+* LLM latency
+* tool usage
+* tool duration
+* optimization comparison
+* token-consumption breakdown
+
+Do not modify Grafana. </grafana>
+
+<benchmarking>
+Inspect the repository for existing tests or workloads that could become representative benchmark tasks.
+
+Determine whether there is enough existing test coverage to measure:
+
+* task success/failure
+* baseline token consumption
+* optimized token consumption
+* latency
+* tool-call count
+
+If a suitable benchmark suite does not exist, explicitly identify this as a prerequisite for the next phase.
+Do not create the benchmark suite yet. </benchmarking>
+
+<architecture>
+Verify that the planned observability architecture is feasible:
+
+Agent
+-> LLM middleware -> Prometheus/Loki
+-> Tool middleware -> Prometheus/Loki
+
+Grafana
+-> Prometheus
+-> Loki
+
+No additional persistence/database should be required in the application. </architecture>
+
+<security>
+Check whether proposed metrics/logs could accidentally expose:
+- Telegram messages
+- prompts
+- full LLM responses
+- credentials
+- tokens/secrets
+- sensitive tool input/output
+
+Recommend what should be measured versus what should never be logged.
+Do not make security changes yet. </security>
+
+</checks>
+
+<output>
+Produce a concise prerequisite audit with these sections:
+
+1. STATUS
+
+   * READY
+   * READY WITH GAPS
+   * BLOCKED
+
+2. VERIFIED
+   List prerequisites that are already satisfied.
+
+3. MISSING
+   List prerequisites that must be added before implementation.
+
+4. RISKS
+   Identify architectural or implementation risks.
+
+5. OLLAMA TOKEN CAPABILITIES
+   Clearly distinguish available, unavailable, and estimated token fields.
+
+6. BENCHMARK READINESS
+   State whether existing tests/workloads are sufficient.
+   If not, describe what the next phase must add.
+
+7. RECOMMENDED NEXT STEPS
+   Give an ordered implementation plan for the observability subproject.
+
+8. FILES TO CHANGE
+   Identify likely existing files/modules that will need modification.
+   Do not modify them.
+
+9. ACCEPTANCE CHECKLIST
+   Provide a checklist that can be used before starting implementation.
+
+   </output>
+
+<constraints>
+- Do not modify application code.
+- Do not modify Kubernetes resources.
+- Do not modify Grafana, Prometheus, or Loki.
+- Do not install dependencies.
+- Do not create dashboards.
+- Do not implement instrumentation.
+- Do not implement optimizations.
+- Do not invent capabilities that are not present.
+- Inspect the actual repository and configuration before making conclusions.
+- Prefer existing architecture and extension points over introducing new abstractions.
+- Keep the audit concise and actionable.
+</constraints>
