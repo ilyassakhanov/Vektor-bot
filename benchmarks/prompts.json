@@ -1,0 +1,52 @@
+[
+  {
+    "id": "chat-explain-cve",
+    "category": "chat",
+    "prompt": "Explain what a CVE is in two sentences."
+  },
+  {
+    "id": "chat-summarize",
+    "category": "chat",
+    "prompt": "Summarize how CVSS base scores work."
+  },
+  {
+    "id": "chat-risk-advice",
+    "category": "chat",
+    "prompt": "What should a small team do first when a critical vulnerability is announced for software they run?"
+  },
+  {
+    "id": "cve-latest-critical",
+    "category": "cve_tool",
+    "prompt": "What is the latest critical CVE? Give me its ID and score."
+  },
+  {
+    "id": "cve-highest-score",
+    "category": "cve_tool",
+    "prompt": "Find the most severe recently published vulnerability and describe its impact."
+  },
+  {
+    "id": "cve-attack-vector",
+    "category": "cve_tool",
+    "prompt": "What is the attack vector of the newest high-severity CVE?"
+  },
+  {
+    "id": "tool-curl-check",
+    "category": "tool_chain",
+    "prompt": "Use curl to check that https://cve.org is reachable and tell me the status."
+  },
+  {
+    "id": "tool-multi-step",
+    "category": "tool_chain",
+    "prompt": "Fetch the latest CVE and then verify the site you got it from is online."
+  },
+  {
+    "id": "edge-one-word",
+    "category": "edge",
+    "prompt": "Hi."
+  },
+  {
+    "id": "edge-long",
+    "category": "edge",
+    "prompt": "I am trying to understand vulnerability trends for our quarterly security review. Please analyze how the landscape of published vulnerabilities has been evolving, what kinds of products and vendors appear most often in recent high-severity CVEs, which attack vectors seem most common, and what that suggests about where our small infrastructure team should focus its patching and monitoring effort over the next quarter. Keep the analysis factual."
+  }
+]
