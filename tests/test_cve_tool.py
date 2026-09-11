@@ -89,6 +89,14 @@ def test_tool_description_mentions_cve():
     assert "CVE" in tool.description
 
 
+def test_cve_tool_description_compact():
+    """O4: the description is re-sent to the LLM on every call — keep it
+    short while still naming the selection rule and the trigger questions."""
+    tool = CveTool(client=_make_client(lambda r: httpx.Response(200, json=[])))
+    assert len(tool.description) <= 140
+    assert "highest CVSS" in tool.description
+
+
 def test_tool_parameters_no_required_args():
     tool = CveTool(client=_make_client(lambda r: httpx.Response(200, json=[])))
     params = tool.parameters
@@ -411,3 +419,54 @@ def test_result_includes_note_about_programmatic_selection():
     result = tool.execute()
 
     assert "programmatically" in result.lower()
+
+
+# --- Fact-sheet truncation --------------------------------------------------
+
+
+def test_cve_fact_sheet_capped_when_description_huge():
+    cve = _make_cve(
+        "CVE-2026-0001",
+        "2026-08-28T15:23:00Z",
+        score=9.8,
+        description="D" * 5000,
+    )
+    commits = _commits_response(["CVE-2026-0001"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            return httpx.Response(200, json=commits)
+        return httpx.Response(200, json=cve)
+
+    tool = CveTool(client=_make_client(handler), max_output_chars=600)
+    result = tool.execute()
+
+    assert len(result) <= 600
+    assert "[truncated " in result
+    assert "CVE_ID: CVE-2026-0001" in result
+    assert "CVSS_SCORE: 9.8" in result
+    assert "DATA_SOURCE" in result
+    assert "Do not fabricate" in result
+
+
+def test_cve_fact_sheet_short_unchanged():
+    cve = _make_cve(
+        "CVE-2026-0001",
+        "2026-08-28T15:23:00Z",
+        score=9.8,
+        description="Buffer overflow in product X",
+    )
+    commits = _commits_response(["CVE-2026-0001"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            return httpx.Response(200, json=commits)
+        return httpx.Response(200, json=cve)
+
+    tool = CveTool(client=_make_client(handler))
+    result = tool.execute()
+
+    assert "[truncated" not in result
+    assert "CVE_ID: CVE-2026-0001" in result
+    assert "Buffer overflow in product X" in result
+    assert "DATA_SOURCE: CVE.org" in result

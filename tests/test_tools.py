@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from tools.base import Tool, ToolError
@@ -48,6 +50,44 @@ class FailingTool(Tool):
 
     def execute(self, **kwargs: object) -> str:
         raise ToolError("boom")
+
+
+class SecretFailingTool(Tool):
+    """Test-only tool that fails with a secret-bearing message."""
+
+    @property
+    def name(self) -> str:
+        return "secretfail"
+
+    @property
+    def description(self) -> str:
+        return "Always fails, message contains a secret."
+
+    @property
+    def parameters(self) -> dict[str, object]:
+        return {"type": "object", "properties": {}}
+
+    def execute(self, **kwargs: object) -> str:
+        raise ToolError("boom SECRETARG")
+
+
+class CrashingTool(Tool):
+    """Test-only tool that raises an unexpected exception with a secret."""
+
+    @property
+    def name(self) -> str:
+        return "crash"
+
+    @property
+    def description(self) -> str:
+        return "Always crashes, message contains a secret."
+
+    @property
+    def parameters(self) -> dict[str, object]:
+        return {"type": "object", "properties": {}}
+
+    def execute(self, **kwargs: object) -> str:
+        raise RuntimeError("crash SECRETDATA")
 
 
 # --- Tool base class --------------------------------------------------------
@@ -117,6 +157,27 @@ def test_registry_execute_tool_failure_returns_error_not_raise():
     result = reg.execute("fail")
     assert "boom" in result
     assert "error" in result.lower() or "fail" in result.lower()
+
+
+def test_registry_error_log_contains_no_exception_content(caplog):
+    reg = ToolRegistry()
+    reg.register(SecretFailingTool())
+    with caplog.at_level(logging.WARNING):
+        result = reg.execute("secretfail")
+    assert "SECRETARG" in result
+    for record in caplog.records:
+        assert "SECRETARG" not in record.getMessage()
+
+
+def test_registry_unexpected_exception_log_sanitized(caplog):
+    reg = ToolRegistry()
+    reg.register(CrashingTool())
+    with caplog.at_level(logging.WARNING):
+        result = reg.execute("crash")
+    assert "SECRETDATA" in result
+    for record in caplog.records:
+        assert "SECRETDATA" not in record.getMessage()
+    assert any("RuntimeError" in record.getMessage() for record in caplog.records)
 
 
 def test_registry_no_tools_empty_specs():

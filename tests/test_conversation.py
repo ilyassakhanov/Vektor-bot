@@ -201,3 +201,164 @@ def test_new_confirmation_message():
     result = conv.handle("42", "/new")
     assert isinstance(result, str)
     assert len(result) > 0
+
+
+# --- History trimming -------------------------------------------------------
+
+
+def test_trim_keeps_recent_messages():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(content="answer 1"),
+            ChatResponse(content="answer 2"),
+            ChatResponse(content="answer 3"),
+            ChatResponse(content="answer 4"),
+            ChatResponse(content="answer 5"),
+        ]
+    )
+    conv = ConversationManager(_make_agent(llm), max_messages=4)
+    for i in range(1, 6):
+        conv.handle("42", f"question {i}")
+    # The 5th LLM call sees the newest 4 kept messages + the just-appended
+    # user message; the two oldest exchanges are gone.
+    fifth_msgs = llm.chat_calls[4][0]
+    assert len(fifth_msgs) == 5
+    assert [m.role for m in fifth_msgs] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert [m.content for m in fifth_msgs] == [
+        "question 3",
+        "answer 3",
+        "question 4",
+        "answer 4",
+        "question 5",
+    ]
+
+
+def test_trim_never_drops_latest_user_message():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc1", name="stub", arguments={})],
+            ),
+            ChatResponse(content="tool done"),
+            ChatResponse(content="follow up answer"),
+        ]
+    )
+    reg = ToolRegistry()
+    reg.register(StubTool())
+    conv = ConversationManager(_make_agent(llm, reg), max_messages=2)
+    conv.handle("42", "please use the tool")
+    conv.handle("42", "follow up")
+    # The tool turn left 4 stored messages; with cap=2 the trim still keeps
+    # the turn's user message instead of slicing it away.
+    second_msgs = llm.chat_calls[2][0]
+    assert len(second_msgs) == 5
+    assert second_msgs[0].role == "user"
+    assert second_msgs[0].content == "please use the tool"
+    assert any(m.role == "assistant" and m.content == "tool done" for m in second_msgs)
+
+
+def test_trim_safe_boundary_first_message_is_user():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc1", name="stub", arguments={})],
+            ),
+            ChatResponse(content="done with tool"),
+            ChatResponse(content="second answer"),
+            ChatResponse(content="third answer"),
+        ]
+    )
+    reg = ToolRegistry()
+    reg.register(StubTool())
+    conv = ConversationManager(_make_agent(llm, reg), max_messages=4)
+    conv.handle("42", "first question")
+    conv.handle("42", "second question")
+    conv.handle("42", "third question")
+    # A naive newest-4 slice would start with the orphan tool message; the
+    # safe boundary drops it so the first kept message has role "user".
+    third_msgs = llm.chat_calls[3][0]
+    assert [m.role for m in third_msgs] == ["user", "assistant", "user"]
+    assert third_msgs[0].content == "second question"
+    assert all(m.role != "tool" for m in third_msgs)
+
+
+def test_new_still_clears_after_trimming():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(content="first answer"),
+            ChatResponse(content="second answer"),
+            ChatResponse(content="fresh answer"),
+        ]
+    )
+    conv = ConversationManager(_make_agent(llm), max_messages=2)
+    conv.handle("42", "question 1")
+    conv.handle("42", "question 2")
+    result = conv.handle("42", "/new")
+    assert "new" in result.lower() or "clear" in result.lower()
+    conv.handle("42", "question 3")
+    third_msgs = llm.chat_calls[2][0]
+    assert len(third_msgs) == 1
+    assert third_msgs[0].role == "user"
+    assert third_msgs[0].content == "question 3"
+
+
+def test_chat_isolation_preserved_with_trimming():
+    llm = ScriptedLLM(
+        [
+            ChatResponse(content="A answer 1"),
+            ChatResponse(content="B answer 1"),
+            ChatResponse(content="A answer 2"),
+            ChatResponse(content="B answer 2"),
+            ChatResponse(content="A answer 3"),
+        ]
+    )
+    conv = ConversationManager(_make_agent(llm), max_messages=2)
+    conv.handle("A", "A question 1")
+    conv.handle("B", "B question 1")
+    conv.handle("A", "A question 2")
+    conv.handle("B", "B question 2")
+    conv.handle("A", "A question 3")
+    a_third = llm.chat_calls[4][0]
+    assert [m.content for m in a_third] == [
+        "A question 2",
+        "A answer 2",
+        "A question 3",
+    ]
+    b_second = llm.chat_calls[3][0]
+    assert [m.content for m in b_second] == [
+        "B question 1",
+        "B answer 1",
+        "B question 2",
+    ]
+
+
+# --- Cap configuration ------------------------------------------------------
+
+
+def test_default_max_messages_is_12(monkeypatch):
+    monkeypatch.delenv("CONVERSATION_MAX_MESSAGES", raising=False)
+    conv = ConversationManager(_make_agent(ScriptedLLM([])))
+    assert conv._max_messages == 12
+
+
+def test_env_override_max_messages(monkeypatch):
+    monkeypatch.setenv("CONVERSATION_MAX_MESSAGES", "5")
+    conv = ConversationManager(_make_agent(ScriptedLLM([])))
+    assert conv._max_messages == 5
+
+
+def test_invalid_env_max_messages_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("CONVERSATION_MAX_MESSAGES", "abc")
+    conv = ConversationManager(_make_agent(ScriptedLLM([])))
+    assert conv._max_messages == 12
+    monkeypatch.setenv("CONVERSATION_MAX_MESSAGES", "0")
+    conv = ConversationManager(_make_agent(ScriptedLLM([])))
+    assert conv._max_messages == 12

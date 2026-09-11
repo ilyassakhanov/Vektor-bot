@@ -48,16 +48,13 @@ class ToolRegistry:
     def execute(self, name: str, **arguments: Any) -> str:
         tool = self._tools.get(name)
         if tool is None:
-            msg = f"Error: tool '{name}' not found."
-            log.warning(msg)
-            return msg
+            log.warning("tool '%s' not found", name)
+            return f"Error: tool '{name}' not found."
         try:
             return tool.execute(**arguments)
         except ToolError as exc:
-            msg = f"Error: tool '{name}' failed: {exc}"
-            log.warning(msg)
-            return msg
-        except Exception as exc:
-            msg = f"Error: tool '{name}' raised: {exc}"
-            log.exception(msg)
-            return msg
+            log.warning("tool '%s' failed: %s", name, type(exc).__name__)
+            return f"Error: tool '{name}' failed: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tool '%s' raised %s", name, type(exc).__name__)
+            return f"Error: tool '{name}' raised: {exc}"

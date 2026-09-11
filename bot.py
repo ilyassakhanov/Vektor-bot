@@ -12,39 +12,42 @@ from pathlib import Path
 import telebot
 
 import config
+import logging_config
+import metrics
 from agent.agent import Agent
 from agent.conversation import ConversationManager
 from llm import LLM, LLMError, OllamaLLM
+from llm.instrumented import InstrumentedLLM
 from skills.loader import SkillLoader
 from tools.cve import CveTool
 from tools.exec import ExecTool
+from tools.instrumented_registry import InstrumentedToolRegistry
 from tools.registry import ToolRegistry
 
 # Load secrets from .env into the environment (real env vars take precedence).
 config.load_env()
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-)
 log = logging.getLogger("vektor.bot")
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _DEFAULT_MAX_ITERATIONS = 8
+_DEFAULT_METRICS_PORT = 9100
 
 
 def build_llm() -> LLM:
     """Composition root — pick the LLM provider from configuration."""
-    return OllamaLLM(
-        base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-        model=os.environ.get("OLLAMA_MODEL", "llama3.2"),
+    return InstrumentedLLM(
+        OllamaLLM(
+            base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+            model=os.environ.get("OLLAMA_MODEL", "llama3.2"),
+        )
     )
 
 
 def build_tool_registry() -> ToolRegistry:
     """Build the tool registry with all available tools."""
-    reg = ToolRegistry()
+    reg = InstrumentedToolRegistry()
     timeout = float(os.environ.get("EXEC_TIMEOUT", "30"))
     reg.register(ExecTool(timeout=timeout))
     reg.register(CveTool(timeout=timeout))
@@ -94,6 +97,20 @@ def load_allowed_usernames() -> frozenset[str]:
     )
 
 
+def _metrics_port_from_env() -> int:
+    """Read ``METRICS_PORT`` — falls back to the default on invalid values."""
+    raw = os.environ.get("METRICS_PORT")
+    if raw is None:
+        return _DEFAULT_METRICS_PORT
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(
+            "Invalid METRICS_PORT %r, using default %d", raw, _DEFAULT_METRICS_PORT
+        )
+        return _DEFAULT_METRICS_PORT
+
+
 def handle_message(
     message: telebot.types.Message,
     conv: ConversationManager,
@@ -110,12 +127,11 @@ def handle_message(
     """
     user = message.from_user
     log.info(
-        "message id=%s chat=%s user=%s%s text=%r",
+        "message id=%s chat=%s user=%s%s",
         message.message_id,
         message.chat.id,
         user.id if user else "?",
         f" @{user.username}" if user and user.username else "",
-        message.text,
     )
     if allowed_usernames is not None and (
         user is None
@@ -149,6 +165,12 @@ def create_bot(
 
 
 def main() -> None:
+    logging_config.configure_logging(
+        loki_url=os.environ.get("LOKI_PUSH_URL") or None,
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+    )
+    metrics_port = _metrics_port_from_env()
+    metrics.start_metrics_server(metrics_port)
     llm = build_llm()
     conv = build_conversation_manager(llm)
     allowed = load_allowed_usernames()

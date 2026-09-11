@@ -21,6 +21,7 @@ import httpx
 
 from agent.cve_selector import select_cve
 from tools.base import Tool
+from tools.truncation import max_output_chars_from_env, truncate
 
 log = logging.getLogger("vektor.tools.cve")
 
@@ -44,7 +45,9 @@ class CveTool(Tool):
     compact fact sheet for the selected CVE (or an error message).
 
     All network access uses :mod:`httpx`. Failures are returned as strings
-    to the LLM — the tool never raises for network/parse errors.
+    to the LLM — the tool never raises for network/parse errors. The fact
+    sheet is capped at ``max_output_chars`` (env ``EXEC_MAX_OUTPUT_CHARS``,
+    default 4000) via the shared head+tail truncation helper.
     """
 
     def __init__(
@@ -53,6 +56,7 @@ class CveTool(Tool):
         client: httpx.Client | None = None,
         commit_count: int = _DEFAULT_COMMIT_COUNT,
         max_records: int = _DEFAULT_MAX_RECORDS,
+        max_output_chars: int | None = None,
     ) -> None:
         self._timeout = timeout
         self._client = client or httpx.Client(
@@ -61,6 +65,7 @@ class CveTool(Tool):
         )
         self._commit_count = commit_count
         self._max_records = max_records
+        self._max_output_chars = max_output_chars_from_env(max_output_chars)
 
     @property
     def name(self) -> str:
@@ -69,11 +74,8 @@ class CveTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve the most critical recently-published CVE with the highest "
-            "CVSS score from official CVE.org data. Returns CVE ID, CVSS score, "
-            "severity, publication date, affected vendor/product, description, "
-            "and attack vector. Use this when the user asks about the latest or "
-            "highest-scoring CVE."
+            "Get the most critical recent CVE (highest CVSS) from official "
+            "CVE.org data. Use for latest or most severe CVE questions."
         )
 
     @property
@@ -110,7 +112,8 @@ class CveTool(Tool):
         log.info(
             "CveTool: selected %s (score=%s)", selected.cve_id, selected.cvss_score
         )
-        return _format_cve(selected, total_retrieved=len(records))
+        fact_sheet = _format_cve(selected, total_retrieved=len(records))
+        return truncate(fact_sheet, self._max_output_chars)
 
     def _discover_cve_ids(self) -> list[str]:
         """Fetch recent commits and extract unique CVE IDs."""

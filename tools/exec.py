@@ -12,6 +12,7 @@ import subprocess
 from typing import Any
 
 from tools.base import Tool, ToolError
+from tools.truncation import max_output_chars_from_env, truncate
 
 log = logging.getLogger("vektor.tools.exec")
 
@@ -24,10 +25,19 @@ class ExecTool(Tool):
     Failures (non-zero exit, timeout, crashes) are returned as strings to
     the LLM — the tool never raises :class:`ToolError` for command failures.
     Only missing arguments raise :class:`ToolError`.
+
+    Combined stdout/stderr output is capped at ``max_output_chars`` (env
+    ``EXEC_MAX_OUTPUT_CHARS``, default 4000) with head+tail truncation; the
+    ``exit_code:`` line is always preserved.
     """
 
-    def __init__(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        timeout: float = _DEFAULT_TIMEOUT,
+        max_output_chars: int | None = None,
+    ) -> None:
         self._timeout = timeout
+        self._max_output_chars = max_output_chars_from_env(max_output_chars)
 
     @property
     def name(self) -> str:
@@ -35,7 +45,7 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return stdout, stderr, and exit code. Use for read-only HTTP requests like curl."
+        return "Run a shell command (e.g. curl); returns stdout, stderr, exit code."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -80,4 +90,5 @@ class ExecTool(Tool):
             return self._format("", f"Error: {exc}", -1)
 
     def _format(self, stdout: str, stderr: str, exit_code: int) -> str:
-        return f"stdout:\n{stdout}\nstderr:\n{stderr}\nexit_code: {exit_code}"
+        body = truncate(f"stdout:\n{stdout}\nstderr:\n{stderr}", self._max_output_chars)
+        return f"{body}\nexit_code: {exit_code}"

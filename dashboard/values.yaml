@@ -141,6 +141,23 @@ dashboards:
               ],
               "title": "Agent runs that hit the max iteration limit (total)",
               "type": "stat"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+              "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+              "id": 6,
+              "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "sum by (model) (rate(vektor_llm_cost_total[5m]))",
+                  "legendFormat": "{{model}}",
+                  "refId": "A"
+                }
+              ],
+              "title": "Notional LLM cost/s by model (USD)",
+              "type": "timeseries"
             }
           ]
         }
