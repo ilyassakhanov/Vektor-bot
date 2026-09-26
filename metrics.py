@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from prometheus_client import Counter, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 log = logging.getLogger("vektor.metrics")
 
@@ -47,6 +47,22 @@ tool_duration_seconds = Histogram(
     "vektor_tool_duration_seconds",
     "Tool call duration in seconds",
     ["tool_name"],
+)
+
+mcp_server_up = Gauge(
+    "vektor_mcp_server_up",
+    "MCP server subprocess state (1=up, 0=down)",
+)
+
+mcp_roundtrip_seconds = Histogram(
+    "vektor_mcp_roundtrip_seconds",
+    "MCP stdio round-trip latency in seconds",
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+
+mcp_restarts_total = Counter(
+    "vektor_mcp_restarts_total",
+    "MCP server subprocess restarts",
 )
 
 

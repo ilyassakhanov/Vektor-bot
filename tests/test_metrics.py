@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from prometheus_client import REGISTRY, Counter, Histogram, generate_latest
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram, generate_latest
 
 import metrics
 
@@ -15,6 +15,9 @@ def test_all_metrics_defined():
     assert hasattr(metrics, "agent_max_iterations_reached_total")
     assert hasattr(metrics, "tool_calls_total")
     assert hasattr(metrics, "tool_duration_seconds")
+    assert hasattr(metrics, "mcp_server_up")
+    assert hasattr(metrics, "mcp_roundtrip_seconds")
+    assert hasattr(metrics, "mcp_restarts_total")
 
 
 def test_llm_tokens_total_is_counter():
@@ -43,6 +46,31 @@ def test_tool_calls_total_is_counter():
 
 def test_tool_duration_seconds_is_histogram():
     assert isinstance(metrics.tool_duration_seconds, Histogram)
+
+
+def test_mcp_server_up_is_gauge():
+    assert isinstance(metrics.mcp_server_up, Gauge)
+    metrics.mcp_server_up.set(0)
+    metrics.mcp_server_up.set(1)
+
+
+def test_mcp_roundtrip_seconds_is_histogram():
+    assert isinstance(metrics.mcp_roundtrip_seconds, Histogram)
+    metrics.mcp_roundtrip_seconds.observe(0.1)
+
+
+def test_mcp_restarts_total_is_counter():
+    assert isinstance(metrics.mcp_restarts_total, Counter)
+    metrics.mcp_restarts_total.inc()
+
+
+def test_mcp_metrics_have_vektor_prefix():
+    metrics.mcp_server_up.set(1)
+    metrics.mcp_roundtrip_seconds.observe(0.1)
+    metrics.mcp_restarts_total.inc(1)
+    assert REGISTRY.get_sample_value("vektor_mcp_server_up") == 1.0
+    assert REGISTRY.get_sample_value("vektor_mcp_roundtrip_seconds_count") is not None
+    assert REGISTRY.get_sample_value("vektor_mcp_restarts_total") is not None
 
 
 def test_llm_tokens_total_labels():

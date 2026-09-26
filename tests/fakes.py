@@ -92,5 +92,44 @@ class ScriptedLLM(LLM):
         return self._script.pop(0)
 
 
+class FakeMcpClient:
+    """In-memory MCP client for tests — mirrors FakeLLM's style.
+
+    Returns pre-seeded specs and a canned ``call_tool`` result (or raises a
+    pre-seeded exception). Records every call in ``self.calls`` as a
+    ``(name, arguments)`` tuple.
+    """
+
+    def __init__(
+        self,
+        specs: list[ToolSpec] | None = None,
+        call_result: str = "",
+        call_error: Exception | None = None,
+    ) -> None:
+        self._specs: list[ToolSpec] = (
+            list(specs)
+            if specs
+            else [
+                ToolSpec(
+                    name="get_latest_cve",
+                    description="Get the most critical recent CVE.",
+                    parameters={"type": "object", "properties": {}, "required": []},
+                )
+            ]
+        )
+        self._call_result = call_result
+        self._call_error = call_error
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def specs(self) -> list[ToolSpec]:
+        return list(self._specs)
+
+    def call_tool(self, name: str, arguments: dict[str, object]) -> str:
+        self.calls.append((name, arguments))
+        if self._call_error is not None:
+            raise self._call_error
+        return self._call_result
+
+
 def make_tool_call(call_id: str, name: str, arguments: dict[str, object]) -> ToolCall:
     return ToolCall(id=call_id, name=name, arguments=arguments)

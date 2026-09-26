@@ -8,3 +8,4 @@ __pycache__/
 benchmarks/results.json
 dashboard/venv/
 dashboard/grafana.db
+.opencode/

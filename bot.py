@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 import telebot
@@ -19,9 +20,9 @@ from agent.conversation import ConversationManager
 from llm import LLM, LLMError, OllamaLLM
 from llm.instrumented import InstrumentedLLM
 from skills.loader import SkillLoader
-from tools.cve import CveTool
 from tools.exec import ExecTool
 from tools.instrumented_registry import InstrumentedToolRegistry
+from tools.mcp import McpClient, McpStdioClient, McpTool, build_server_env
 from tools.registry import ToolRegistry
 
 # Load secrets from .env into the environment (real env vars take precedence).
@@ -33,6 +34,10 @@ log = logging.getLogger("vektor.bot")
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _DEFAULT_MAX_ITERATIONS = 8
 _DEFAULT_METRICS_PORT = 9100
+_DEFAULT_MCP_COMMAND: list[str] = [
+    sys.executable,
+    str(_PROJECT_ROOT / "mcp_servers" / "cve_server.py"),
+]
 
 
 def build_llm() -> LLM:
@@ -45,12 +50,14 @@ def build_llm() -> LLM:
     )
 
 
-def build_tool_registry() -> ToolRegistry:
+def build_tool_registry(mcp_client: McpClient | None = None) -> ToolRegistry:
     """Build the tool registry with all available tools."""
     reg = InstrumentedToolRegistry()
     timeout = float(os.environ.get("EXEC_TIMEOUT", "30"))
     reg.register(ExecTool(timeout=timeout))
-    reg.register(CveTool(timeout=timeout))
+    if mcp_client is not None:
+        for spec in mcp_client.specs():
+            reg.register(McpTool(client=mcp_client, spec=spec))
     return reg
 
 
@@ -82,7 +89,7 @@ def build_conversation_manager(
 ) -> ConversationManager:
     """Build a ConversationManager wired to an Agent."""
     if tools is None:
-        tools = build_tool_registry()
+        tools = build_tool_registry(None)
     agent = build_agent(llm, tools, max_iterations=max_iterations)
     return ConversationManager(agent)
 
@@ -109,6 +116,19 @@ def _metrics_port_from_env() -> int:
             "Invalid METRICS_PORT %r, using default %d", raw, _DEFAULT_METRICS_PORT
         )
         return _DEFAULT_METRICS_PORT
+
+
+def _mcp_command_from_env() -> list[str]:
+    """Read ``MCP_CVE_SERVER_CMD`` — falls back to the default when unset/empty."""
+    raw = os.environ.get("MCP_CVE_SERVER_CMD")
+    if not raw or not raw.strip():
+        if raw is not None:
+            log.warning(
+                "Empty MCP_CVE_SERVER_CMD, using default %s",
+                _DEFAULT_MCP_COMMAND,
+            )
+        return list(_DEFAULT_MCP_COMMAND)
+    return raw.split()
 
 
 def handle_message(
@@ -172,21 +192,40 @@ def main() -> None:
     metrics_port = _metrics_port_from_env()
     metrics.start_metrics_server(metrics_port)
     llm = build_llm()
-    conv = build_conversation_manager(llm)
-    allowed = load_allowed_usernames()
-    if allowed:
-        log.info("Allowed users: %d", len(allowed))
-    else:
-        log.warning("No ALLOWED_USERNAMES set — all users denied.")
-    bot = create_bot(conv, allowed)
-    log.info("Starting bot (polling)...")
+    mcp_client = McpStdioClient(
+        command=_mcp_command_from_env(),
+        env=build_server_env(),
+        startup_timeout=float(os.environ.get("MCP_STARTUP_TIMEOUT", "10")),
+        cwd=str(_PROJECT_ROOT),
+        pythonpath=str(_PROJECT_ROOT),
+    )
     try:
-        bot.infinity_polling()
-    except KeyboardInterrupt:
-        log.info("Stopped by user.")
+        try:
+            mcp_client.start()
+            reg = build_tool_registry(mcp_client)
+        except Exception:
+            log.warning(
+                "MCP CVE server failed to start; running exec-only", exc_info=True
+            )
+            metrics.mcp_server_up.set(0)
+            reg = build_tool_registry(None)
+        conv = build_conversation_manager(llm, tools=reg)
+        allowed = load_allowed_usernames()
+        if allowed:
+            log.info("Allowed users: %d", len(allowed))
+        else:
+            log.warning("No ALLOWED_USERNAMES set — all users denied.")
+        bot = create_bot(conv, allowed)
+        log.info("Starting bot (polling)...")
+        try:
+            bot.infinity_polling()
+        except KeyboardInterrupt:
+            log.info("Stopped by user.")
+        finally:
+            bot.stop_polling()
+            log.info("Bot shut down.")
     finally:
-        bot.stop_polling()
-        log.info("Bot shut down.")
+        mcp_client.stop()
 
 
 if __name__ == "__main__":

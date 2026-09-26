@@ -15,7 +15,7 @@ import json
 import pytest
 
 from agent.cve_selector import select_cve
-from tools.cve import CveTool
+from cve_core import get_latest_cve_fact_sheet
 from tools.exec import ExecTool
 
 _CVE_API = "https://cveawg.mitre.org/api/cve"
@@ -110,17 +110,13 @@ def test_cve_selector_with_real_records(exec_tool: ExecTool, online: None) -> No
 
 
 def test_cve_tool_retrieves_and_selects(online: None) -> None:
-    """End-to-end: CveTool fetches real CVE records and selects the most critical.
+    """End-to-end: cve_core fetches real CVE records and selects the most critical.
 
-    This exercises the full CveTool pipeline against live CVE.org endpoints:
+    This exercises the full cve_core pipeline against live CVE.org endpoints:
     discover IDs from cvelistV5 commits, fetch records from cveawg.mitre.org,
     and run the programmatic selector. The result must be a valid fact sheet.
     """
-    tool = CveTool(timeout=30.0)
-    try:
-        result = tool.execute()
-    finally:
-        tool.close()
+    result = get_latest_cve_fact_sheet(timeout=30.0)
 
     assert isinstance(result, str)
     # Either we got a CVE fact sheet or a graceful "no CVSS" / error message.

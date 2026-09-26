@@ -19,6 +19,7 @@ from typing import Any, cast
 import httpx
 
 from agent.agent import MAX_ITERATIONS_REPLY, Agent
+from cve_core import get_latest_cve_fact_sheet
 from llm.base import (
     LLM,
     ChatResponse,
@@ -30,7 +31,7 @@ from llm.base import (
 from llm.cost import estimate_cost
 from llm.ollama import OllamaLLM
 from skills.loader import SkillLoader
-from tools.cve import CveTool
+from tools.base import Tool
 from tools.exec import ExecTool
 from tools.registry import ToolRegistry
 
@@ -136,6 +137,36 @@ def load_prompts(path: Path) -> list[dict[str, str]]:
     return prompts
 
 
+class CveCoreTool(Tool):
+    """In-process Tool adapter for benchmarks — delegates to ``cve_core``.
+
+    Benchmarks run in-process (no subprocess overhead needed), so this
+    adapter wraps :func:`cve_core.get_latest_cve_fact_sheet` with the same
+    name/description/empty-params as the old ``CveTool``.
+    """
+
+    @property
+    def name(self) -> str:
+        return "get_latest_cve"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Get the most critical recent CVE (highest CVSS) from official "
+            "CVE.org data. Use for latest or most severe CVE questions."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}, "required": []}
+
+    def execute(self, **kwargs: Any) -> str:
+        return get_latest_cve_fact_sheet(timeout=self._timeout)
+
+    def __init__(self, timeout: float = 30.0) -> None:
+        self._timeout = timeout
+
+
 def build_benchmark_agent(
     base_url: str,
     model: str,
@@ -145,7 +176,7 @@ def build_benchmark_agent(
     counting = CountingLLM(ollama)
     registry = CountingRegistry()
     registry.register(ExecTool(timeout=_TOOL_TIMEOUT))
-    registry.register(CveTool(timeout=_TOOL_TIMEOUT))
+    registry.register(CveCoreTool(timeout=_TOOL_TIMEOUT))
     loader = SkillLoader(_PROJECT_ROOT / "skills")
     agent = Agent(
         llm=counting,
