@@ -56,7 +56,7 @@ dashboards:
           "time": { "from": "now-1h", "to": "now" },
           "title": "Vektor Bot",
           "uid": "vektor-bot",
-          "version": 1,
+          "version": 2,
           "panels": [
             {
               "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -157,6 +157,39 @@ dashboards:
                 }
               ],
               "title": "Notional LLM cost/s by model (USD)",
+              "type": "timeseries"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+              "gridPos": { "h": 4, "w": 12, "x": 0, "y": 28 },
+              "id": 7,
+              "options": { "colorMode": "value", "graphMode": "none" },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "vektor_mcp_server_up",
+                  "refId": "A"
+                }
+              ],
+              "title": "MCP CVE server up",
+              "type": "stat"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+              "gridPos": { "h": 4, "w": 12, "x": 12, "y": 28 },
+              "id": 8,
+              "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true } },
+              "targets": [
+                {
+                  "datasource": { "type": "prometheus", "uid": "prometheus" },
+                  "expr": "histogram_quantile(0.95, sum by (le) (rate(vektor_mcp_roundtrip_seconds_bucket[5m])))",
+                  "legendFormat": "p95",
+                  "refId": "A"
+                }
+              ],
+              "title": "MCP round-trip p95",
               "type": "timeseries"
             }
           ]

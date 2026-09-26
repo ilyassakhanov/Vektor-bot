@@ -1,4 +1,4 @@
-"""Tests for CveTool — fetches recent CVE records and selects the most critical.
+"""Tests for cve_core — fetches recent CVE records and selects the most critical.
 
 All tests use httpx.MockTransport — no network access needed.
 """
@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from tools.cve import CveTool
+from cve_core import get_latest_cve_fact_sheet
 
 
 def _make_cve(
@@ -76,34 +76,6 @@ def _make_client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler), timeout=5.0)
 
 
-# --- Tool metadata ---------------------------------------------------------
-
-
-def test_tool_name():
-    tool = CveTool(client=_make_client(lambda r: httpx.Response(200, json=[])))
-    assert tool.name == "get_latest_cve"
-
-
-def test_tool_description_mentions_cve():
-    tool = CveTool(client=_make_client(lambda r: httpx.Response(200, json=[])))
-    assert "CVE" in tool.description
-
-
-def test_cve_tool_description_compact():
-    """O4: the description is re-sent to the LLM on every call — keep it
-    short while still naming the selection rule and the trigger questions."""
-    tool = CveTool(client=_make_client(lambda r: httpx.Response(200, json=[])))
-    assert len(tool.description) <= 140
-    assert "highest CVSS" in tool.description
-
-
-def test_tool_parameters_no_required_args():
-    tool = CveTool(client=_make_client(lambda r: httpx.Response(200, json=[])))
-    params = tool.parameters
-    assert params["type"] == "object"
-    assert params["required"] == []
-
-
 # --- Happy path: returns selected CVE fact sheet ----------------------------
 
 
@@ -120,8 +92,7 @@ def test_returns_highest_scoring_cve_from_latest_window():
         cve_id = str(req.url).rsplit("/", 1)[-1]
         return httpx.Response(200, json=records[cve_id])
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "CVE-2026-0002" in result
     assert "9.8" in result
@@ -146,8 +117,7 @@ def test_result_contains_all_fields():
             return httpx.Response(200, json=commits)
         return httpx.Response(200, json=cve)
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "CVE_ID: CVE-2026-0001" in result
     assert "CVSS_SCORE: 9.8" in result
@@ -174,8 +144,7 @@ def test_older_high_score_loses_to_newer_window():
         cve_id = str(req.url).rsplit("/", 1)[-1]
         return httpx.Response(200, json=records[cve_id])
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "CVE-2026-0002" in result
     assert "CVE-2026-0001" not in result.split("\n")[0]
@@ -193,8 +162,7 @@ def test_equal_scores_tiebreak_by_most_recent():
         cve_id = str(req.url).rsplit("/", 1)[-1]
         return httpx.Response(200, json=records[cve_id])
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "CVE-2026-0002" in result
 
@@ -214,8 +182,7 @@ def test_all_missing_cvss_returns_message():
         cve_id = str(req.url).rsplit("/", 1)[-1]
         return httpx.Response(200, json=records[cve_id])
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "none" in result.lower() or "no" in result.lower()
     assert "CVSS" in result
@@ -233,8 +200,7 @@ def test_missing_cvss_cannot_win():
         cve_id = str(req.url).rsplit("/", 1)[-1]
         return httpx.Response(200, json=records[cve_id])
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "CVE-2026-0002" in result
 
@@ -246,8 +212,7 @@ def test_github_api_failure_returns_error_message():
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "No recent CVE IDs" in result or "failed" in result.lower()
 
@@ -265,8 +230,7 @@ def test_cve_record_fetch_failure_returns_partial_result():
             return httpx.Response(404)
         return httpx.Response(200, json=cve_good)
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "CVE-2026-0001" in result
 
@@ -279,8 +243,7 @@ def test_cve_record_malformed_json_skipped():
             return httpx.Response(200, json=commits)
         return httpx.Response(200, content=b"not-json")
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "Failed to retrieve" in result or "none" in result.lower()
 
@@ -289,8 +252,7 @@ def test_commits_malformed_json_returns_error():
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"not-json")
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "No recent CVE IDs" in result or "failed" in result.lower()
 
@@ -314,8 +276,7 @@ def test_multiple_commits_cve_ids_aggregated():
         cve_id = str(req.url).rsplit("/", 1)[-1]
         return httpx.Response(200, json=records[cve_id])
 
-    tool = CveTool(client=_make_client(handler), commit_count=2)
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler), commit_count=2)
 
     assert "CVE-2026-0002" in result
     assert "9.0" in result
@@ -337,8 +298,7 @@ def test_duplicate_cve_ids_deduplicated():
         request_count["cve_api"] += 1
         return httpx.Response(200, json=cve)
 
-    tool = CveTool(client=_make_client(handler), commit_count=2)
-    tool.execute()
+    get_latest_cve_fact_sheet(client=_make_client(handler), commit_count=2)
 
     assert request_count["cve_api"] == 1
 
@@ -359,8 +319,7 @@ def test_max_records_limits_fetches():
         request_count["cve_api"] += 1
         return httpx.Response(200, json=cve)
 
-    tool = CveTool(client=_make_client(handler), max_records=2)
-    tool.execute()
+    get_latest_cve_fact_sheet(client=_make_client(handler), max_records=2)
 
     assert request_count["cve_api"] == 2
 
@@ -372,8 +331,7 @@ def test_empty_commits_returns_message():
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[])
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "No recent CVE IDs" in result
 
@@ -384,8 +342,7 @@ def test_commits_without_cve_ids_returns_message():
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=commits)
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "No recent CVE IDs" in result
 
@@ -399,8 +356,7 @@ def test_result_includes_data_source_attribution():
             return httpx.Response(200, json=commits)
         return httpx.Response(200, json=cve)
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "cveawg.mitre.org" in result
     assert "cvelistV5" in result
@@ -415,8 +371,7 @@ def test_result_includes_note_about_programmatic_selection():
             return httpx.Response(200, json=commits)
         return httpx.Response(200, json=cve)
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "programmatically" in result.lower()
 
@@ -438,8 +393,9 @@ def test_cve_fact_sheet_capped_when_description_huge():
             return httpx.Response(200, json=commits)
         return httpx.Response(200, json=cve)
 
-    tool = CveTool(client=_make_client(handler), max_output_chars=600)
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(
+        client=_make_client(handler), max_output_chars=600
+    )
 
     assert len(result) <= 600
     assert "[truncated " in result
@@ -447,6 +403,32 @@ def test_cve_fact_sheet_capped_when_description_huge():
     assert "CVSS_SCORE: 9.8" in result
     assert "DATA_SOURCE" in result
     assert "Do not fabricate" in result
+
+
+# --- Timeout resolution -----------------------------------------------------
+
+
+def test_get_latest_cve_fact_sheet_reads_timeout_from_env(monkeypatch):
+    """When ``EXEC_TIMEOUT`` is set, the internally-created client uses it."""
+    monkeypatch.setenv("EXEC_TIMEOUT", "60")
+    captured: dict[str, Any] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    original_client_init = httpx.Client.__init__
+
+    def fake_init(self: httpx.Client, *args: Any, **kwargs: Any) -> None:
+        captured["timeout"] = kwargs.get("timeout")
+        kwargs["transport"] = httpx.MockTransport(handler)
+        original_client_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "__init__", fake_init)
+
+    result = get_latest_cve_fact_sheet()
+
+    assert captured["timeout"] == 60.0
+    assert "No recent CVE IDs" in result
 
 
 def test_cve_fact_sheet_short_unchanged():
@@ -463,8 +445,7 @@ def test_cve_fact_sheet_short_unchanged():
             return httpx.Response(200, json=commits)
         return httpx.Response(200, json=cve)
 
-    tool = CveTool(client=_make_client(handler))
-    result = tool.execute()
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert "[truncated" not in result
     assert "CVE_ID: CVE-2026-0001" in result

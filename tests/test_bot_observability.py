@@ -7,6 +7,7 @@ into logs, the default metrics port, and logging/metrics wiring in main().
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,11 +52,21 @@ def test_build_llm_returns_instrumented():
 
 
 def test_build_tool_registry_returns_instrumented():
-    reg = build_tool_registry()
+    from tests.fakes import FakeMcpClient
+
+    reg = build_tool_registry(FakeMcpClient())
     assert isinstance(reg, InstrumentedToolRegistry)
     names = {spec.name for spec in reg.specs()}
     assert "exec" in names
     assert "get_latest_cve" in names
+
+
+def test_build_tool_registry_exec_only_when_client_none():
+    reg = build_tool_registry(None)
+    assert isinstance(reg, InstrumentedToolRegistry)
+    names = {spec.name for spec in reg.specs()}
+    assert "exec" in names
+    assert "get_latest_cve" not in names
 
 
 # --- No message text in logs --------------------------------------------------
@@ -112,6 +123,43 @@ def test_metrics_port_from_env_invalid_returns_default(monkeypatch, caplog):
 def test_metrics_port_from_env_unset_returns_default(monkeypatch):
     monkeypatch.delenv("METRICS_PORT", raising=False)
     assert bot._metrics_port_from_env() == bot._DEFAULT_METRICS_PORT
+
+
+# --- MCP_CVE_SERVER_CMD parsing ----------------------------------------------
+
+
+def test_mcp_command_from_env_unset_returns_default(monkeypatch):
+    monkeypatch.delenv("MCP_CVE_SERVER_CMD", raising=False)
+    expected = [
+        sys.executable,
+        str(Path(bot.__file__).resolve().parent / "mcp_servers" / "cve_server.py"),
+    ]
+    assert bot._mcp_command_from_env() == expected
+
+
+def test_mcp_command_from_env_set_returns_parsed(monkeypatch):
+    monkeypatch.setenv("MCP_CVE_SERVER_CMD", "python mcp_servers/cve_server.py")
+    assert bot._mcp_command_from_env() == ["python", "mcp_servers/cve_server.py"]
+
+
+def test_mcp_command_from_env_multi_token(monkeypatch):
+    monkeypatch.setenv("MCP_CVE_SERVER_CMD", "python3 /abs/path/cve_server.py --flag")
+    assert bot._mcp_command_from_env() == [
+        "python3",
+        "/abs/path/cve_server.py",
+        "--flag",
+    ]
+
+
+def test_mcp_command_from_env_empty_returns_default(monkeypatch, caplog):
+    monkeypatch.setenv("MCP_CVE_SERVER_CMD", "")
+    expected = [
+        sys.executable,
+        str(Path(bot.__file__).resolve().parent / "mcp_servers" / "cve_server.py"),
+    ]
+    with caplog.at_level(logging.WARNING):
+        assert bot._mcp_command_from_env() == expected
+    assert "MCP_CVE_SERVER_CMD" in caplog.text
 
 
 def test_main_wiring_exists():

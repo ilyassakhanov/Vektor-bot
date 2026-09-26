@@ -30,7 +30,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `OLLAMA_NUM_CTX` | no | Ollama context window size sent as payload `options.num_ctx`; unset = Ollama's own default (a too-small value silently truncates context — set only if prompts approach the default window) |
 | `OLLAMA_KEEP_ALIVE` | no | Ollama model keep-alive duration (e.g. `30m`) sent as payload `keep_alive` — keeps the model (and its prompt cache) loaded between calls; unset = Ollama default |
 | `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed) |
-| `EXEC_TIMEOUT` | no | Timeout in seconds for the `exec` tool (default `30`) |
+| `EXEC_TIMEOUT` | no | Timeout in seconds for the `exec` tool, the MCP CVE server httpx calls, and the MCP round-trip (default `30`) |
 | `EXEC_MAX_OUTPUT_CHARS` | no | Cap for tool output (combined exec stdout/stderr body and CVE fact sheet); over-cap output keeps head+tail with a `... [truncated N chars] ...` marker, exit-code line always preserved (default `4000`) |
 | `AGENT_MAX_ITERATIONS` | no | Maximum agent loop iterations (default `8`) |
 | `CONVERSATION_MAX_MESSAGES` | no | Maximum messages kept per chat conversation; oldest trimmed after each agent run, latest user message always kept (default `12`) |
@@ -39,6 +39,8 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `METRICS_PORT` | no | Prometheus metrics port (default `9100`; use `9101` when the dashboard stack is up — Rancher Desktop forwards node-exporter's 9100 to the host) |
 | `LOKI_PUSH_URL` | no | Loki push endpoint; empty = logs only to stderr |
 | `LOG_LEVEL` | no | Log level (default `INFO`) |
+| `MCP_STARTUP_TIMEOUT` | no | Seconds to wait for the MCP CVE server subprocess to initialize before falling back to exec-only mode (default `10`) |
+| `MCP_CVE_SERVER_CMD` | no | MCP CVE server subprocess command (space-separated; first token is the executable). Default: `python mcp_servers/cve_server.py` |
 
 ## Project structure
 
@@ -56,7 +58,9 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `tools/base.py` | Abstract `Tool` interface, `ToolError` |
 | `tools/registry.py` | `ToolRegistry` — agent invokes tools via registry |
 | `tools/exec.py` | `ExecTool` — generic shell execution with timeout, returns stdout/stderr/exit code |
-| `tools/cve.py` | `CveTool` — retrieves recent CVE records and selects the most critical one programmatically |
+| `cve_core.py` | CVE logic extracted from the old `CveTool` — module-level functions for discover/fetch/select/format/truncate (no `Tool` base, no MCP deps) |
+| `mcp_servers/cve_server.py` | `MCPServer` wrapping `cve_core.get_latest_cve()` as the `get_latest_cve` MCP tool (stdio transport, stderr-only logging) |
+| `tools/mcp.py` | `McpStdioClient` — launches the CVE server subprocess, async/sync bridge; `McpTool` — `Tool` adapter delegating to the client; `build_server_env()` — scrubbed env for the subprocess |
 | `tools/truncation.py` | `truncate()` — shared head+tail tool-output truncation; `EXEC_MAX_OUTPUT_CHARS` resolution |
 | `skills/loader.py` | `SkillLoader` — discovers `.md` skill files dynamically |
 | `skills/cve.md` | CVE workflow skill — instructions for using the `get_latest_cve` tool |
@@ -74,7 +78,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 Telegram → ConversationManager → Agent → LLM interface → OllamaLLM
                                     │
                                     ├── ToolRegistry → ExecTool (shell, curl)
-                                    │                → CveTool (programmatic CVE retrieval + selection)
+                                    │                → McpTool(Tool) → [stdio JSON-RPC] → mcp_servers/cve_server.py → cve_core.py
                                     └── SkillLoader → skills/*.md
 ```
 
