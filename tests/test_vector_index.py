@@ -2,7 +2,10 @@
 
 VectorIndex decodes chunk_id -> embedding BLOB mappings (as produced by
 ChunkStore.all_vectors) into a float32 matrix and answers cosine-similarity
-queries with deterministic, best-first ChunkHit ordering.
+queries with deterministic, best-first ChunkHit ordering. ``search`` takes a
+LIST of query vectors and scores each chunk by MAX cosine similarity across
+them (standard multi-query max-sim); a single-query list reproduces the plain
+cosine ranking.
 
 Covered acceptance criteria:
 1. Cosine ordering correct with fake embeddings: query aligned with one
@@ -14,11 +17,14 @@ Covered acceptance criteria:
    independent of insertion order.
 5. BLOB float32 round-trip lossless: dyadic values whose cosine arithmetic is
    exact in float32 yield exactly 1.0 / 0.0 / -1.0.
-6. Empty index -> []; dimension mismatch between query and stored vectors
-   raises ValueError.
+6. Empty index -> []; dimension mismatch between any query vector and stored
+   vectors raises ValueError.
 7. replace_all refreshes the index: new vectors searchable, old ids gone.
 8. Hits carry chunk_id + score only; metadata fields stay empty for the later
    store join.
+9. Multi-query max-sim: a chunk closest to ANY query vector wins; a
+   single-query list ranks exactly like the legacy single-vector search; an
+   empty query list returns [].
 """
 
 from __future__ import annotations
@@ -48,7 +54,7 @@ class TestCosineOrdering:
             }
         )
 
-        hits = index.search([1.0, 0.0, 0.0], limit=10)
+        hits = index.search([[1.0, 0.0, 0.0]], limit=10)
 
         assert [hit.chunk_id for hit in hits] == [
             "c-aligned",
@@ -69,24 +75,81 @@ class TestCosineOrdering:
             }
         )
 
-        hits = index.search([3.0, 0.0], limit=2)
+        hits = index.search([[3.0, 0.0]], limit=2)
 
         assert hits[0].score == pytest.approx(hits[1].score)
         assert not math.isnan(hits[0].score)
 
-    def test_query_as_ndarray_accepted(self) -> None:
+
+class TestMultiQueryMaxSim:
+    def test_chunk_closest_to_any_query_wins(self) -> None:
+        """A chunk mediocre for query 1 but perfect for query 2 must win.
+
+        For query 1 alone, "med" (0.8) outranks "best2" (0.0); max-sim lifts
+        "best2" to 1.0 via query 2.
+        """
+        index = VectorIndex(
+            {
+                "med": _blob([0.8, 0.6]),
+                "best2": _blob([0.0, 1.0]),
+                "best1": _blob([1.0, 0.0]),
+            }
+        )
+
+        hits = index.search([[1.0, 0.0], [0.0, 1.0]], limit=3)
+
+        assert [hit.chunk_id for hit in hits] == ["best1", "best2", "med"]
+        assert hits[0].score == pytest.approx(1.0)
+        assert hits[1].score == pytest.approx(1.0)
+        assert hits[2].score == pytest.approx(0.8)
+
+    def test_single_query_list_matches_legacy_single_vector_search(self) -> None:
+        index = VectorIndex(
+            {
+                "c-aligned": _blob([2.0, 0.0, 0.0]),
+                "d-orthogonal": _blob([0.0, 5.0, 0.0]),
+                "a-opposite": _blob([-3.0, 0.0, 0.0]),
+                "b-oblique": _blob([1.0, 1.0, 0.0]),
+            }
+        )
+
+        hits = index.search([[1.0, 0.0, 0.0]], limit=10)
+
+        assert [hit.chunk_id for hit in hits] == [
+            "c-aligned",
+            "b-oblique",
+            "d-orthogonal",
+            "a-opposite",
+        ]
+        assert hits[0].score == pytest.approx(1.0)
+        assert hits[3].score == pytest.approx(-1.0)
+
+    def test_zero_query_in_list_does_not_mask_other_queries(self) -> None:
+        index = VectorIndex({"pos": _blob([1.0, 0.0]), "neg": _blob([-1.0, 0.0])})
+
+        hits = index.search([[0.0, 0.0], [1.0, 0.0]], limit=2)
+
+        assert [hit.chunk_id for hit in hits] == ["pos", "neg"]
+        assert hits[0].score == pytest.approx(1.0)
+        assert hits[1].score == 0.0
+        assert not math.isnan(hits[1].score)
+
+    def test_empty_query_list_returns_empty(self) -> None:
         index = VectorIndex({"a": _blob([1.0, 0.0])})
 
-        hits = index.search(np.asarray([1.0, 0.0], dtype=np.float32), limit=1)
+        assert index.search([], limit=5) == []
 
-        assert hits[0].chunk_id == "a"
+    def test_empty_inner_query_vector_raises(self) -> None:
+        index = VectorIndex({"a": _blob([1.0, 0.0])})
+        with pytest.raises(ValueError):
+            index.search([[]], limit=1)
 
 
 class TestZeroVector:
     def test_stored_zero_vector_scores_exactly_zero(self) -> None:
         index = VectorIndex({"zero": _blob([0.0, 0.0]), "pos": _blob([1.0, 0.0])})
 
-        hits = index.search([1.0, 0.0], limit=2)
+        hits = index.search([[1.0, 0.0]], limit=2)
 
         assert [hit.chunk_id for hit in hits] == ["pos", "zero"]
         assert hits[1].score == 0.0
@@ -95,7 +158,7 @@ class TestZeroVector:
     def test_zero_query_scores_zero_for_all(self) -> None:
         index = VectorIndex({"b": _blob([1.0, 2.0]), "a": _blob([3.0, 4.0])})
 
-        hits = index.search([0.0, 0.0], limit=5)
+        hits = index.search([[0.0, 0.0]], limit=5)
 
         assert [hit.chunk_id for hit in hits] == ["a", "b"]
         assert all(hit.score == 0.0 for hit in hits)
@@ -105,26 +168,26 @@ class TestZeroVector:
 class TestLimit:
     def test_limit_zero_returns_empty(self) -> None:
         index = VectorIndex({"a": _blob([1.0, 0.0])})
-        assert index.search([1.0, 0.0], limit=0) == []
+        assert index.search([[1.0, 0.0]], limit=0) == []
 
     def test_limit_below_collection_size(self) -> None:
         index = VectorIndex({f"v{i}": _blob([1.0, float(i)]) for i in range(4)})
 
-        hits = index.search([1.0, 3.0], limit=2)
+        hits = index.search([[1.0, 3.0]], limit=2)
 
         assert len(hits) == 2
         assert hits[0].chunk_id == "v3"
 
     def test_limit_above_collection_size(self) -> None:
         index = VectorIndex({"a": _blob([1.0, 0.0])})
-        assert len(index.search([1.0, 0.0], limit=99)) == 1
+        assert len(index.search([[1.0, 0.0]], limit=99)) == 1
 
 
 class TestTieBreak:
     def test_identical_vectors_order_by_chunk_id(self) -> None:
         index = VectorIndex({"zz": _blob([1.0, 2.0]), "aa": _blob([1.0, 2.0])})
 
-        hits = index.search([1.0, 2.0], limit=2)
+        hits = index.search([[1.0, 2.0]], limit=2)
 
         assert [hit.chunk_id for hit in hits] == ["aa", "zz"]
         assert hits[0].score == pytest.approx(1.0)
@@ -135,8 +198,8 @@ class TestTieBreak:
             {"m": _blob([1.0, 1.0]), "b": _blob([1.0, 0.0]), "q": _blob([0.0, 1.0])}
         )
 
-        first = index.search([1.0, 1.0], limit=3)
-        second = index.search([1.0, 1.0], limit=3)
+        first = index.search([[1.0, 1.0]], limit=3)
+        second = index.search([[1.0, 1.0]], limit=3)
 
         assert first == second
 
@@ -161,7 +224,7 @@ class TestBlobRoundTrip:
             }
         )
 
-        hits = index.search([1.5, -2.0], limit=4)
+        hits = index.search([[1.5, -2.0]], limit=4)
 
         scores = {hit.chunk_id: hit.score for hit in hits}
         assert scores["same"] == 1.0
@@ -172,26 +235,21 @@ class TestBlobRoundTrip:
 
 class TestEmptyIndexAndDimensions:
     def test_empty_index_returns_empty_list(self) -> None:
-        assert VectorIndex().search([1.0, 0.0], limit=5) == []
+        assert VectorIndex().search([[1.0, 0.0]], limit=5) == []
 
     def test_empty_mapping_returns_empty_list(self) -> None:
-        assert VectorIndex({}).search([1.0, 0.0], limit=5) == []
+        assert VectorIndex({}).search([[1.0, 0.0]], limit=5) == []
 
     def test_dimension_mismatch_raises(self) -> None:
         index = VectorIndex({"a": _blob([1.0, 0.0])})
         with pytest.raises(ValueError):
-            index.search([1.0, 0.0, 0.0], limit=1)
-
-    def test_empty_query_against_non_empty_index_raises(self) -> None:
-        index = VectorIndex({"a": _blob([1.0, 0.0])})
-        with pytest.raises(ValueError):
-            index.search([], limit=1)
+            index.search([[1.0, 0.0, 0.0]], limit=1)
 
     def test_dimension_checked_against_current_vectors_after_replace(self) -> None:
         index = VectorIndex({"a": _blob([1.0, 0.0])})
         index.replace_all({"b": _blob([1.0, 0.0, 0.0])})
         with pytest.raises(ValueError):
-            index.search([1.0, 0.0], limit=1)
+            index.search([[1.0, 0.0]], limit=1)
 
 
 class TestRefresh:
@@ -200,7 +258,7 @@ class TestRefresh:
 
         index.replace_all({"new-c": _blob([0.0, 1.0])})
 
-        hits = index.search([0.0, 1.0], limit=10)
+        hits = index.search([[0.0, 1.0]], limit=10)
         assert [hit.chunk_id for hit in hits] == ["new-c"]
         assert hits[0].score == pytest.approx(1.0)
 
@@ -208,21 +266,21 @@ class TestRefresh:
         index = VectorIndex({"old-a": _blob([1.0, 0.0])})
         index.replace_all({"new-c": _blob([1.0, 0.0])})
 
-        hits = index.search([1.0, 0.0], limit=10)
+        hits = index.search([[1.0, 0.0]], limit=10)
 
         assert [hit.chunk_id for hit in hits] == ["new-c"]
 
     def test_replace_all_with_empty_clears_index(self) -> None:
         index = VectorIndex({"a": _blob([1.0, 0.0])})
         index.replace_all({})
-        assert index.search([1.0, 0.0], limit=5) == []
+        assert index.search([[1.0, 0.0]], limit=5) == []
 
 
 class TestHitMetadata:
     def test_hits_carry_only_chunk_id_and_score(self) -> None:
         index = VectorIndex({"a": _blob([1.0, 0.0])})
 
-        hit = index.search([1.0, 0.0], limit=1)[0]
+        hit = index.search([[1.0, 0.0]], limit=1)[0]
 
         assert hit.chunk_id == "a"
         assert hit.score == pytest.approx(1.0)
@@ -246,7 +304,7 @@ class TestToBlob:
 
     def test_feeds_vector_index_search(self) -> None:
         index = VectorIndex({"a": to_blob([1.0, 0.0])})
-        assert index.search([1.0, 0.0], limit=1)[0].chunk_id == "a"
+        assert index.search([[1.0, 0.0]], limit=1)[0].chunk_id == "a"
 
 
 class TestConcurrentSwap:
@@ -266,7 +324,7 @@ class TestConcurrentSwap:
         gen_a = {f"a{i}": _blob([1.0, float(i), 0.0, 0.0]) for i in range(8)}
         gen_b = {f"b{i}": _blob([1.0, float(i)]) for i in range(3)}
         index = VectorIndex(gen_a)
-        query = [1.0, 2.0, 0.0, 0.0]
+        query = [[1.0, 2.0, 0.0, 0.0]]
 
         illegal: list[str] = []
         stop = threading.Event()
@@ -283,9 +341,7 @@ class TestConcurrentSwap:
                     illegal.append(f"raised {type(exc).__name__}: {exc}")
                     return
                 wrong = [
-                    hit.chunk_id
-                    for hit in hits
-                    if not hit.chunk_id.startswith("a")
+                    hit.chunk_id for hit in hits if not hit.chunk_id.startswith("a")
                 ]
                 if wrong:
                     illegal.append(f"dim-4 query returned {wrong}")

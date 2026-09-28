@@ -77,15 +77,15 @@ class FakeVector(VectorSearch):
         error: Exception | None = None,
         delay: float = 0.0,
     ) -> None:
-        self.calls: list[tuple[list[float], int]] = []
+        self.calls: list[tuple[list[list[float]], int]] = []
         self.entered = False
         self._hits = hits or []
         self._error = error
         self._delay = delay
 
-    def search(self, query: list[float], limit: int) -> list[ChunkHit]:
+    def search(self, queries: list[list[float]], limit: int) -> list[ChunkHit]:
         self.entered = True
-        self.calls.append((list(query), limit))
+        self.calls.append(([list(query) for query in queries], limit))
         if self._delay:
             time.sleep(self._delay)
         if self._error is not None:
@@ -156,7 +156,7 @@ def test_sources_run_concurrently():
     assert len(result.hits) == 2
 
 
-def test_expanded_terms_reach_fts_and_vector_gets_original_embedding():
+def test_expanded_terms_reach_both_sources():
     llm = FakeLLM(
         reply='{"keywords": ["vector search", "semantic retrieval"],'
         ' "queries": ["how does rrf work"]}'
@@ -176,9 +176,31 @@ def test_expanded_terms_reach_fts_and_vector_gets_original_embedding():
         "semantic retrieval",
         "how does rrf work",
     ]
-    assert embedder.calls == [["hybrid search"]]
-    assert vector.calls[0][0] == FakeEmbedder.vector_for("hybrid search")
-    assert vector.calls[0][0] != FakeEmbedder.vector_for("vector search")
+    assert embedder.calls == [["hybrid search", "how does rrf work"]]
+    assert vector.calls[0][0] == [
+        FakeEmbedder.vector_for("hybrid search"),
+        FakeEmbedder.vector_for("how does rrf work"),
+    ]
+
+
+def test_embed_batch_dedupes_and_drops_whitespace_and_skips_keywords():
+    llm = FakeLLM(
+        reply='{"keywords": ["vector search"],'
+        ' "queries": ["HYBRID SEARCH", "   ", "how does rrf work"]}'
+    )
+    embedder = FakeEmbedder()
+    vector = FakeVector(hits=[_hit("a")])
+    fts = FakeFts(hits=[_hit("a")])
+
+    _retriever(embedder, vector, fts, expander=QueryExpander(llm)).search(
+        "hybrid search"
+    )
+
+    assert embedder.calls == [["hybrid search", "how does rrf work"]]
+    assert vector.calls[0][0] == [
+        FakeEmbedder.vector_for("hybrid search"),
+        FakeEmbedder.vector_for("how does rrf work"),
+    ]
 
 
 def test_duplicate_expanded_terms_are_deduped():
@@ -286,6 +308,7 @@ def test_no_expander_means_no_llm_call_and_original_query_everywhere():
     assert llm.calls == []
     assert result.used_expansion is False
     assert embedder.calls == [["hybrid search"]]
+    assert vector.calls[0][0] == [FakeEmbedder.vector_for("hybrid search")]
     assert fts.calls[0][0] == ["hybrid search"]
 
 

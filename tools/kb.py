@@ -94,8 +94,8 @@ class VectorIndexAdapter(VectorSearch):
         self._index = index
         self._metadata = metadata
 
-    def search(self, query: list[float], limit: int) -> list[ChunkHit]:
-        return [self._hydrate(hit) for hit in self._index.search(query, limit)]
+    def search(self, queries: list[list[float]], limit: int) -> list[ChunkHit]:
+        return [self._hydrate(hit) for hit in self._index.search(queries, limit)]
 
     def _hydrate(self, hit: ChunkHit) -> ChunkHit:
         cached = self._metadata.get(hit.chunk_id)
