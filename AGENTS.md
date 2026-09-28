@@ -1,6 +1,6 @@
 # Vektor — Telegram long-polling bot with autonomous AI agent
 
-**Stack:** Python 3.14, [pyTelegramBotAPI](https://github.com/eternnoir/pyTelegramBotAPI), [httpx](https://www.python-httpx.org/), [ruff](https://docs.astral.sh/ruff/), [mypy](https://mypy-lang.org/)
+**Stack:** Python 3.14, [pyTelegramBotAPI](https://github.com/eternnoir/pyTelegramBotAPI), [httpx](https://www.python-httpx.org/), [pypdf](https://pypdf.readthedocs.io/) + [python-docx](https://python-docx.readthedocs.io/) (document extraction), [ruff](https://docs.astral.sh/ruff/), [mypy](https://mypy-lang.org/)
 
 ## Setup
 
@@ -66,6 +66,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `bot.py` | Entrypoint — composition root, wires TeleBot with Agent + ConversationManager + LLM |
 | `config.py` | `.env` loader (stdlib only) |
 | `.env.example` | Template for `.env` |
+| `documents.py` | Document text extraction — `extract_text()`, `DocumentError`, `SUPPORTED_EXTENSIONS`; .txt/.pdf/.docx via pypdf + python-docx (Telegram-free) |
 | `llm/base.py` | Abstract `LLM` interface, `LLMResponse`, `ChatResponse`, `Message`, `ToolSpec`, `ToolCall`, `ToolResult`, `LLMError` |
 | `llm/ollama.py` | `OllamaLLM` — Ollama HTTP API via `httpx` (no Ollama SDK) |
 | `llm/__init__.py` | Re-exports LLM types; lazy-loads `OllamaLLM` |
@@ -81,6 +82,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `tools/truncation.py` | `truncate()` — shared head+tail tool-output truncation; `EXEC_MAX_OUTPUT_CHARS` resolution |
 | `skills/loader.py` | `SkillLoader` — discovers `.md` skill files dynamically |
 | `skills/cve.md` | CVE workflow skill — instructions for using the `get_latest_cve` tool |
+| `skills/documents.md` | Document-upload skill — answering questions about ingested documents via `kb_search` |
 | `metrics.py` | Prometheus metric definitions (`vektor_*`) and metrics server startup |
 | `logging_config.py` | JSON logging, sensitive-data redaction, optional Loki wiring |
 | `loki_handler.py` | `LokiPushHandler` — batches log records and pushes them to Loki |
@@ -108,6 +110,10 @@ Telegram → ConversationManager → Agent → LLM interface → OllamaLLM
                                     │                → McpTool(Tool) → [stdio JSON-RPC] → mcp_servers/cve_server.py → cve_core.py
                                     │                → KbIngestTool / KbSearchTool → retrieval stack (see Retrieval)
                                     └── SkillLoader → skills/*.md
+
+Telegram document → bot.get_file + download_file → documents.extract_text
+                  → KbIngestTool → retrieval stack (before the agent)
+                  caption → ConversationManager → Agent (second reply)
 ```
 
 ### LLM layer
@@ -165,6 +171,15 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 - Storage: one SQLite file (`KB_DB_PATH`) holds the chunks table and the FTS5 index, synced in a single transaction per write; chunk ids are stable sha256 (`doc_id:idx`), so re-ingest is an upsert; embeddings are float32 BLOBs via `to_blob()`.
 - `kb_search` renders a compact fact sheet (`[sources] title (chunk N)` + capped content; raw scores never shown), capped at `EXEC_MAX_OUTPUT_CHARS`.
 
+### Documents
+
+Messages with a document (.txt/.pdf/.docx) are handled by the bot, not the agent:
+
+- **Bot-level ingestion** — `build_document_handler` (`bot.py`) downloads the file (Telegram caps bot downloads at 20 MB — that is the size limit; no env knob), extracts text via `documents.extract_text`, and ingests it with a fresh `KbIngestTool` BEFORE the agent runs. Rationale: extraction output (potentially megabytes) must never cross the LLM tool boundary as an argument.
+- **Two-reply caption UX** — with a caption: ingest confirmation, then the agent's answer (caption routed through `ConversationManager`, so it can immediately `kb_search`). Without: only the confirmation.
+- **Never crash polling** — download/extract/ingest failures and caption LLM/agent errors each produce exactly one friendly reply; logs carry file name and outcome only, never file content or captions.
+- **Gates** — the auth check runs FIRST (unauthorized users' documents are never downloaded); with the KB disabled (`kb=None` / `KB_ENABLED=0`) documents get "Document uploads are not enabled."; a message with both `text` and `document` takes the document branch.
+
 ### Observability
 
 `build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `HybridRetriever` additionally records `vektor_retrieval_expansion_total{status=ok|fallback}`, `vektor_retrieval_latency_seconds{stage=expansion|vector|fts|total}`, and `vektor_retrieval_results{source=vector|fts|final}` — enum labels only. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
@@ -173,8 +188,8 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 
 - `from __future__ import annotations` in every module
 - Logging via module-level logger (`log = logging.getLogger("vektor.xxx")`)
-- `handle_message(message, conv, reply_to)` (`bot.py`) is the testable handler core — it takes an injected `ConversationManager` and a `reply_to` callable
-- `create_bot(conv)` (`bot.py`) wraps `handle_message` in a TeleBot handler — add new handlers there
+- `handle_message(message, conv, reply_to, allowed_usernames=None, document_handler=None)` (`bot.py`) is the testable handler core — it takes an injected `ConversationManager` and a `reply_to` callable; documents are delegated to `document_handler` after the auth gate
+- `create_bot(conv, allowed_usernames=None, kb=None)` (`bot.py`) wraps `handle_message` in a TeleBot handler — add new handlers there
 - Type hints throughout; mypy and ruff must pass
 
 ## Quality
@@ -198,6 +213,8 @@ python -m pytest
 - CveTool tests use `httpx.MockTransport` — no network access needed.
 - Integration tests (`tests/test_cve_integration.py`) are skipped when CVE.org is unreachable.
 - Retrieval tests (RRF, store, chunking, vector index, hybrid, expansion, kb tools, config) use fakes, `httpx.MockTransport`, and tmp SQLite files — no Ollama/network needed.
+- Document tests (`tests/test_documents.py`) build fixtures in-test — a handcrafted minimal PDF (known `Tj` text operator), a python-docx-generated DOCX, plain bytes — fully offline, no binary fixtures committed.
+- Document bot-flow tests (`tests/test_bot_documents.py`) use a fake TeleBot (records get_file/download_file, canned bytes or raises), a real kb stack over tmp SQLite with a deterministic fake embedder, and `ScriptedLLM`/`FakeLLM` — no network, no Ollama.
 - Retrieval-benchmark tests cover only the scoring math and labeled dataset — offline.
 - Benchmarks run via `python -m benchmarks.run` (agent, requires a running Ollama) and `python -m benchmarks.retrieval_bench` (retrieval modes; Recall@K/Precision@K/latency, requires a running Ollama); both are excluded from pytest.
 
@@ -209,6 +226,7 @@ python -m pytest
 - Tools: registration, execution, failure handling, unknown tool, adding tools without loop changes.
 - CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, data-source attribution.
 - Skill loader: discovers `.md` files, ignores non-`.md`, system prompt generation.
-- Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling.
+- Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling, document flow (download/extract/ingest roundtrip, ingestion searchable via kb_search, caption routing two-replies/one-reply, auth gate with no download, KB-disabled reply, error paths — unknown ext, corrupt bytes, API error, embedder failure, caption LLM/agent errors, missing file_path — and document-wins-over-text).
+- Documents: extraction per format (.txt replacement decode, handcrafted PDF `Tj` text, python-docx paragraphs), case-insensitive extensions, unsupported/missing extension and empty filename → `DocumentError`, corrupt bytes → `DocumentError`, content-independence from filename, exact `SUPPORTED_EXTENSIONS`, no Telegram imports (AST-checked).
 - Retrieval: RRF fusion and tie-breaking, store upsert + one-transaction FTS sync + restart hydration, chunking windows, VectorIndex cosine/zero vectors/multi-query max-sim, HybridRetriever fallbacks/concurrency/metrics, expansion ok/fallback parsing, kb ingest→search roundtrips, KB_ENABLED=0 regression, bot composition roots.
 - Retrieval benchmark: recall/precision@K scoring math (dedup, k-truncation, empty cases) and dataset coherence — offline.
