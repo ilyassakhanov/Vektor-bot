@@ -8,7 +8,10 @@
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env  # then edit TELEGRAM_BOT_TOKEN
+ollama pull llama3.2 qwen3:0.6b qwen3-embedding:0.6b
 ```
+
+Default models: `llama3.2` (agent), `qwen3:0.6b` (query expansion), `qwen3-embedding:0.6b` (embeddings).
 
 ## Run
 
@@ -41,6 +44,20 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `LOG_LEVEL` | no | Log level (default `INFO`) |
 | `MCP_STARTUP_TIMEOUT` | no | Seconds to wait for the MCP CVE server subprocess to initialize before falling back to exec-only mode (default `10`) |
 | `MCP_CVE_SERVER_CMD` | no | MCP CVE server subprocess command (space-separated; first token is the executable). Default: `python mcp_servers/cve_server.py` |
+| `KB_ENABLED` | no | Register the knowledge-base tools `kb_ingest`/`kb_search` (default `1`; `0` = exact pre-kb tool set) |
+| `KB_DB_PATH` | no | SQLite file holding chunks + FTS5 (default `data/vektor.db`) |
+| `KB_CHUNK_SIZE` | no | Chunking window in characters (default `800`) |
+| `KB_CHUNK_OVERLAP` | no | Word-aligned overlap between consecutive chunks (default `100`) |
+| `KB_VECTOR_LIMIT` | no | Per-source result limit forwarded to vector search (default `20`) |
+| `KB_FTS_LIMIT` | no | Per-source result limit forwarded to FTS search (default `20`) |
+| `KB_TOP_K` | no | Number of fused hits returned (default `5`) |
+| `KB_RRF_K` | no | RRF k constant — score contribution `1/(k + rank)` (default `60`) |
+| `KB_FTS_ENABLED` | no | FTS5 keyword source enabled (default `1`; FTS5-unavailable warns and degrades to vector-only) |
+| `KB_EXPANSION_ENABLED` | no | LLM query expansion before retrieval (default `1`) |
+| `KB_EXPANSION_TIMEOUT` | no | Expansion LLM call timeout in seconds (default `10.0`) |
+| `KB_EXPANSION_TEMPERATURE` | no | Expansion sampling temperature (default `0.0`) |
+| `OLLAMA_EXPANSION_MODEL` | no | Query-expansion model (default `qwen3:0.6b`) |
+| `OLLAMA_EMBED_MODEL` | no | Embedding model for `/api/embed` (default `qwen3-embedding:0.6b`) |
 
 ## Project structure
 
@@ -69,7 +86,17 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `loki_handler.py` | `LokiPushHandler` — batches log records and pushes them to Loki |
 | `llm/instrumented.py` | `InstrumentedLLM` — records token/latency/cost metrics around an LLM |
 | `tools/instrumented_registry.py` | `InstrumentedToolRegistry` — records tool call/duration metrics |
-| `benchmarks/` | LLM benchmark prompts (`prompts.json`) and runner (`run.py`) — requires Ollama |
+| `retrieval/rrf.py` | `rrf_fuse()` — pure Reciprocal Rank Fusion (`ChunkHit`/`FusedHit`); raw per-source scores never mixed, ties by chunk_id |
+| `retrieval/store.py` | `ChunkStore` — one SQLite file: chunks + FTS5 synced in a single transaction; stable sha256 chunk ids; FTS5 probe → vector-only degradation |
+| `retrieval/chunking.py` | `chunk_text()` — word-aligned fixed-size windows with overlap |
+| `retrieval/embeddings.py` | `Embedder` ABC + `OllamaEmbedder` — `/api/embed` via httpx, MockTransport-testable |
+| `retrieval/expansion.py` | `QueryExpander` — small-model query expansion (temp 0, JSON/comma parsing); never fails, falls back to the original query |
+| `retrieval/config.py` | `RetrievalConfig.from_env()` — single read boundary for all retrieval env knobs, warn-and-fallback |
+| `retrieval/vector_index.py` | `VectorIndex` — numpy float32 cosine search, multi-query max-sim; `to_blob()` BLOB serialization |
+| `retrieval/hybrid.py` | `HybridRetriever` — expand → batch embed → vector ‖ FTS → RRF → top-k; per-source degradation; `vektor_retrieval_*` instrumentation |
+| `tools/kb.py` | `KbIngestTool`/`KbSearchTool` (`kb_ingest`/`kb_search`), `KbStack`, `VectorIndexAdapter`/`StoreFtsAdapter` adapters |
+| `benchmarks/` | LLM benchmark (`prompts.json` + `run.py`) and retrieval benchmark (`retrieval_bench.py`) — require Ollama |
+| `tasks/` | Plan + checklist for the hybrid-search feature (`plan.md`, `todo.md`) |
 | `mypy.ini` | mypy configuration |
 
 ## Architecture
@@ -79,6 +106,7 @@ Telegram → ConversationManager → Agent → LLM interface → OllamaLLM
                                     │
                                     ├── ToolRegistry → ExecTool (shell, curl)
                                     │                → McpTool(Tool) → [stdio JSON-RPC] → mcp_servers/cve_server.py → cve_core.py
+                                    │                → KbIngestTool / KbSearchTool → retrieval stack (see Retrieval)
                                     └── SkillLoader → skills/*.md
 ```
 
@@ -127,9 +155,19 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 6. If scores tie, select the most recently published.
 7. Returns None if no CVE with CVSS exists in the latest window.
 
+### Retrieval
+
+`kb_ingest`/`kb_search` (`tools/kb.py`) are registered behind `KB_ENABLED=1` and drive the retrieval stack:
+
+- Pipeline: optional expansion → embed `[original + alt queries]` in one batch → `ThreadPoolExecutor(max_workers=2)` running vector and FTS in parallel → `rrf_fuse` (k=60) → top-k.
+- Vector search scores each chunk by max cosine across the query vectors (multi-query max-sim, numpy float32). Expansion **keywords stay FTS-side only** — they are BM25 terms, not sentences.
+- Fallbacks, never failures: expansion degrades to the original query; a failing source is skipped while the other still answers (recorded in `note`); FTS5 unavailable or `KB_FTS_ENABLED=0` → vector-only mode.
+- Storage: one SQLite file (`KB_DB_PATH`) holds the chunks table and the FTS5 index, synced in a single transaction per write; chunk ids are stable sha256 (`doc_id:idx`), so re-ingest is an upsert; embeddings are float32 BLOBs via `to_blob()`.
+- `kb_search` renders a compact fact sheet (`[sources] title (chunk N)` + capped content; raw scores never shown), capped at `EXEC_MAX_OUTPUT_CHARS`.
+
 ### Observability
 
-`build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
+`build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `HybridRetriever` additionally records `vektor_retrieval_expansion_total{status=ok|fallback}`, `vektor_retrieval_latency_seconds{stage=expansion|vector|fts|total}`, and `vektor_retrieval_results{source=vector|fts|final}` — enum labels only. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
 
 ## Code conventions
 
@@ -159,7 +197,9 @@ python -m pytest
 - CVE selector tests use raw CVE record dicts — no network access needed.
 - CveTool tests use `httpx.MockTransport` — no network access needed.
 - Integration tests (`tests/test_cve_integration.py`) are skipped when CVE.org is unreachable.
-- Benchmarks run via `python -m benchmarks.run` (requires a running Ollama) and are excluded from pytest.
+- Retrieval tests (RRF, store, chunking, vector index, hybrid, expansion, kb tools, config) use fakes, `httpx.MockTransport`, and tmp SQLite files — no Ollama/network needed.
+- Retrieval-benchmark tests cover only the scoring math and labeled dataset — offline.
+- Benchmarks run via `python -m benchmarks.run` (agent, requires a running Ollama) and `python -m benchmarks.retrieval_bench` (retrieval modes; Recall@K/Precision@K/latency, requires a running Ollama); both are excluded from pytest.
 
 ### Test coverage
 
@@ -170,3 +210,5 @@ python -m pytest
 - CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, data-source attribution.
 - Skill loader: discovers `.md` files, ignores non-`.md`, system prompt generation.
 - Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling.
+- Retrieval: RRF fusion and tie-breaking, store upsert + one-transaction FTS sync + restart hydration, chunking windows, VectorIndex cosine/zero vectors/multi-query max-sim, HybridRetriever fallbacks/concurrency/metrics, expansion ok/fallback parsing, kb ingest→search roundtrips, KB_ENABLED=0 regression, bot composition roots.
+- Retrieval benchmark: recall/precision@K scoring math (dedup, k-truncation, empty cases) and dataset coherence — offline.
