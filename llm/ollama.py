@@ -79,6 +79,9 @@ class OllamaLLM(LLM):
             payload ``keep_alive``. When None, read from
             ``OLLAMA_KEEP_ALIVE`` at construction; unset/empty → omitted
             (unloading the model resets its prompt cache).
+        temperature: Sampling temperature sent as
+            ``options.temperature``. None (default) → omitted entirely;
+            payloads stay byte-identical to the pre-temperature behavior.
     """
 
     def __init__(
@@ -89,6 +92,7 @@ class OllamaLLM(LLM):
         client: httpx.Client | None = None,
         num_ctx: int | None = None,
         keep_alive: str | None = None,
+        temperature: float | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
@@ -100,11 +104,22 @@ class OllamaLLM(LLM):
             keep_alive = _keep_alive_from_env()
         self._num_ctx = num_ctx
         self._keep_alive = keep_alive
+        self._temperature = temperature
 
-    def _apply_cache_options(self, payload: dict[str, Any]) -> None:
-        """Add prompt-cache tuning keys to a request payload when set."""
+    def _apply_options(self, payload: dict[str, Any]) -> None:
+        """Merge configured sampling/cache options into a request payload.
+
+        Options merge into any existing ``payload["options"]`` dict
+        instead of overwriting it, so ``num_ctx`` and ``temperature``
+        coexist when both are set; nothing is added when neither is.
+        """
+        options: dict[str, Any] = dict(payload.get("options") or {})
         if self._num_ctx is not None:
-            payload["options"] = {"num_ctx": self._num_ctx}
+            options["num_ctx"] = self._num_ctx
+        if self._temperature is not None:
+            options["temperature"] = self._temperature
+        if options:
+            payload["options"] = options
         if self._keep_alive is not None:
             payload["keep_alive"] = self._keep_alive
 
@@ -117,7 +132,7 @@ class OllamaLLM(LLM):
             "prompt": message,
             "stream": False,
         }
-        self._apply_cache_options(payload)
+        self._apply_options(payload)
         try:
             resp = self._client.post(
                 f"{self._base_url}/api/generate",
@@ -186,7 +201,7 @@ class OllamaLLM(LLM):
         }
         if tools:
             payload["tools"] = [_tool_spec_to_ollama(t) for t in tools]
-        self._apply_cache_options(payload)
+        self._apply_options(payload)
 
         try:
             resp = self._client.post(
