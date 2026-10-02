@@ -7,16 +7,21 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import telebot
+from telebot.apihelper import ApiTelegramException
 
 import config
+import documents
 import logging_config
 import metrics
 from agent.agent import Agent
 from agent.conversation import ConversationManager
+from documents import DocumentError
 from llm import LLM, LLMError, OllamaLLM
 from llm.instrumented import InstrumentedLLM
 from retrieval.config import RetrievalConfig
@@ -27,6 +32,7 @@ from retrieval.rrf import ChunkHit
 from retrieval.store import ChunkStore
 from retrieval.vector_index import VectorIndex
 from skills.loader import SkillLoader
+from tools.base import ToolError
 from tools.exec import ExecTool
 from tools.instrumented_registry import InstrumentedToolRegistry
 from tools.kb import (
@@ -52,6 +58,9 @@ _DEFAULT_MCP_COMMAND: list[str] = [
     sys.executable,
     str(_PROJECT_ROOT / "mcp_servers" / "cve_server.py"),
 ]
+_DOCUMENT_ERROR_REPLY = "Sorry, I couldn't process that document."
+_LLM_ERROR_REPLY = "Sorry, I couldn't generate a response."
+_DOCUMENT_FALLBACK_NAME = "document"
 
 
 def build_llm() -> LLM:
@@ -251,11 +260,99 @@ def _mcp_command_from_env() -> list[str]:
     return raw.split()
 
 
+def build_document_handler(
+    bot: telebot.TeleBot,
+    kb: KbStack,
+    conv: ConversationManager,
+) -> Callable[..., None]:
+    """Build the document-message handler: download → extract → ingest → 2 replies.
+
+    The document is ingested via a fresh :class:`KbIngestTool` (same wiring
+    as ``build_tool_registry``) BEFORE any agent run — extraction output
+    must never cross the LLM tool boundary as an argument. After a
+    successful ingest the first reply is the ingest confirmation; the agent
+    then ALWAYS runs with a synthetic upload notice (file name + chunk
+    count + ``kb_search`` hint), so the upload lands in conversation
+    context. A non-empty caption is appended to the notice and answered in
+    the same turn. Download, extraction, and ingest failures each produce
+    exactly one user-friendly reply (no agent run) and are never re-raised
+    into the polling loop. Logs carry file name and outcome only — never
+    file content or captions.
+    """
+
+    def handle_document(
+        message: telebot.types.Message,
+        reply_to: Callable[..., None],
+    ) -> None:
+        doc = message.document
+        if doc is None:
+            log.warning("document message without a document payload")
+            reply_to(message, _DOCUMENT_ERROR_REPLY)
+            return
+        file_id = doc.file_id
+        file_name = doc.file_name or _DOCUMENT_FALLBACK_NAME
+        try:
+            file_info = bot.get_file(file_id)
+            file_path = file_info.file_path
+            if not file_path:
+                raise DocumentError("Telegram returned no file path")
+            content = bot.download_file(file_path)
+            text = documents.extract_text(content, file_name)
+            ingest = KbIngestTool(
+                store=kb.store,
+                embedder=kb.embedder,
+                vector_index=kb.vector_index,
+                metadata=kb.metadata,
+                chunk_size=kb.cfg.kb_chunk_size,
+                chunk_overlap=kb.cfg.kb_chunk_overlap,
+            )
+            ingest_result = ingest.execute(text=text, title=file_name)
+        except (ApiTelegramException, DocumentError, ToolError) as exc:
+            log.warning(
+                "document ingest failed for %r: %s", file_name, type(exc).__name__
+            )
+            reply_to(message, _DOCUMENT_ERROR_REPLY)
+            return
+        log.info(
+            "document %r ingested: %s chunks",
+            file_name,
+            _chunk_count(ingest_result),
+        )
+        reply_to(message, ingest_result)
+        notice = (
+            f'[document uploaded: "{file_name}", '
+            f"{_chunk_count(ingest_result)} chunks ingested; "
+            "content is now searchable via kb_search]"
+        )
+        caption = (getattr(message, "caption", None) or "").strip()
+        prompt = f"{notice}\n\n{caption}" if caption else notice
+        try:
+            response = conv.handle(message.chat.id, prompt)
+        except LLMError as exc:
+            log.warning("LLM error on document upload: %s", exc)
+            reply_to(message, _LLM_ERROR_REPLY)
+            return
+        except Exception:
+            log.warning("agent error on document upload", exc_info=True)
+            reply_to(message, _LLM_ERROR_REPLY)
+            return
+        reply_to(message, response)
+
+    return handle_document
+
+
+def _chunk_count(ingest_result: str) -> str:
+    """Extract the chunk count from a ``KbIngestTool`` result string."""
+    match = re.search(r"Ingested (\d+) chunks", ingest_result)
+    return match.group(1) if match else "unknown"
+
+
 def handle_message(
     message: telebot.types.Message,
     conv: ConversationManager,
     reply_to,
     allowed_usernames: set[str] | frozenset[str] | None = None,
+    document_handler: Callable[..., None] | None = None,
 ) -> None:
     """Process a single message: route through the Agent and reply via ``reply_to``.
 
@@ -264,6 +361,12 @@ def handle_message(
 
     When ``allowed_usernames`` is provided, only users whose Telegram username
     is in that set may use the bot; others get a denial reply.
+
+    Document messages are delegated to ``document_handler`` (before the text
+    path) — a document never reaches the agent as message text. When
+    ``document_handler`` is None (knowledge base disabled), documents get a
+    "not enabled" reply. The auth check runs FIRST, so unauthorized users'
+    documents are never downloaded.
     """
     user = message.from_user
     log.info(
@@ -281,11 +384,18 @@ def handle_message(
         log.warning("unauthorized user=%s denied", user.id if user else "?")
         reply_to(message, "Sorry, you are not allowed to use this bot.")
         return
+    doc = getattr(message, "document", None)
+    if doc is not None:
+        if document_handler is None:
+            reply_to(message, "Document uploads are not enabled.")
+            return
+        document_handler(message, reply_to)
+        return
     try:
         response = conv.handle(message.chat.id, message.text or "")
     except LLMError as exc:
         log.warning("LLM error: %s", exc)
-        reply_to(message, "Sorry, I couldn't generate a response.")
+        reply_to(message, _LLM_ERROR_REPLY)
         return
     reply_to(message, response)
 
@@ -293,13 +403,20 @@ def handle_message(
 def create_bot(
     conv: ConversationManager,
     allowed_usernames: frozenset[str] | None = None,
+    kb: KbStack | None = None,
 ) -> telebot.TeleBot:
-    """Wire up a TeleBot with the injected ConversationManager."""
-    bot = telebot.TeleBot(BOT_TOKEN)
+    """Wire up a TeleBot with the injected ConversationManager.
 
-    @bot.message_handler(func=lambda m: True)
+    When ``kb`` is provided, document uploads are enabled: the wired
+    handler downloads → extracts → ingests documents into the knowledge
+    base before the agent runs (see :func:`build_document_handler`).
+    """
+    bot = telebot.TeleBot(BOT_TOKEN)
+    document_handler = build_document_handler(bot, kb, conv) if kb is not None else None
+
+    @bot.message_handler(func=lambda m: True, content_types=["text", "document"])
     def on_message(message: telebot.types.Message) -> None:
-        handle_message(message, conv, bot.reply_to, allowed_usernames)
+        handle_message(message, conv, bot.reply_to, allowed_usernames, document_handler)
 
     return bot
 
@@ -343,7 +460,7 @@ def main() -> None:
             log.info("Allowed users: %d", len(allowed))
         else:
             log.warning("No ALLOWED_USERNAMES set — all users denied.")
-        bot = create_bot(conv, allowed)
+        bot = create_bot(conv, allowed, kb=kb)
         log.info("Starting bot (polling)...")
         try:
             bot.infinity_polling()
