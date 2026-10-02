@@ -265,17 +265,19 @@ def build_document_handler(
     kb: KbStack,
     conv: ConversationManager,
 ) -> Callable[..., None]:
-    """Build the document-message handler: download → extract → ingest → reply.
+    """Build the document-message handler: download → extract → ingest → 2 replies.
 
     The document is ingested via a fresh :class:`KbIngestTool` (same wiring
     as ``build_tool_registry``) BEFORE any agent run — extraction output
-    must never cross the LLM tool boundary as an argument. If the document
-    carries a non-empty caption, the caption is routed through ``conv`` and
-    the agent's response is sent as a second reply, so the agent can
-    immediately ``kb_search`` the ingested content. Download, extraction,
-    and ingest failures each produce exactly one user-friendly reply and
-    are never re-raised into the polling loop. Logs carry file name and
-    outcome only — never file content or captions.
+    must never cross the LLM tool boundary as an argument. After a
+    successful ingest the first reply is the ingest confirmation; the agent
+    then ALWAYS runs with a synthetic upload notice (file name + chunk
+    count + ``kb_search`` hint), so the upload lands in conversation
+    context. A non-empty caption is appended to the notice and answered in
+    the same turn. Download, extraction, and ingest failures each produce
+    exactly one user-friendly reply (no agent run) and are never re-raised
+    into the polling loop. Logs carry file name and outcome only — never
+    file content or captions.
     """
 
     def handle_document(
@@ -317,17 +319,21 @@ def build_document_handler(
             _chunk_count(ingest_result),
         )
         reply_to(message, ingest_result)
+        notice = (
+            f'[document uploaded: "{file_name}", '
+            f"{_chunk_count(ingest_result)} chunks ingested; "
+            "content is now searchable via kb_search]"
+        )
         caption = (getattr(message, "caption", None) or "").strip()
-        if not caption:
-            return
+        prompt = f"{notice}\n\n{caption}" if caption else notice
         try:
-            response = conv.handle(message.chat.id, caption)
+            response = conv.handle(message.chat.id, prompt)
         except LLMError as exc:
-            log.warning("LLM error on document caption: %s", exc)
+            log.warning("LLM error on document upload: %s", exc)
             reply_to(message, _LLM_ERROR_REPLY)
             return
         except Exception:
-            log.warning("agent error on document caption", exc_info=True)
+            log.warning("agent error on document upload", exc_info=True)
             reply_to(message, _LLM_ERROR_REPLY)
             return
         reply_to(message, response)
@@ -408,7 +414,7 @@ def create_bot(
     bot = telebot.TeleBot(BOT_TOKEN)
     document_handler = build_document_handler(bot, kb, conv) if kb is not None else None
 
-    @bot.message_handler(func=lambda m: True)
+    @bot.message_handler(func=lambda m: True, content_types=["text", "document"])
     def on_message(message: telebot.types.Message) -> None:
         handle_message(message, conv, bot.reply_to, allowed_usernames, document_handler)
 

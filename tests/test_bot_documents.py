@@ -1,4 +1,6 @@
-"""Tests for the document-upload flow — bot-level ingest + caption routing.
+"""Tests for the document-upload flow — bot-level ingest, then every upload
+routes an upload notice (+ caption) through the conversation: confirmation
++ agent reply.
 
 Offline: a fake TeleBot records get_file/download_file calls and hands out
 canned bytes; the kb stack is real over a tmp SQLite DB with a deterministic
@@ -187,16 +189,17 @@ def _handle_document(
 def test_document_downloaded_extracted_ingested_confirmed(tmp_path: Path) -> None:
     bot = FakeBot(_DOC_BODY.encode())
     kb = _make_kb(tmp_path)
-    llm = ScriptedLLM([])
+    llm = ScriptedLLM([ChatResponse(content="noted")])
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
     assert bot.get_file_calls == [_FILE_ID]
     assert bot.download_calls == [_FILE_PATH]
-    assert len(replies) == 1
+    assert len(replies) == 2
     assert replies[0].startswith(_CONFIRMATION_PREFIX)
     assert "notes.txt" in replies[0]
-    assert llm.chat_calls == []
+    assert replies[1] == "noted"
+    assert len(llm.chat_calls) == 1
 
 
 def test_ingested_document_findable_via_kb_search(tmp_path: Path) -> None:
@@ -204,7 +207,11 @@ def test_ingested_document_findable_via_kb_search(tmp_path: Path) -> None:
     kb = _make_kb(tmp_path)
     replies: list[str] = []
     _handle_document(
-        bot, kb, _make_conv(ScriptedLLM([])), _make_doc_message("notes.txt"), replies
+        bot,
+        kb,
+        _make_conv(ScriptedLLM([ChatResponse(content="done")])),
+        _make_doc_message("notes.txt"),
+        replies,
     )
     search = KbSearchTool(retriever=kb.retriever, store=kb.store)
     result = search.execute(query="needle")
@@ -245,18 +252,22 @@ def test_caption_routed_to_agent_two_replies_in_order(tmp_path: Path) -> None:
     assert replies[1] == "agent answer"
     messages, _tools, _system = llm.chat_calls[0]
     assert messages[-1].role == "user"
-    assert messages[-1].content == caption
+    prompt = messages[-1].content
+    assert "notes.txt" in prompt
+    assert "kb_search" in prompt
+    assert prompt.endswith(caption)
 
 
-def test_no_caption_exactly_one_reply(tmp_path: Path) -> None:
-    llm = ScriptedLLM([])
+def test_no_caption_two_replies_confirmation_then_agent(tmp_path: Path) -> None:
+    llm = ScriptedLLM([ChatResponse(content="ack — the document is searchable")])
     conv = _make_conv(llm)
     bot = FakeBot(_DOC_BODY.encode())
     kb = _make_kb(tmp_path)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert len(replies) == 1
-    assert llm.chat_calls == []
+    assert len(replies) == 2
+    assert replies[0].startswith(_CONFIRMATION_PREFIX)
+    assert replies[1] == "ack — the document is searchable"
 
 
 def test_caption_llm_error_confirmation_then_friendly_reply(tmp_path: Path) -> None:
@@ -425,7 +436,8 @@ def test_caption_non_llm_error_still_gets_friendly_reply(tmp_path: Path) -> None
 
 def test_document_wins_over_text(tmp_path: Path) -> None:
     """A message with BOTH document and text takes the document path —
-    the text is never sent to the LLM."""
+    the plain text is never sent to the LLM; the agent gets the upload
+    notice instead."""
     bot = FakeBot(_DOC_BODY.encode())
     kb = _make_kb(tmp_path)
     llm = FakeLLM(reply="text answer")
@@ -437,10 +449,34 @@ def test_document_wins_over_text(tmp_path: Path) -> None:
     handle_message(message, conv, _capture(replies), None, handler)
     assert bot.get_file_calls == [_FILE_ID]
     assert bot.download_calls == [_FILE_PATH]
-    assert len(replies) == 1
+    assert len(replies) == 2
     assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert llm.chat_calls == []
+    assert replies[1] == "text answer"
+    assert len(llm.chat_calls) == 1
+    messages, _tools, _system = llm.chat_calls[0]
+    assert "hello as plain text" not in messages[-1].content
+    assert "notes.txt" in messages[-1].content
     assert llm.calls == []
+
+
+def test_document_upload_propagates_context_to_next_message(tmp_path: Path) -> None:
+    """Core regression: a no-caption upload enters conversation context —
+    a follow-up message's LLM history contains the upload turn."""
+    llm = ScriptedLLM(
+        [ChatResponse(content="ack"), ChatResponse(content="it has needles")]
+    )
+    conv = _make_conv(llm)
+    bot = FakeBot(_DOC_BODY.encode())
+    kb = _make_kb(tmp_path)
+    replies: list[str] = []
+    _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
+    assert len(replies) == 2
+    assert replies[0].startswith(_CONFIRMATION_PREFIX)
+    assert replies[1] == "ack"
+    follow_up = conv.handle(42, "what was in the document?")
+    assert follow_up == "it has needles"
+    history, _tools, _system = llm.chat_calls[1]
+    assert any(m.role == "user" and "notes.txt" in m.content for m in history)
 
 
 # --- Composition roots ---------------------------------------------------------------
@@ -478,3 +514,16 @@ def test_create_bot_without_kb_skips_document_handler(monkeypatch) -> None:
     monkeypatch.setattr(bot_module, "build_document_handler", unexpected_builder)
     created = create_bot(_make_conv(ScriptedLLM([])), kb=None)
     assert created is not None
+
+
+def test_create_bot_registers_document_content_type(tmp_path: Path) -> None:
+    """Regression: the catch-all handler must accept document messages, not
+    just text — TeleBot defaults content_types to ['text'] when omitted,
+    which silently drops document uploads before handle_message runs."""
+    kb = _make_kb(tmp_path)
+    conv = _make_conv(ScriptedLLM([]))
+    tb = create_bot(conv, kb=kb)
+    assert tb.message_handlers, "no message handlers registered"
+    content_types = tb.message_handlers[0]["filters"]["content_types"]
+    assert "document" in content_types
+    assert "text" in content_types

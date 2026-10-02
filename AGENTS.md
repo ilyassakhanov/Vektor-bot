@@ -113,7 +113,7 @@ Telegram → ConversationManager → Agent → LLM interface → OllamaLLM
 
 Telegram document → bot.get_file + download_file → documents.extract_text
                   → KbIngestTool → retrieval stack (before the agent)
-                  caption → ConversationManager → Agent (second reply)
+                  → upload notice [+ caption] → ConversationManager → Agent (second reply)
 ```
 
 ### LLM layer
@@ -173,11 +173,11 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 
 ### Documents
 
-Messages with a document (.txt/.pdf/.docx) are handled by the bot, not the agent:
+Messages with a document (.txt/.pdf/.docx) are ingested by the bot before the agent runs:
 
 - **Bot-level ingestion** — `build_document_handler` (`bot.py`) downloads the file (Telegram caps bot downloads at 20 MB — that is the size limit; no env knob), extracts text via `documents.extract_text`, and ingests it with a fresh `KbIngestTool` BEFORE the agent runs. Rationale: extraction output (potentially megabytes) must never cross the LLM tool boundary as an argument.
-- **Two-reply caption UX** — with a caption: ingest confirmation, then the agent's answer (caption routed through `ConversationManager`, so it can immediately `kb_search`). Without: only the confirmation.
-- **Never crash polling** — download/extract/ingest failures and caption LLM/agent errors each produce exactly one friendly reply; logs carry file name and outcome only, never file content or captions.
+- **Two-reply UX** — EVERY successful upload produces exactly two replies: the ingest confirmation, then the agent's response. The agent always runs on a synthetic upload notice (`[document uploaded: "{file_name}", {N} chunks ingested; content is now searchable via kb_search]`), with the caption appended when present; no-caption uploads get an agent acknowledgement as the second reply. The upload turn is recorded in the conversation context (`ConversationManager`), so follow-up questions can `kb_search` it.
+- **Never crash polling** — download/extract/ingest failures produce exactly one friendly reply (no agent run); LLM/agent errors on the upload turn produce the confirmation + exactly one friendly reply. Logs carry file name and outcome only, never file content or captions.
 - **Gates** — the auth check runs FIRST (unauthorized users' documents are never downloaded); with the KB disabled (`kb=None` / `KB_ENABLED=0`) documents get "Document uploads are not enabled."; a message with both `text` and `document` takes the document branch.
 
 ### Observability
@@ -226,7 +226,7 @@ python -m pytest
 - Tools: registration, execution, failure handling, unknown tool, adding tools without loop changes.
 - CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, data-source attribution.
 - Skill loader: discovers `.md` files, ignores non-`.md`, system prompt generation.
-- Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling, document flow (download/extract/ingest roundtrip, ingestion searchable via kb_search, caption routing two-replies/one-reply, auth gate with no download, KB-disabled reply, error paths — unknown ext, corrupt bytes, API error, embedder failure, caption LLM/agent errors, missing file_path — and document-wins-over-text).
+- Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling, document flow (download/extract/ingest roundtrip, ingestion searchable via kb_search, two-reply invariant — every upload gets confirmation + agent reply via the upload notice [+ caption] — and upload context propagating to follow-up messages, auth gate with no download, KB-disabled reply, error paths — unknown ext, corrupt bytes, API error, embedder failure, agent-turn LLM/agent errors, missing file_path — and document-wins-over-text).
 - Documents: extraction per format (.txt replacement decode, handcrafted PDF `Tj` text, python-docx paragraphs), case-insensitive extensions, unsupported/missing extension and empty filename → `DocumentError`, corrupt bytes → `DocumentError`, content-independence from filename, exact `SUPPORTED_EXTENSIONS`, no Telegram imports (AST-checked).
 - Retrieval: RRF fusion and tie-breaking, store upsert + one-transaction FTS sync + restart hydration, chunking windows, VectorIndex cosine/zero vectors/multi-query max-sim, HybridRetriever fallbacks/concurrency/metrics, expansion ok/fallback parsing, kb ingest→search roundtrips, KB_ENABLED=0 regression, bot composition roots.
 - Retrieval benchmark: recall/precision@K scoring math (dedup, k-truncation, empty cases) and dataset coherence — offline.

@@ -1,6 +1,6 @@
-Documents the user sends (.txt, .pdf, .docx) are automatically extracted and
-ingested into the knowledge base BEFORE you run. You never see the raw file —
-its content is only reachable through `kb_search`.
+User documents (.txt, .pdf, .docx) are ingested into the knowledge base
+BEFORE you run. Every upload sends you a notice (file name + chunk count),
+with any caption appended — answer it and later questions via `kb_search`.
 
 Rules:
 
