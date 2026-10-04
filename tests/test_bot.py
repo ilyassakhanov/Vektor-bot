@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.agent import Agent
 from agent.conversation import ConversationManager
 from bot import create_bot, handle_message
@@ -121,3 +123,59 @@ def test_none_allowed_set_allows_everyone():
     """When auth is disabled (None), the LLM is always called."""
     llm = FakeLLM(reply="hello")
     assert _run_auth("hi", llm, None, username="intruder") == "hello"
+
+
+# --- single-user knowledge base enforcement ----------------------------------------
+
+
+def _kb_stack(monkeypatch, tmp_path):
+    """Build a real KB stack over a tmp database (expansion off, fast)."""
+    from bot import build_kb_stack
+
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+    stack = build_kb_stack()
+    assert stack is not None
+    return stack
+
+
+def test_ensure_kb_single_user_rejects_multiple_users(monkeypatch, tmp_path):
+    """KB + several allowed users would leak every document to everyone."""
+    from bot import KBMultiUserError, ensure_kb_single_user
+
+    stack = _kb_stack(monkeypatch, tmp_path)
+    try:
+        with pytest.raises(KBMultiUserError, match="single allowed user"):
+            ensure_kb_single_user(stack, frozenset({"alice", "bob"}))
+    finally:
+        stack.close()
+
+
+def test_ensure_kb_single_user_allows_one_user(monkeypatch, tmp_path):
+    from bot import ensure_kb_single_user
+
+    stack = _kb_stack(monkeypatch, tmp_path)
+    try:
+        ensure_kb_single_user(stack, frozenset({"alice"}))
+    finally:
+        stack.close()
+
+
+def test_ensure_kb_single_user_allows_empty_allowlist(monkeypatch, tmp_path):
+    """Nobody is allowed in — a shared KB nobody can search is not a leak."""
+    from bot import ensure_kb_single_user
+
+    stack = _kb_stack(monkeypatch, tmp_path)
+    try:
+        ensure_kb_single_user(stack, frozenset())
+    finally:
+        stack.close()
+
+
+def test_ensure_kb_single_user_ignores_disabled_kb():
+    """kb=None (disabled/degraded) is never a violation, whatever the list."""
+    from bot import ensure_kb_single_user
+
+    ensure_kb_single_user(None, frozenset({"a", "b", "c"}))
+    ensure_kb_single_user(None, None)

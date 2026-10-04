@@ -17,12 +17,20 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import httpx
+import numpy as np
 
 log = logging.getLogger("vektor.retrieval.embeddings")
 
 _DEFAULT_BASE_URL = "http://localhost:11434"
 _DEFAULT_MODEL = "qwen3-embedding:0.6b"
 _DEFAULT_TIMEOUT = 120.0
+
+# float() proves a component is a finite binary64 — not that it survives
+# the float32 conversion the retrieval pipeline performs at every boundary
+# (to_blob serialization, VectorIndex query decoding). 1e39 is finite as a
+# Python float but overflows to inf in float32, poisoning cosine norms and
+# rankings. Components must fit the float32 finite range.
+_F32_MAX = float(np.finfo(np.float32).max)
 
 
 class EmbeddingError(Exception):
@@ -85,12 +93,15 @@ class OllamaEmbedder(Embedder):
                 components — ``NaN``/``inf`` coerce cleanly through
                 ``float()`` and even arrive as JSON strings like
                 ``"NaN"``, but they poison cosine norms/scores and make
-                rankings invalid or nondeterministic — or components
+                rankings invalid or nondeterministic — components
                 that overflow a float, for which ``float()`` raises
-                ``OverflowError`` on huge JSON integers). Rejecting
-                malformed batches here keeps bad vectors out of the
-                store, where they would break the vector index after the
-                write had already committed.
+                ``OverflowError`` on huge JSON integers, and components
+                outside the finite float32 range — a value like ``1e39``
+                is a finite binary64 but overflows to ``inf`` in the
+                float32 conversion the retrieval pipeline performs).
+                Rejecting malformed batches here keeps bad vectors out of
+                the store, where they would break the vector index after
+                the write had already committed.
         """
         log.debug("embed model=%s texts=%d", self._model, len(texts))
         if not texts:
@@ -133,6 +144,8 @@ class OllamaEmbedder(Embedder):
                     "Malformed response from embedding service."
                 ) from exc
             if not all(math.isfinite(component) for component in components):
+                raise EmbeddingError("Malformed response from embedding service.")
+            if any(abs(component) > _F32_MAX for component in components):
                 raise EmbeddingError("Malformed response from embedding service.")
             vectors.append(components)
         if len({len(vector) for vector in vectors}) > 1:

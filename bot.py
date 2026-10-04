@@ -63,6 +63,47 @@ _LLM_ERROR_REPLY = "Sorry, I couldn't generate a response."
 _DOCUMENT_FALLBACK_NAME = "document"
 
 
+class KBMultiUserError(Exception):
+    """The knowledge base is enabled for more than one allowed user.
+
+    The KB has no per-user namespace: chunks carry no owner, and
+    ``kb_search``/``kb_ingest`` are invoked by the shared agent without
+    any principal context, so every allowed user can retrieve every
+    stored document. The composition root therefore refuses to start a
+    multi-user KB — the safe resolutions are listing exactly one allowed
+    username or setting ``KB_ENABLED=0``.
+    """
+
+
+def ensure_kb_single_user(
+    kb: KbStack | None,
+    allowed_usernames: set[str] | frozenset[str] | None,
+) -> None:
+    """Refuse a KB-enabled bot that serves more than one allowed user.
+
+    ``ALLOWED_USERNAMES`` supports several tags, but the knowledge base is
+    a single shared store with no owner predicate on search — user A's
+    uploads would be searchable by user B. Until the KB grows per-user
+    namespacing, a KB-enabled bot must serve at most one user. ``kb=None``
+    (KB disabled) is never a violation; an empty allow-list is safe (the
+    bot denies everyone).
+
+    Raises:
+        KBMultiUserError: when ``kb`` is built and more than one username
+            is allowed.
+    """
+    if kb is None or allowed_usernames is None:
+        return
+    if len(allowed_usernames) > 1:
+        raise KBMultiUserError(
+            "KB_ENABLED=1 supports a single allowed user, but"
+            f" ALLOWED_USERNAMES lists {len(allowed_usernames)}."
+            " The knowledge base has no per-user namespace — any allowed"
+            " user can search every stored document. Keep one allowed"
+            " username or set KB_ENABLED=0."
+        )
+
+
 def build_llm() -> LLM:
     """Composition root — pick the LLM provider from configuration."""
     return InstrumentedLLM(
@@ -507,6 +548,11 @@ def main() -> None:
             log.info("Allowed users: %d", len(allowed))
         else:
             log.warning("No ALLOWED_USERNAMES set — all users denied.")
+        try:
+            ensure_kb_single_user(kb, allowed)
+        except KBMultiUserError as exc:
+            log.error("%s", exc)
+            raise SystemExit(1) from exc
         bot = create_bot(conv, allowed, kb=kb)
         log.info("Starting bot (polling)...")
         try:

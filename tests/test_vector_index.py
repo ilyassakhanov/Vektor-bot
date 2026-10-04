@@ -251,6 +251,12 @@ class TestEmptyIndexAndDimensions:
         with pytest.raises(ValueError):
             index.search([[1.0, 0.0]], limit=1)
 
+    def test_float32_overflow_query_raises(self) -> None:
+        """1e39 is finite as binary64 but overflows to inf in the float32 cast."""
+        index = VectorIndex({"a": _blob([1.0, 0.0])})
+        with pytest.raises(ValueError, match="float32"):
+            index.search([[1e39, 0.0]], limit=1)
+
 
 class TestRefresh:
     def test_replace_all_swaps_vectors_atomically(self) -> None:
@@ -305,6 +311,20 @@ class TestToBlob:
     def test_feeds_vector_index_search(self) -> None:
         index = VectorIndex({"a": to_blob([1.0, 0.0])})
         assert index.search([[1.0, 0.0]], limit=1)[0].chunk_id == "a"
+
+    def test_rejects_float32_overflow_component(self) -> None:
+        """A finite binary64 overflowing the float32 cast must not persist.
+
+        The embedder validates the range first; this is the defensive
+        boundary for direct callers — an inf BLOB would poison cosine
+        norms and rankings after a clean-looking write.
+        """
+        with pytest.raises(ValueError, match="float32"):
+            to_blob([1e39])
+
+    def test_rejects_nan_component(self) -> None:
+        with pytest.raises(ValueError, match="float32"):
+            to_blob([float("nan")])
 
 
 class TestConcurrentSwap:

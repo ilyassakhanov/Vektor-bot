@@ -173,6 +173,32 @@ def test_embed_huge_integer_component_raises_embedding_error():
         embedder.embed(["a"])
 
 
+def test_embed_float32_overflow_component_raises_embedding_error():
+    """1e39 is a finite binary64 but overflows to inf in the float32 cast.
+
+    math.isfinite() alone admits it; the retrieval pipeline converts to
+    float32 at every boundary (to_blob, query decoding), so such a vector
+    would poison cosine norms and rankings after persisting cleanly.
+    """
+    client = _make_client(httpx.Response(200, json={"embeddings": [[0.1, 1e39]]}))
+    embedder = OllamaEmbedder(client=client)
+    with pytest.raises(EmbeddingError, match="Malformed"):
+        embedder.embed(["a"])
+
+
+def test_embed_negative_float32_overflow_component_raises_embedding_error():
+    client = _make_client(httpx.Response(200, json={"embeddings": [[-3.5e38]]}))
+    embedder = OllamaEmbedder(client=client)
+    with pytest.raises(EmbeddingError, match="Malformed"):
+        embedder.embed(["a"])
+
+
+def test_embed_component_at_float32_scale_is_accepted():
+    client = _make_client(_ok_response([[1e38, -1e38]]))
+    embedder = OllamaEmbedder(client=client)
+    assert embedder.embed(["a"]) == [[1e38, -1e38]]
+
+
 def test_embed_single_vector_batch_needs_no_dimension_check():
     client = _make_client(_ok_response([[0.1, 0.2, 0.3]]))
     embedder = OllamaEmbedder(client=client)

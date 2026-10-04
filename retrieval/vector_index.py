@@ -38,8 +38,20 @@ def to_blob(vector: list[float] | np.ndarray) -> bytes:
     Pairs with the ``np.frombuffer(blob, dtype=np.float32)`` decode inside
     :class:`VectorIndex` — the encode/decode contract lives entirely in
     this module.
+
+    Raises:
+        ValueError: if any component is non-finite after the float32
+            conversion — a finite binary64 like ``1e39`` overflows to
+            ``inf`` in float32 and would poison cosine norms and rankings
+            if persisted. The embedder validates the float32 range first,
+            so this is defense in depth for direct callers.
     """
-    return np.asarray(vector, dtype=np.float32).tobytes()
+    array = np.asarray(vector, dtype=np.float32)
+    if not np.isfinite(array).all():
+        raise ValueError(
+            "vector component overflows the float32 range (inf/nan after cast)"
+        )
+    return array.tobytes()
 
 
 def _cosine_scores(
@@ -106,16 +118,22 @@ class VectorIndex:
 
         Raises:
             ValueError: if any query vector's dimensionality differs from
-                the indexed vectors' dimensionality (only when the index is
-                non-empty).
+                the indexed vectors' dimensionality, or any query
+                component is non-finite after the float32 conversion
+                (only when the index is non-empty).
         """
         ids, matrix = self._state
         if matrix is None or limit <= 0 or not queries:
             return []
 
-        query_vectors = [
-            np.asarray(query, dtype=np.float32).ravel() for query in queries
-        ]
+        query_vectors: list[np.ndarray] = []
+        for query in queries:
+            query_vector = np.asarray(query, dtype=np.float32).ravel()
+            if not np.isfinite(query_vector).all():
+                raise ValueError(
+                    "query component overflows the float32 range (inf/nan after cast)"
+                )
+            query_vectors.append(query_vector)
         for query_vector in query_vectors:
             if query_vector.shape[0] != matrix.shape[1]:
                 raise ValueError(

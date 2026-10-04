@@ -32,7 +32,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `OLLAMA_MODEL` | no | Ollama model name (default `llama3.2`) |
 | `OLLAMA_NUM_CTX` | no | Ollama context window size sent as payload `options.num_ctx`; unset = Ollama's own default (a too-small value silently truncates context — set only if prompts approach the default window) |
 | `OLLAMA_KEEP_ALIVE` | no | Ollama model keep-alive duration (e.g. `30m`) sent as payload `keep_alive` — keeps the model (and its prompt cache) loaded between calls; unset = Ollama default |
-| `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed) |
+| `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed). With `KB_ENABLED=1` at most one username is permitted — the KB has no per-user namespace, so `main()` exits non-zero when several are listed |
 | `EXEC_TIMEOUT` | no | Timeout in seconds for the `exec` tool, the MCP CVE server httpx calls, and the MCP round-trip (default `30`) |
 | `EXEC_MAX_OUTPUT_CHARS` | no | Cap for tool output (combined exec stdout/stderr body and CVE fact sheet); over-cap output keeps head+tail with a `... [truncated N chars] ...` marker, exit-code line always preserved (default `4000`) |
 | `AGENT_MAX_ITERATIONS` | no | Maximum agent loop iterations (default `8`) |
@@ -168,7 +168,8 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 - Pipeline: optional expansion → embed `[original + alt queries]` in one batch → `ThreadPoolExecutor(max_workers=2)` running vector and FTS in parallel → `rrf_fuse` (k=60) → top-k.
 - Vector search scores each chunk by max cosine across the query vectors (multi-query max-sim, numpy float32). Expansion **keywords stay FTS-side only** — they are BM25 terms, not sentences.
 - Fallbacks, never failures: expansion degrades to the original query; a failing source is skipped while the other still answers (recorded in `note`); FTS5 unavailable or `KB_FTS_ENABLED=0` → vector-only mode.
-- Storage: one SQLite file (`KB_DB_PATH`) holds the chunks table and the FTS5 index, synced in a single transaction per write; chunk ids are stable sha256 (`doc_id:idx`), so re-ingest is an upsert; embeddings are float32 BLOBs via `to_blob()`.
+- Storage: one SQLite file (`KB_DB_PATH`) holds the chunks table and the FTS5 index, synced in a single transaction per write; chunk ids are stable sha256 (`doc_id:idx`), so re-ingest is an upsert; embeddings are float32 BLOBs via `to_blob()`; the embedder rejects components outside the finite float32 range and `to_blob()` re-checks the cast.
+- Single-user scope: the KB has no per-user namespace (tools receive no principal context — the shared agent calls `kb_search`/`kb_ingest` without knowing the chat), so `ensure_kb_single_user` makes `main()` exit non-zero when `KB_ENABLED=1` and `ALLOWED_USERNAMES` lists more than one user. Per-chat namespacing (context plumbing + owner-scoped `doc_id`) is future work.
 - `kb_search` renders a compact fact sheet (`[sources] title (chunk N)` + capped content; raw scores never shown), capped at `EXEC_MAX_OUTPUT_CHARS`.
 
 ### Documents
