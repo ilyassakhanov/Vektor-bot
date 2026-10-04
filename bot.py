@@ -168,15 +168,20 @@ def build_retriever(cfg: RetrievalConfig | None = None) -> HybridRetriever | Non
 def build_tool_registry(
     mcp_client: McpClient | None = None,
     kb: KbStack | None = None,
+    auto_build_kb: bool = True,
 ) -> ToolRegistry:
     """Build the tool registry with all available tools.
 
-    When ``kb`` is None the knowledge-base stack is auto-built from the
-    environment (``KB_ENABLED``, default on), so ``python bot.py`` works
-    unchanged; an auto-build failure degrades to a kb-less registry with a
-    warning, mirroring the MCP fallback — except a persisted-embedding-model
-    conflict (:class:`KBModelError`), which is a configuration error and
-    propagates. Pass an explicit stack to inject test doubles.
+    When ``kb`` is None AND ``auto_build_kb`` is true the knowledge-base
+    stack is auto-built from the environment (``KB_ENABLED``, default on),
+    so ``python bot.py`` works unchanged; an auto-build failure degrades to
+    a kb-less registry with a warning, mirroring the MCP fallback — except
+    a persisted-embedding-model conflict (:class:`KBModelError`), which is
+    a configuration error and propagates. Pass an explicit stack to inject
+    test doubles. ``main`` passes ``auto_build_kb=False``: it builds the
+    stack itself, so a ``None`` there means "degraded/disabled at startup"
+    and must NOT be retried — a retry would register kb tools backed by an
+    untracked, unclosed stack while document uploads stay disabled.
     ``KB_ENABLED=0`` yields the exact pre-kb tool set.
     """
     reg = InstrumentedToolRegistry()
@@ -185,7 +190,7 @@ def build_tool_registry(
     if mcp_client is not None:
         for spec in mcp_client.specs():
             reg.register(McpTool(client=mcp_client, spec=spec))
-    if kb is None:
+    if kb is None and auto_build_kb:
         try:
             kb = build_kb_stack()
         except KBModelError:
@@ -483,13 +488,13 @@ def main() -> None:
             )
         try:
             mcp_client.start()
-            reg = build_tool_registry(mcp_client, kb=kb)
+            reg = build_tool_registry(mcp_client, kb=kb, auto_build_kb=False)
         except Exception:
             log.warning(
                 "MCP CVE server failed to start; running exec-only", exc_info=True
             )
             metrics.mcp_server_up.set(0)
-            reg = build_tool_registry(None, kb=kb)
+            reg = build_tool_registry(None, kb=kb, auto_build_kb=False)
         conv = build_conversation_manager(llm, tools=reg)
         allowed = load_allowed_usernames()
         if allowed:

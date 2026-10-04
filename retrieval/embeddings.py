@@ -12,6 +12,7 @@ client.
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -79,11 +80,15 @@ class OllamaEmbedder(Embedder):
         Raises:
             EmbeddingError: on timeout, connection failure, HTTP error,
                 or a malformed response shape (missing/non-list
-                ``embeddings``, wrong vector count, empty vectors, or
-                inconsistent dimensions across the batch). Rejecting
-                malformed batches here keeps inconsistent vectors out of
-                the store, where they would break the vector index after
-                the write had already committed.
+                ``embeddings``, wrong vector count, empty vectors,
+                inconsistent dimensions across the batch, or non-finite
+                components — ``NaN``/``inf`` coerce cleanly through
+                ``float()`` and even arrive as JSON strings like
+                ``"NaN"``, but they poison cosine norms/scores and make
+                rankings invalid or nondeterministic). Rejecting
+                malformed batches here keeps bad vectors out of the
+                store, where they would break the vector index after the
+                write had already committed.
         """
         log.debug("embed model=%s texts=%d", self._model, len(texts))
         if not texts:
@@ -120,11 +125,14 @@ class OllamaEmbedder(Embedder):
             if not isinstance(vector, list) or not vector:
                 raise EmbeddingError("Malformed response from embedding service.")
             try:
-                vectors.append([float(component) for component in vector])
+                components = [float(component) for component in vector]
             except (TypeError, ValueError) as exc:
                 raise EmbeddingError(
                     "Malformed response from embedding service."
                 ) from exc
+            if not all(math.isfinite(component) for component in components):
+                raise EmbeddingError("Malformed response from embedding service.")
+            vectors.append(components)
         if len({len(vector) for vector in vectors}) > 1:
             raise EmbeddingError("Malformed response from embedding service.")
         return vectors

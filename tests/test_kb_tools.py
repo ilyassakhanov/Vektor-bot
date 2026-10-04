@@ -462,6 +462,39 @@ def test_kb_enabled_default_registers_kb_tools(monkeypatch, tmp_path: Path) -> N
     assert "exec" in names
 
 
+def test_auto_build_kb_false_never_retries_degraded_kb(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """main() after a degraded KB startup passes kb=None WITHOUT auto-build.
+
+    A None kb there means "disabled/degraded at startup" — the registry
+    must not silently rebuild the stack (it would back agent kb tools with
+    an untracked, unclosed stack while document uploads stay disabled).
+    """
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+
+    reg = build_tool_registry(None, kb=None, auto_build_kb=False)
+    names = {spec.name for spec in reg.specs()}
+    assert "kb_ingest" not in names
+    assert "kb_search" not in names
+    assert "exec" in names
+
+    # No stack was built behind the scenes — the DB file was never created.
+    assert not (tmp_path / "kb.db").exists()
+
+
+def test_auto_build_kb_default_still_builds(monkeypatch, tmp_path: Path) -> None:
+    """The default keeps auto-building — plain build_tool_registry(None) works."""
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+    reg = build_tool_registry(None, kb=None)
+    names = {spec.name for spec in reg.specs()}
+    assert {"kb_ingest", "kb_search"} <= names
+
+
 # --- Agent end-to-end -------------------------------------------------------------
 
 

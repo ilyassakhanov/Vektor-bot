@@ -23,6 +23,10 @@ Covered acceptance criteria:
    all_vectors; other documents are untouched; empty list is a no-op.
    An optional meta mapping commits in the same transaction (and survives
    reopen); empty list is a no-op even with meta.
+10. FTS backfill: a database populated in vector-only mode is backfilled
+    into a freshly created chunks_fts (content ingested without FTS5
+    becomes keyword-searchable); an existing chunks_fts is never rebuilt
+    or re-backfilled on reopen.
 """
 
 from __future__ import annotations
@@ -324,6 +328,76 @@ class TestFtsAvailability:
 
         with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
             ChunkStore(tmp_path / "kb.db")
+
+    def test_fts_backfill_after_vector_only_period(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Chunks ingested while FTS5 was down are searchable once it returns."""
+
+        def raise_no_fts5(self: ChunkStore) -> None:
+            raise sqlite3.OperationalError("no such module: fts5")
+
+        monkeypatch.setattr(ChunkStore, "_create_fts_table", raise_no_fts5)
+        store = ChunkStore(tmp_path / "kb.db")
+        store.add_chunks(
+            [
+                _record("doc-1", 0, "postgres replication notes"),
+                _record("doc-1", 1, "WAL archiving details", title="Other"),
+            ]
+        )
+        assert store.fts_available is False
+        assert store.search_fts(["replication"], limit=10) == []
+        store.close()
+
+        monkeypatch.undo()  # FTS5 support is back for the next startup.
+
+        reopened = ChunkStore(tmp_path / "kb.db")
+        try:
+            assert reopened.fts_available is True
+            hits = reopened.search_fts(["replication"], limit=10)
+            assert [hit.chunk_id for hit in hits] == [chunk_id_for("doc-1", 0)]
+            assert [hit.idx for hit in reopened.search_fts(["wal"], limit=10)] == [1]
+        finally:
+            reopened.close()
+
+    def test_fts_backfill_is_not_repeated_on_reopen(self, tmp_path: Path) -> None:
+        """An existing chunks_fts is never rebuilt — no duplicates, no drift fix."""
+        db_path = tmp_path / "kb.db"
+        store = ChunkStore(db_path)
+        store.add_chunks([_record("doc-1", 0, "postgres replication notes")])
+        store.close()
+
+        first = ChunkStore(db_path)
+        try:
+            assert len(first.search_fts(["replication"], limit=10)) == 1
+        finally:
+            first.close()
+
+        second = ChunkStore(db_path)
+        try:
+            assert len(second.search_fts(["replication"], limit=10)) == 1
+        finally:
+            second.close()
+
+    def test_fts_backfill_skipped_when_table_already_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """Backfill is tied to table creation, not a blanket reconciliation."""
+        db_path = tmp_path / "kb.db"
+        store = ChunkStore(db_path)
+        store.add_chunks([_record("doc-1", 0, "searchable content")])
+        store._conn.execute("DELETE FROM chunks_fts")  # simulate FTS-side drift
+        store._conn.commit()
+        store.close()
+
+        reopened = ChunkStore(db_path)
+        try:
+            assert reopened.fts_available is True
+            assert reopened.search_fts(["searchable"], limit=10) == []
+        finally:
+            reopened.close()
 
 
 class TestLifecycle:

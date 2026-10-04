@@ -133,6 +133,33 @@ def test_embed_inconsistent_dimensions_raise_embedding_error():
         embedder.embed(["a", "b"])
 
 
+def test_embed_non_finite_components_raise_embedding_error():
+    # httpx encodes json= with allow_nan=False, so the malformed body is
+    # built raw; Python's json parser accepts the NaN/Infinity literals.
+    body = b'{"embeddings": [[0.1, Infinity], [0.2, NaN]]}'
+    client = _make_client(httpx.Response(200, content=body))
+    embedder = OllamaEmbedder(client=client)
+    with pytest.raises(EmbeddingError, match="Malformed"):
+        embedder.embed(["a", "b"])
+
+
+def test_embed_single_non_finite_component_raises_embedding_error():
+    client = _make_client(httpx.Response(200, content=b'{"embeddings": [[NaN]]}'))
+    embedder = OllamaEmbedder(client=client)
+    with pytest.raises(EmbeddingError, match="Malformed"):
+        embedder.embed(["a"])
+
+
+def test_embed_string_nan_component_raises_embedding_error():
+    """float('NaN') coerces a JSON string — it must still be rejected."""
+    client = _make_client(
+        httpx.Response(200, content=b'{"embeddings": [["NaN", 0.1]]}')
+    )
+    embedder = OllamaEmbedder(client=client)
+    with pytest.raises(EmbeddingError, match="Malformed"):
+        embedder.embed(["a"])
+
+
 def test_embed_single_vector_batch_needs_no_dimension_check():
     client = _make_client(_ok_response([[0.1, 0.2, 0.3]]))
     embedder = OllamaEmbedder(client=client)

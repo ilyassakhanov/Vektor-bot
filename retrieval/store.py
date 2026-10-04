@@ -15,7 +15,11 @@ BM25 values are never mixed with vector similarity scores.
 
 FTS5 availability is probed once at init. When the SQLite build lacks FTS5
 the store logs a warning and continues in vector-only mode: chunks (and
-embedding BLOBs) are still stored, search_fts returns an empty list.
+embedding BLOBs) are still stored, search_fts returns an empty list. When
+FTS5 becomes available on a later startup, the freshly created (empty)
+``chunks_fts`` table is backfilled from ``chunks`` in the same transaction
+that creates it, so content ingested during a vector-only period is
+keyword-searchable too — without rebuilding the index on every restart.
 
 The connection is opened with ``check_same_thread=False`` because the hybrid
 retriever runs FTS searches in ThreadPoolExecutor worker threads; a module
@@ -142,6 +146,9 @@ class ChunkStore:
         The parent directory is not created — callers compose paths. FTS5 is
         probed by creating the virtual table; when unavailable, the store
         degrades to vector-only mode with ``fts_available`` set to False.
+        When the probe succeeds on a database that had no ``chunks_fts``
+        table yet, the new table is backfilled from ``chunks`` — content
+        ingested while FTS5 was unavailable becomes keyword-searchable.
         """
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._lock = threading.Lock()
@@ -151,7 +158,17 @@ class ChunkStore:
                 self._conn.execute(_CREATE_CHUNKS)
                 self._conn.execute(_CREATE_CHUNKS_DOC_ID_INDEX)
                 self._conn.execute(_CREATE_META)
-            self._create_fts_table()
+            fts_existed = self._fts_table_exists()
+            # sqlite3's legacy mode never opens a transaction for DDL, so
+            # the BEGIN here is what makes table creation and the initial
+            # backfill one atomic unit — a crash in between cannot leave a
+            # freshly created, empty chunks_fts that later startups would
+            # treat as already-migrated.
+            with self._conn:
+                self._conn.execute("BEGIN")
+                self._create_fts_table()
+                if not fts_existed:
+                    self._backfill_fts()
         except sqlite3.OperationalError as exc:
             if "fts5" in str(exc).lower():
                 log.warning(
@@ -162,10 +179,39 @@ class ChunkStore:
             raise
         self.fts_available = True
 
+    def _fts_table_exists(self) -> bool:
+        """Return True when ``chunks_fts`` already exists in the database."""
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+        ).fetchone()
+        return row is not None
+
     def _create_fts_table(self) -> None:
-        """Create the FTS5 virtual table; doubles as the capability probe."""
-        with self._conn:
-            self._conn.execute(_CREATE_FTS)
+        """Create the FTS5 virtual table; doubles as the capability probe.
+
+        Runs inside the caller's transaction so the table creation and the
+        initial backfill commit — or roll back — together.
+        """
+        self._conn.execute(_CREATE_FTS)
+
+    def _backfill_fts(self) -> None:
+        """Populate the freshly created ``chunks_fts`` from ``chunks``.
+
+        A database written in vector-only mode (FTS5 unavailable at the
+        time) carries chunk rows with no FTS counterpart. Mirroring them
+        here, in the same transaction as the table creation, keeps keyword
+        search from silently missing everything ingested before FTS5
+        appeared. Runs inside the caller's transaction.
+        """
+        cursor = self._conn.execute(
+            "INSERT INTO chunks_fts (content, chunk_id) SELECT content, id FROM chunks"
+        )
+        backfilled = cursor.rowcount
+        if backfilled:
+            log.info(
+                "FTS5 became available; backfilled %d stored chunks into chunks_fts",
+                backfilled,
+            )
 
     def _insert_chunk(self, chunk: ChunkRecord) -> str:
         """Insert one chunk into both tables inside the caller's transaction."""
