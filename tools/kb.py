@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -113,17 +114,24 @@ class KbIngestTool(Tool):
     """``kb_ingest`` — store text into the local knowledge base.
 
     Chunks the text (configured size/overlap), embeds ALL chunks in one
-    :meth:`~retrieval.embeddings.Embedder.embed` batch, validates the vector
-    dimension against the persisted ``embed_dim`` meta, replaces the
-    document's stored chunks atomically via
+    :meth:`~retrieval.embeddings.Embedder.embed` batch, then — under the
+    shared ``ingest_lock`` — validates the vector dimension against the
+    persisted ``embed_dim`` meta (committing it atomically with the chunks
+    on first ingest), replaces the document's stored chunks via
     :meth:`~retrieval.store.ChunkStore.replace_chunks`, refreshes the
-    :class:`~retrieval.vector_index.VectorIndex` from the store, and updates
-    the shared metadata cache (dropping cache entries of removed chunks).
-    The document id is ``sha256(text)[:16]`` hex — stable per document, so
-    the same text never duplicates and re-ingest removes obsolete chunks
-    (e.g. a tail left by a previous chunking configuration). The title
-    defaults to the first ~40 characters of the (whitespace-normalized)
-    text, or ``untitled`` when the text starts with non-word content that
+    :class:`~retrieval.vector_index.VectorIndex` from the store, and
+    updates the shared metadata cache (dropping cache entries of removed
+    chunks). The lock serializes the complete write/snapshot/publication
+    sequence across every :class:`KbIngestTool` sharing it (the bot wires
+    one per :class:`KbStack`): TeleBot handlers run concurrently, and
+    interleaved ingests could otherwise publish an older vector-index
+    generation over a newer one. The embed call stays outside the lock —
+    it is the slow, network-bound step. The document id is
+    ``sha256(text)[:16]`` hex — stable per document, so the same text
+    never duplicates and re-ingest removes obsolete chunks (e.g. a tail
+    left by a previous chunking configuration). The title defaults to the
+    first ~40 characters of the (whitespace-normalized) text, or
+    ``untitled`` when the text starts with non-word content that
     normalizes away.
     """
 
@@ -135,6 +143,7 @@ class KbIngestTool(Tool):
         metadata: dict[str, ChunkHit],
         chunk_size: int = 800,
         chunk_overlap: int = 100,
+        ingest_lock: threading.Lock | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -142,6 +151,7 @@ class KbIngestTool(Tool):
         self._metadata = metadata
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
+        self._ingest_lock = ingest_lock or threading.Lock()
 
     @property
     def name(self) -> str:
@@ -197,15 +207,6 @@ class KbIngestTool(Tool):
                 "Try again later."
             ) from exc
         dim = len(vectors[0])
-        stored_dim = self._store.get_meta(META_EMBED_DIM)
-        if stored_dim is not None and self._parse_dim(stored_dim) != dim:
-            raise ToolError(
-                "Could not ingest: the knowledge base stores vectors with"
-                f" embedding dimension {stored_dim}, but the embedding"
-                f" service returned dimension {dim}. The embedding model"
-                " changed — restore the previous OLLAMA_EMBED_MODEL or delete"
-                " the knowledge base database to rebuild it."
-            )
         records = [
             ChunkRecord(
                 doc_id=doc_id,
@@ -216,21 +217,33 @@ class KbIngestTool(Tool):
             )
             for idx, (chunk, vector) in enumerate(zip(chunks, vectors))
         ]
-        self._store.replace_chunks(doc_id, records)
-        if stored_dim is None:
-            self._store.set_meta(META_EMBED_DIM, str(dim))
-        self._prune_metadata_cache(doc_id, records)
-        self._vector_index.replace_all(dict(self._store.all_vectors()))
-        for record in records:
-            chunk_id = chunk_id_for(record.doc_id, record.idx)
-            self._metadata[chunk_id] = ChunkHit(
-                chunk_id=chunk_id,
-                doc_id=record.doc_id,
-                title=record.title,
-                idx=record.idx,
-                content=record.content,
-                score=0.0,
+        with self._ingest_lock:
+            stored_dim = self._store.get_meta(META_EMBED_DIM)
+            if stored_dim is not None and self._parse_dim(stored_dim) != dim:
+                raise ToolError(
+                    "Could not ingest: the knowledge base stores vectors with"
+                    f" embedding dimension {stored_dim}, but the embedding"
+                    f" service returned dimension {dim}. The embedding model"
+                    " changed — restore the previous OLLAMA_EMBED_MODEL or"
+                    " delete the knowledge base database to rebuild it."
+                )
+            self._store.replace_chunks(
+                doc_id,
+                records,
+                meta={META_EMBED_DIM: str(dim)} if stored_dim is None else None,
             )
+            self._prune_metadata_cache(doc_id, records)
+            self._vector_index.replace_all(dict(self._store.all_vectors()))
+            for record in records:
+                chunk_id = chunk_id_for(record.doc_id, record.idx)
+                self._metadata[chunk_id] = ChunkHit(
+                    chunk_id=chunk_id,
+                    doc_id=record.doc_id,
+                    title=record.title,
+                    idx=record.idx,
+                    content=record.content,
+                    score=0.0,
+                )
         log.info("kb_ingest: stored %d chunks (doc %s)", len(records), doc_id)
         sample = ", ".join(
             chunk_id_for(doc_id, idx)
@@ -404,8 +417,12 @@ class KbStack:
     turns it into agent tools. ``metadata`` is the shared chunk_id →
     hydrated-hit cache (score is a placeholder): :class:`KbIngestTool`
     populates it on ingest and :class:`VectorIndexAdapter` consults it on
-    search. ``close()`` releases the store and embedder resources
-    best-effort (the expansion LLM, when configured, owns its client).
+    search. ``ingest_lock`` serializes the complete
+    write/snapshot/publish sequence of every :class:`KbIngestTool` wired
+    from this stack — the bot constructs fresh tools per upload, so the
+    lock must live on the stack, not on a tool instance. ``close()``
+    releases the store and embedder resources best-effort (the expansion
+    LLM, when configured, owns its client).
     """
 
     cfg: RetrievalConfig
@@ -417,6 +434,7 @@ class KbStack:
     metadata: dict[str, ChunkHit] = field(default_factory=dict)
     fts: FtsSearch | None = None
     expander: QueryExpander | None = None
+    ingest_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def close(self) -> None:
         """Best-effort release of the store and embedder resources."""

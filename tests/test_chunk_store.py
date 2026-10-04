@@ -21,6 +21,8 @@ Covered acceptance criteria:
 9. replace_chunks: replaces a whole document atomically — obsolete tail
    chunks (smaller new chunk count) are gone from chunks, FTS, and
    all_vectors; other documents are untouched; empty list is a no-op.
+   An optional meta mapping commits in the same transaction (and survives
+   reopen); empty list is a no-op even with meta.
 """
 
 from __future__ import annotations
@@ -540,3 +542,68 @@ class TestReplaceChunks:
             assert set(dict(store.all_vectors())) == {chunk_id_for("doc-1", 0)}
         finally:
             store.close()
+
+    def test_replace_writes_meta_in_same_transaction(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.replace_chunks(
+                "doc-1",
+                [_record("doc-1", 0, "first content")],
+                meta={"embed_dim": "7"},
+            )
+
+            assert store.count() == 1
+            assert store.get_meta("embed_dim") == "7"
+
+            store.replace_chunks(
+                "doc-1",
+                [_record("doc-1", 0, "revised content")],
+                meta={"embed_dim": "8"},
+            )
+
+            assert store.get_meta("embed_dim") == "8"
+        finally:
+            store.close()
+
+    def test_replace_without_meta_leaves_meta_untouched(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.replace_chunks(
+                "doc-1",
+                [_record("doc-1", 0, "first content")],
+                meta={"embed_dim": "7"},
+            )
+
+            store.replace_chunks("doc-1", [_record("doc-1", 0, "revised content")])
+
+            assert store.get_meta("embed_dim") == "7"
+        finally:
+            store.close()
+
+    def test_replace_empty_list_is_noop_even_with_meta(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.add_chunks([_record("doc-1", 0, "kept content")])
+
+            assert store.replace_chunks("doc-1", [], meta={"embed_dim": "7"}) == 0
+
+            assert store.count() == 1
+            assert store.get_meta("embed_dim") is None
+        finally:
+            store.close()
+
+    def test_replaced_meta_survives_reopen(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "kb.db"
+        store = ChunkStore(db_path)
+        store.replace_chunks(
+            "doc-1",
+            [_record("doc-1", 0, "content")],
+            meta={"embed_dim": "7"},
+        )
+        store.close()
+
+        reopened = ChunkStore(db_path)
+        try:
+            assert reopened.get_meta("embed_dim") == "7"
+        finally:
+            reopened.close()

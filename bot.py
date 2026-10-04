@@ -205,6 +205,7 @@ def build_tool_registry(
                 metadata=kb.metadata,
                 chunk_size=kb.cfg.kb_chunk_size,
                 chunk_overlap=kb.cfg.kb_chunk_overlap,
+                ingest_lock=kb.ingest_lock,
             )
         )
         reg.register(KbSearchTool(retriever=kb.retriever, store=kb.store))
@@ -297,8 +298,10 @@ def build_document_handler(
     context. A non-empty caption is appended to the notice and answered in
     the same turn. Download, extraction, and ingest failures each produce
     exactly one user-friendly reply (no agent run) and are never re-raised
-    into the polling loop. Logs carry file name and outcome only — never
-    file content or captions.
+    into the polling loop — including unexpected errors (SQLite, I/O,
+    vector-index failures): the whole download/extract/ingest boundary is
+    failure-proof. Logs carry file name and outcome only — never file
+    content or captions.
     """
 
     def handle_document(
@@ -326,11 +329,20 @@ def build_document_handler(
                 metadata=kb.metadata,
                 chunk_size=kb.cfg.kb_chunk_size,
                 chunk_overlap=kb.cfg.kb_chunk_overlap,
+                ingest_lock=kb.ingest_lock,
             )
             ingest_result = ingest.execute(text=text, title=file_name)
         except (ApiTelegramException, DocumentError, ToolError) as exc:
             log.warning(
                 "document ingest failed for %r: %s", file_name, type(exc).__name__
+            )
+            reply_to(message, _DOCUMENT_ERROR_REPLY)
+            return
+        except Exception:
+            log.warning(
+                "document ingest failed for %r: unexpected error",
+                file_name,
+                exc_info=True,
             )
             reply_to(message, _DOCUMENT_ERROR_REPLY)
             return

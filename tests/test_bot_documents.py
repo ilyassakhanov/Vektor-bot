@@ -10,10 +10,12 @@ Ollama, no real Telegram.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from telebot.apihelper import ApiTelegramException
 
 import bot as bot_module
@@ -401,6 +403,29 @@ def test_ingest_embedder_failure_friendly_reply(tmp_path: Path) -> None:
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
     assert replies == [_DOC_ERROR_REPLY]
     assert bot.get_file_calls == [_FILE_ID]
+    assert llm.chat_calls == []
+
+
+def test_unexpected_ingest_error_friendly_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected error inside the ingest boundary (SQLite/I/O/vector-index)
+    must not escape into the polling loop: exactly one friendly error reply,
+    no agent run."""
+    bot = FakeBot(_DOC_BODY.encode())
+    kb = _make_kb(tmp_path)
+    llm = ScriptedLLM([])
+    conv = _make_conv(llm)
+    replies: list[str] = []
+
+    def locked(doc_id, chunks, meta=None):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kb.store, "replace_chunks", locked)
+    _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
+    assert replies == [_DOC_ERROR_REPLY]
+    assert bot.get_file_calls == [_FILE_ID]
+    assert bot.download_calls == [_FILE_PATH]
     assert llm.chat_calls == []
 
 

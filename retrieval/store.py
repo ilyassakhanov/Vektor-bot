@@ -37,7 +37,10 @@ always safer than mixing vectors from incompatible models.
 ``replace_chunks`` is the document-level write: it removes every stored
 chunk of one ``doc_id`` (both tables) before inserting the new records, in
 a single transaction, so re-ingesting with a different chunking
-configuration can never leave obsolete tail chunks behind.
+configuration can never leave obsolete tail chunks behind. An optional
+``meta`` mapping is persisted in the same transaction — knowledge-base-level
+facts (e.g. the embedding dimension) are committed atomically with the
+vectors they describe, never in a second, separately-crashable write.
 """
 
 from __future__ import annotations
@@ -203,16 +206,24 @@ class ChunkStore:
                 self._insert_chunk(chunk)
         return len(chunks)
 
-    def replace_chunks(self, doc_id: str, chunks: list[ChunkRecord]) -> int:
+    def replace_chunks(
+        self,
+        doc_id: str,
+        chunks: list[ChunkRecord],
+        meta: dict[str, str] | None = None,
+    ) -> int:
         """Atomically replace all stored chunks of ``doc_id`` with ``chunks``.
 
         Deletes every existing row for the document from both `chunks` and
         `chunks_fts` — including tail chunks left over from a previous
         chunking configuration — then inserts the new records, all in one
         transaction. Unlike :meth:`add_chunks` this can never leave obsolete
-        content of the same document behind. An empty ``chunks`` list is a
-        no-op (it never deletes the stored document). When FTS5 is
-        unavailable only the `chunks` rows are replaced.
+        content of the same document behind. When ``meta`` is given, its
+        key/value pairs are upserted into the meta table inside the same
+        transaction, so the chunks and the facts describing them (e.g. the
+        embedding dimension) commit atomically. An empty ``chunks`` list is
+        a no-op (it never deletes the stored document, never writes meta).
+        When FTS5 is unavailable only the `chunks` rows are replaced.
         """
         if not chunks:
             return 0
@@ -226,6 +237,11 @@ class ChunkStore:
             self._conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
             for chunk in chunks:
                 self._insert_chunk(chunk)
+            for key, value in (meta or {}).items():
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
         return len(chunks)
 
     def get_meta(self, key: str) -> str | None:

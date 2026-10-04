@@ -2,17 +2,20 @@
 
 Covers: ingest→search roundtrip with a FakeEmbedder + tmp SQLite DB,
 re-ingest deduplication, stale-chunk removal on re-ingest with a different
-chunking configuration, persisted embed-dim validation, fact-sheet
-formatting (sources tag, no raw scores, truncation cap), tool error
-mapping, KB_ENABLED=0 regression (exact pre-kb tool set), KB_ENABLED
-default-on registration, an agent end-to-end round trip through kb_search,
-and the bot composition roots (build_kb_stack / build_retriever) driven by
+chunking configuration, persisted embed-dim validation, shared ingest-lock
+serialization (snapshot + publish inside the critical section; concurrent
+ingests keep the index in sync with the store), fact-sheet formatting
+(sources tag, no raw scores, truncation cap), tool error mapping,
+KB_ENABLED=0 regression (exact pre-kb tool set), KB_ENABLED default-on
+registration, an agent end-to-end round trip through kb_search, and the
+bot composition roots (build_kb_stack / build_retriever) driven by
 environment variables — including the persisted-embedding-model conflict
 (KBModelError).
 """
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -218,6 +221,101 @@ def test_ingest_persists_embed_dim_meta(tmp_path: Path) -> None:
     ingest, _search, store = _make_kb(tmp_path)
     ingest.execute(text=_TEXT, title="Corpus")
     assert store.get_meta(META_EMBED_DIM) == str(len(FakeEmbedder.vector_for("x")))
+
+
+# --- shared ingest lock ------------------------------------------------------------
+
+
+def test_ingest_snapshots_and_publishes_under_shared_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The store snapshot and the index publish run inside the ingest lock."""
+    lock = threading.Lock()
+    store = ChunkStore(tmp_path / "kb.db")
+    vector_index = VectorIndex({})
+    metadata: dict[str, ChunkHit] = {}
+    observed: dict[str, bool] = {}
+
+    real_all_vectors = store.all_vectors
+
+    def all_vectors() -> list[tuple[str, bytes]]:
+        observed["snapshot"] = lock.locked()
+        return real_all_vectors()
+
+    real_replace_all = vector_index.replace_all
+
+    def replace_all(vectors: dict[str, bytes]) -> None:
+        observed["publish"] = lock.locked()
+        real_replace_all(vectors)
+
+    monkeypatch.setattr(store, "all_vectors", all_vectors)
+    monkeypatch.setattr(vector_index, "replace_all", replace_all)
+
+    ingest = KbIngestTool(
+        store=store,
+        embedder=FakeEmbedder(),
+        vector_index=vector_index,
+        metadata=metadata,
+        chunk_size=_CHUNK_SIZE,
+        chunk_overlap=_CHUNK_OVERLAP,
+        ingest_lock=lock,
+    )
+    ingest.execute(text=_TEXT, title="Corpus")
+
+    assert observed == {"snapshot": True, "publish": True}
+
+
+def test_concurrent_ingests_keep_index_in_sync_with_store(tmp_path: Path) -> None:
+    """Two tools sharing one lock: the final index covers everything stored."""
+    lock = threading.Lock()
+    store = ChunkStore(tmp_path / "kb.db")
+    embedder = FakeEmbedder()
+    vector_index = VectorIndex({})
+    metadata: dict[str, ChunkHit] = {}
+
+    def make_tool() -> KbIngestTool:
+        return KbIngestTool(
+            store=store,
+            embedder=embedder,
+            vector_index=vector_index,
+            metadata=metadata,
+            chunk_size=_CHUNK_SIZE,
+            chunk_overlap=_CHUNK_OVERLAP,
+            ingest_lock=lock,
+        )
+
+    errors: list[BaseException] = []
+
+    def run(tool: KbIngestTool, **kwargs: str) -> None:
+        try:
+            tool.execute(**kwargs)
+        except BaseException as exc:  # noqa: BLE001 — surfaced by the assert below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(
+            target=run, args=(make_tool(),), kwargs={"text": _TEXT, "title": "A"}
+        ),
+        threading.Thread(
+            target=run,
+            args=(make_tool(),),
+            kwargs={"text": _para("zeta", 20), "title": "B"},
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    stored_ids = set(dict(store.all_vectors()))
+    indexed_ids = {
+        hit.chunk_id
+        for hit in vector_index.search([FakeEmbedder.vector_for("x")], limit=100)
+    }
+    assert indexed_ids == stored_ids
+    assert set(metadata) == stored_ids
 
 
 def test_ingest_dim_mismatch_raises_tool_error_and_writes_nothing(
