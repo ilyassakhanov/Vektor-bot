@@ -81,11 +81,13 @@ class OllamaEmbedder(Embedder):
             EmbeddingError: on timeout, connection failure, HTTP error,
                 or a malformed response shape (missing/non-list
                 ``embeddings``, wrong vector count, empty vectors,
-                inconsistent dimensions across the batch, or non-finite
+                inconsistent dimensions across the batch, non-finite
                 components — ``NaN``/``inf`` coerce cleanly through
                 ``float()`` and even arrive as JSON strings like
                 ``"NaN"``, but they poison cosine norms/scores and make
-                rankings invalid or nondeterministic). Rejecting
+                rankings invalid or nondeterministic — or components
+                that overflow a float, for which ``float()`` raises
+                ``OverflowError`` on huge JSON integers). Rejecting
                 malformed batches here keeps bad vectors out of the
                 store, where they would break the vector index after the
                 write had already committed.
@@ -126,7 +128,7 @@ class OllamaEmbedder(Embedder):
                 raise EmbeddingError("Malformed response from embedding service.")
             try:
                 components = [float(component) for component in vector]
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise EmbeddingError(
                     "Malformed response from embedding service."
                 ) from exc

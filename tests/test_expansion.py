@@ -6,7 +6,7 @@ import json
 
 from llm.base import LLM, ChatResponse, LLMError, LLMResponse, Message, ToolSpec
 from retrieval.expansion import ExpandedQuery, QueryExpander
-from tests.fakes import FakeLLM
+from tests.fakes import CloseableLLM, FakeLLM
 
 
 class ExplodingLLM(LLM):
@@ -160,3 +160,23 @@ def test_prompt_contains_original_query():
     QueryExpander(llm).expand("cosine similarity vs dot product")
     assert len(llm.calls) == 1
     assert "cosine similarity vs dot product" in llm.calls[0]
+
+
+def test_close_delegates_to_llm_close():
+    llm = CloseableLLM()
+    expander = QueryExpander(llm)
+    expander.close()
+    assert llm.close_calls == 1
+
+
+def test_close_without_llm_close_is_noop():
+    """FakeLLM has no close() — shutdown must not fail on such LLMs."""
+    QueryExpander(FakeLLM()).close()
+
+
+def test_close_is_repeatable():
+    llm = CloseableLLM()
+    expander = QueryExpander(llm)
+    expander.close()
+    expander.close()
+    assert llm.close_calls == 2

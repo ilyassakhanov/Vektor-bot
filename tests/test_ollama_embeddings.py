@@ -160,6 +160,19 @@ def test_embed_string_nan_component_raises_embedding_error():
         embedder.embed(["a"])
 
 
+def test_embed_huge_integer_component_raises_embedding_error():
+    """float() of a huge JSON integer raises OverflowError — still EmbeddingError.
+
+    An escaping OverflowError would fail the whole retrieval request
+    instead of degrading the vector source, and a persisted huge-int
+    vector would poison cosine scores like NaN/inf.
+    """
+    client = _make_client(httpx.Response(200, json={"embeddings": [[10**400]]}))
+    embedder = OllamaEmbedder(client=client)
+    with pytest.raises(EmbeddingError, match="Malformed"):
+        embedder.embed(["a"])
+
+
 def test_embed_single_vector_batch_needs_no_dimension_check():
     client = _make_client(_ok_response([[0.1, 0.2, 0.3]]))
     embedder = OllamaEmbedder(client=client)

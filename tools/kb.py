@@ -421,8 +421,8 @@ class KbStack:
     write/snapshot/publish sequence of every :class:`KbIngestTool` wired
     from this stack — the bot constructs fresh tools per upload, so the
     lock must live on the stack, not on a tool instance. ``close()``
-    releases the store and embedder resources best-effort (the expansion
-    LLM, when configured, owns its client).
+    releases the store, embedder and expansion-LLM resources best-effort
+    (the expansion LLM, when configured, owns its client).
     """
 
     cfg: RetrievalConfig
@@ -437,7 +437,7 @@ class KbStack:
     ingest_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def close(self) -> None:
-        """Best-effort release of the store and embedder resources."""
+        """Best-effort release of the store, embedder and expander resources."""
         try:
             self.store.close()
         except Exception:
@@ -448,3 +448,8 @@ class KbStack:
                 close_embedder()
             except Exception:
                 log.warning("failed to close kb embedder", exc_info=True)
+        if self.expander is not None:
+            try:
+                self.expander.close()
+            except Exception:
+                log.warning("failed to close kb expander", exc_info=True)

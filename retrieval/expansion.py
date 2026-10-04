@@ -89,6 +89,18 @@ class QueryExpander:
             used_expansion=True,
         )
 
+    def close(self) -> None:
+        """Release the expansion LLM's resources (client close).
+
+        Delegates to the LLM's ``close()`` when it has one; LLMs without
+        ``close()`` (fakes, stateless providers) make this a no-op.
+        Errors propagate — callers release resources best-effort and
+        log failures themselves (mirrors the embedder/store close flow).
+        """
+        close = getattr(self._llm, "close", None)
+        if callable(close):
+            close()
+
 
 def _parse_reply(text: str) -> tuple[list[str], list[str]]:
     """Parse model output as (keywords, alt_queries).

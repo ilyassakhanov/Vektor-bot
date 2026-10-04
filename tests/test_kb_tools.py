@@ -10,7 +10,7 @@ KB_ENABLED=0 regression (exact pre-kb tool set), KB_ENABLED default-on
 registration, an agent end-to-end round trip through kb_search, and the
 bot composition roots (build_kb_stack / build_retriever) driven by
 environment variables — including the persisted-embedding-model conflict
-(KBModelError).
+(KBModelError) — and shutdown closing the expansion LLM's client.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from agent.agent import Agent
 from bot import build_kb_stack, build_retriever, build_tool_registry
 from llm.base import ChatResponse
 from retrieval.embeddings import Embedder, EmbeddingError
+from retrieval.expansion import QueryExpander
 from retrieval.hybrid import HybridRetriever
 from retrieval.rrf import ChunkHit
 from retrieval.store import (
@@ -33,7 +34,13 @@ from retrieval.store import (
     KBModelError,
 )
 from retrieval.vector_index import VectorIndex
-from tests.fakes import FakeMcpClient, ScriptedLLM, make_tool_call
+from tests.fakes import (
+    CloseableLLM,
+    FakeLLM,
+    FakeMcpClient,
+    ScriptedLLM,
+    make_tool_call,
+)
 from tools.base import ToolError
 from tools.kb import KbIngestTool, KbSearchTool, StoreFtsAdapter, VectorIndexAdapter
 from tools.registry import ToolRegistry
@@ -580,6 +587,30 @@ def test_build_kb_stack_expansion_enabled_builds_expander(
         assert stack.expander is not None
     finally:
         stack.close()
+
+
+def test_build_kb_stack_close_closes_expansion_llm(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    stack = build_kb_stack()
+    assert stack is not None
+    assert stack.expander is not None
+    llm = CloseableLLM()
+    stack.expander = QueryExpander(llm)
+    stack.close()
+    assert llm.close_calls == 1
+
+
+def test_build_kb_stack_close_tolerates_llm_without_close(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    stack = build_kb_stack()
+    assert stack is not None
+    assert stack.expander is not None
+    stack.expander = QueryExpander(FakeLLM(reply="ok"))
+    stack.close()
 
 
 def test_build_kb_stack_disabled_returns_none(monkeypatch) -> None:
