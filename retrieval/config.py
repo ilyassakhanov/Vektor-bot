@@ -48,13 +48,33 @@ class RetrievalConfig:
 
     @classmethod
     def from_env(cls) -> RetrievalConfig:
-        """Build a config from the environment — the single read boundary."""
+        """Build a config from the environment — the single read boundary.
+
+        ``KB_CHUNK_SIZE`` and ``KB_CHUNK_OVERLAP`` are validated as a pair:
+        each variable alone only needs its individual minimum, but an
+        overlap that is not smaller than the size would make the first
+        ``chunk_text`` call raise ``ValueError`` — so the invalid pair falls
+        back to both documented defaults instead.
+        """
         defaults = cls()
+        chunk_size = _env_int("KB_CHUNK_SIZE", defaults.kb_chunk_size, 1)
+        chunk_overlap = _env_int("KB_CHUNK_OVERLAP", defaults.kb_chunk_overlap, 0)
+        if chunk_overlap >= chunk_size:
+            log.warning(
+                "Invalid KB_CHUNK_SIZE=%d / KB_CHUNK_OVERLAP=%d pair"
+                " (need 0 <= overlap < size), using defaults %d/%d",
+                chunk_size,
+                chunk_overlap,
+                defaults.kb_chunk_size,
+                defaults.kb_chunk_overlap,
+            )
+            chunk_size = defaults.kb_chunk_size
+            chunk_overlap = defaults.kb_chunk_overlap
         return cls(
             kb_enabled=_env_bool("KB_ENABLED", defaults.kb_enabled),
             kb_db_path=Path(_env_str("KB_DB_PATH", str(defaults.kb_db_path))),
-            kb_chunk_size=_env_int("KB_CHUNK_SIZE", defaults.kb_chunk_size, 1),
-            kb_chunk_overlap=_env_int("KB_CHUNK_OVERLAP", defaults.kb_chunk_overlap, 0),
+            kb_chunk_size=chunk_size,
+            kb_chunk_overlap=chunk_overlap,
             kb_vector_limit=_env_int("KB_VECTOR_LIMIT", defaults.kb_vector_limit, 1),
             kb_fts_limit=_env_int("KB_FTS_LIMIT", defaults.kb_fts_limit, 1),
             kb_top_k=_env_int("KB_TOP_K", defaults.kb_top_k, 1),

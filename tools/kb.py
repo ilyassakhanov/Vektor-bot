@@ -54,7 +54,12 @@ from retrieval.embeddings import Embedder, EmbeddingError
 from retrieval.expansion import QueryExpander
 from retrieval.hybrid import FtsSearch, HybridRetriever, VectorSearch
 from retrieval.rrf import ChunkHit, FusedHit
-from retrieval.store import ChunkRecord, ChunkStore, chunk_id_for
+from retrieval.store import (
+    META_EMBED_DIM,
+    ChunkRecord,
+    ChunkStore,
+    chunk_id_for,
+)
 from retrieval.vector_index import VectorIndex, to_blob
 from tools.base import Tool, ToolError
 from tools.truncation import max_output_chars_from_env, truncate
@@ -108,13 +113,18 @@ class KbIngestTool(Tool):
     """``kb_ingest`` — store text into the local knowledge base.
 
     Chunks the text (configured size/overlap), embeds ALL chunks in one
-    :meth:`~retrieval.embeddings.Embedder.embed` batch, upserts them into
-    the ChunkStore (stable chunk ids → re-ingest overwrites), refreshes the
-    VectorIndex from the store, and updates the shared metadata cache. The
-    document id is ``sha256(text)[:16]`` hex — stable per document, so the
-    same text never duplicates. The title defaults to the first ~40
-    characters of the (whitespace-normalized) text, or ``untitled`` when
-    the text starts with non-word content that normalizes away.
+    :meth:`~retrieval.embeddings.Embedder.embed` batch, validates the vector
+    dimension against the persisted ``embed_dim`` meta, replaces the
+    document's stored chunks atomically via
+    :meth:`~retrieval.store.ChunkStore.replace_chunks`, refreshes the
+    :class:`~retrieval.vector_index.VectorIndex` from the store, and updates
+    the shared metadata cache (dropping cache entries of removed chunks).
+    The document id is ``sha256(text)[:16]`` hex — stable per document, so
+    the same text never duplicates and re-ingest removes obsolete chunks
+    (e.g. a tail left by a previous chunking configuration). The title
+    defaults to the first ~40 characters of the (whitespace-normalized)
+    text, or ``untitled`` when the text starts with non-word content that
+    normalizes away.
     """
 
     def __init__(
@@ -186,6 +196,16 @@ class KbIngestTool(Tool):
                 "Could not ingest: the embedding service is unavailable. "
                 "Try again later."
             ) from exc
+        dim = len(vectors[0])
+        stored_dim = self._store.get_meta(META_EMBED_DIM)
+        if stored_dim is not None and self._parse_dim(stored_dim) != dim:
+            raise ToolError(
+                "Could not ingest: the knowledge base stores vectors with"
+                f" embedding dimension {stored_dim}, but the embedding"
+                f" service returned dimension {dim}. The embedding model"
+                " changed — restore the previous OLLAMA_EMBED_MODEL or delete"
+                " the knowledge base database to rebuild it."
+            )
         records = [
             ChunkRecord(
                 doc_id=doc_id,
@@ -196,7 +216,10 @@ class KbIngestTool(Tool):
             )
             for idx, (chunk, vector) in enumerate(zip(chunks, vectors))
         ]
-        self._store.add_chunks(records)
+        self._store.replace_chunks(doc_id, records)
+        if stored_dim is None:
+            self._store.set_meta(META_EMBED_DIM, str(dim))
+        self._prune_metadata_cache(doc_id, records)
         self._vector_index.replace_all(dict(self._store.all_vectors()))
         for record in records:
             chunk_id = chunk_id_for(record.doc_id, record.idx)
@@ -217,6 +240,30 @@ class KbIngestTool(Tool):
             f"Ingested {len(chunks)} chunks (doc {doc_id}, "
             f"title '{resolved_title}'). chunk_ids: {sample}"
         )
+
+    @staticmethod
+    def _parse_dim(raw: str) -> int:
+        """Parse a persisted ``embed_dim`` meta value; -1 when corrupt."""
+        try:
+            return int(raw)
+        except ValueError:
+            return -1
+
+    def _prune_metadata_cache(self, doc_id: str, records: list[ChunkRecord]) -> None:
+        """Drop cached entries of this document's removed chunks.
+
+        ``replace_chunks`` may have deleted tail chunks from a previous
+        chunking configuration; their cache entries would otherwise linger
+        as hydratable ghosts.
+        """
+        keep = {chunk_id_for(doc_id, record.idx) for record in records}
+        stale = [
+            chunk_id
+            for chunk_id, hit in self._metadata.items()
+            if hit.doc_id == doc_id and chunk_id not in keep
+        ]
+        for chunk_id in stale:
+            del self._metadata[chunk_id]
 
     @staticmethod
     def _resolve_title(title: str, text: str) -> str:

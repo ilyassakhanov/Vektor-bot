@@ -29,7 +29,7 @@ from retrieval.embeddings import OllamaEmbedder
 from retrieval.expansion import QueryExpander
 from retrieval.hybrid import FtsSearch, HybridRetriever, VectorSearch
 from retrieval.rrf import ChunkHit
-from retrieval.store import ChunkStore
+from retrieval.store import META_EMBED_MODEL, ChunkStore, KBModelError
 from retrieval.vector_index import VectorIndex
 from skills.loader import SkillLoader
 from tools.base import ToolError
@@ -84,6 +84,12 @@ def build_kb_stack(cfg: RetrievalConfig | None = None) -> KbStack | None:
     ``KB_EXPANSION_ENABLED`` — a second OllamaLLM with
     ``OLLAMA_EXPANSION_MODEL``, temperature, and short timeout), and the
     HybridRetriever wired with every config limit.
+
+    The configured embedding model is persisted in the store's meta table
+    on first run and validated on every start: a conflict between the
+    stored model and ``OLLAMA_EMBED_MODEL`` raises :class:`KBModelError`
+    with an actionable message instead of mixing vectors from incompatible
+    models.
     """
     cfg = cfg or RetrievalConfig.from_env()
     if not cfg.kb_enabled:
@@ -91,6 +97,17 @@ def build_kb_stack(cfg: RetrievalConfig | None = None) -> KbStack | None:
         return None
     cfg.kb_db_path.parent.mkdir(parents=True, exist_ok=True)
     store = ChunkStore(cfg.kb_db_path)
+    stored_model = store.get_meta(META_EMBED_MODEL)
+    if stored_model is None:
+        store.set_meta(META_EMBED_MODEL, cfg.ollama_embed_model)
+    elif stored_model != cfg.ollama_embed_model:
+        store.close()
+        raise KBModelError(
+            f"Knowledge base at {cfg.kb_db_path} was built with embedding"
+            f" model {stored_model!r}, but OLLAMA_EMBED_MODEL is now"
+            f" {cfg.ollama_embed_model!r}. Restore the previous model or"
+            " delete the database file to rebuild the knowledge base."
+        )
     embedder = OllamaEmbedder(
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         model=cfg.ollama_embed_model,
@@ -157,8 +174,10 @@ def build_tool_registry(
     When ``kb`` is None the knowledge-base stack is auto-built from the
     environment (``KB_ENABLED``, default on), so ``python bot.py`` works
     unchanged; an auto-build failure degrades to a kb-less registry with a
-    warning, mirroring the MCP fallback. Pass an explicit stack to inject
-    test doubles. ``KB_ENABLED=0`` yields the exact pre-kb tool set.
+    warning, mirroring the MCP fallback — except a persisted-embedding-model
+    conflict (:class:`KBModelError`), which is a configuration error and
+    propagates. Pass an explicit stack to inject test doubles.
+    ``KB_ENABLED=0`` yields the exact pre-kb tool set.
     """
     reg = InstrumentedToolRegistry()
     timeout = float(os.environ.get("EXEC_TIMEOUT", "30"))
@@ -169,6 +188,8 @@ def build_tool_registry(
     if kb is None:
         try:
             kb = build_kb_stack()
+        except KBModelError:
+            raise
         except Exception:
             log.warning(
                 "knowledge base unavailable; running without kb tools",
@@ -440,6 +461,9 @@ def main() -> None:
     try:
         try:
             kb = build_kb_stack()
+        except KBModelError as exc:
+            log.error("%s", exc)
+            raise SystemExit(1) from exc
         except Exception:
             log.warning(
                 "knowledge base unavailable; running without kb tools",

@@ -126,6 +126,19 @@ def test_embed_empty_vector_raises_embedding_error():
         embedder.embed(["a", "b"])
 
 
+def test_embed_inconsistent_dimensions_raise_embedding_error():
+    client = _make_client(_ok_response([[0.1], [0.2, 0.3]]))
+    embedder = OllamaEmbedder(client=client)
+    with pytest.raises(EmbeddingError, match="Malformed"):
+        embedder.embed(["a", "b"])
+
+
+def test_embed_single_vector_batch_needs_no_dimension_check():
+    client = _make_client(_ok_response([[0.1, 0.2, 0.3]]))
+    embedder = OllamaEmbedder(client=client)
+    assert embedder.embed(["a"]) == [[0.1, 0.2, 0.3]]
+
+
 def test_embed_request_payload_and_url():
     captured: dict[str, Any] = {}
 

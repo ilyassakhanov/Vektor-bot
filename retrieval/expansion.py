@@ -3,7 +3,10 @@
 QueryExpander asks a small model (configured by the caller with temperature 0
 and a short timeout) for keywords and alternative phrasings of a search query.
 The reply is parsed as minimal JSON (``{"keywords": [...], "queries": [...]}``)
-with a comma/newline-separated fallback. Every failure path — LLMError,
+with a comma/newline-separated fallback for plain non-JSON replies. A reply
+that is JSON-shaped (contains braces) but does not parse is treated as
+unparseable — brace fragments are never fed to the token fallback. Every
+failure path — LLMError,
 unexpected exception, empty/whitespace text, unparseable output, or junk-only
 tokens — yields the original query with ``used_expansion=False``; :meth:`expand`
 never raises, so expansion can never fail retrieval.
@@ -91,14 +94,18 @@ def _parse_reply(text: str) -> tuple[list[str], list[str]]:
     """Parse model output as (keywords, alt_queries).
 
     Tries a JSON object first (robustly extracted between the first ``{`` and
-    the last ``}``); falls back to comma/newline-separated tokens of the raw
-    text.
+    the last ``}``). Replies that are JSON-shaped (contain braces) but fail
+    to parse return no tokens at all — the caller falls back to the original
+    query instead of splitting brace fragments into keywords. The
+    comma/newline token fallback applies only to genuinely non-JSON replies.
     """
     payload = _extract_json_object(text)
     if payload is not None:
         return _string_items(payload.get("keywords")), _string_items(
             payload.get("queries")
         )
+    if "{" in text or "}" in text:
+        return [], []
     return _split_tokens(text), []
 
 

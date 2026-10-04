@@ -71,6 +71,26 @@ def test_malformed_json_without_braces_falls_back_to_tokens():
     assert result.used_expansion is True
 
 
+def test_truncated_json_with_braces_falls_back_to_original_query():
+    result = _expand('{"keywords": ["foo"')
+    assert result == ExpandedQuery(
+        original="hybrid search", keywords=(), alt_queries=(), used_expansion=False
+    )
+
+
+def test_unclosed_json_object_falls_back_to_original_query():
+    result = _expand('{"keywords": ["a", "b"')
+    assert result.used_expansion is False
+    assert result.keywords == ()
+    assert result.alt_queries == ()
+
+
+def test_json_shaped_garbage_falls_back_to_original_query():
+    result = _expand('{"keywords": ["ok"} and then }')
+    assert result.used_expansion is False
+    assert result.keywords == ()
+
+
 def test_json_with_non_string_and_non_list_values_is_defensive():
     result = _expand('{"keywords": ["real", 5, null], "queries": "not-a-list"}')
     assert result.keywords == ("real",)

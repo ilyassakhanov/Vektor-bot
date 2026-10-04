@@ -121,6 +121,53 @@ def test_zero_chunk_overlap_is_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     assert RetrievalConfig.from_env().kb_chunk_overlap == 0
 
 
+def test_chunk_pair_overlap_ge_size_falls_back_to_both_defaults(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """KB_CHUNK_SIZE=50 is valid alone but clashes with default overlap 100."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    monkeypatch.setenv("KB_CHUNK_SIZE", "50")
+    cfg = RetrievalConfig.from_env()
+    assert cfg.kb_chunk_size == 800
+    assert cfg.kb_chunk_overlap == 100
+    assert "KB_CHUNK_SIZE" in caplog.text
+    assert "KB_CHUNK_OVERLAP" in caplog.text
+
+
+def test_chunk_pair_overlap_above_default_size_falls_back_to_defaults(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    monkeypatch.setenv("KB_CHUNK_OVERLAP", "900")
+    cfg = RetrievalConfig.from_env()
+    assert cfg.kb_chunk_size == 800
+    assert cfg.kb_chunk_overlap == 100
+    assert "KB_CHUNK_OVERLAP" in caplog.text
+
+
+def test_chunk_pair_equal_overlap_and_size_falls_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    monkeypatch.setenv("KB_CHUNK_SIZE", "100")
+    monkeypatch.setenv("KB_CHUNK_OVERLAP", "100")
+    cfg = RetrievalConfig.from_env()
+    assert cfg.kb_chunk_size == 800
+    assert cfg.kb_chunk_overlap == 100
+
+
+def test_chunk_pair_valid_pair_is_kept_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    monkeypatch.setenv("KB_CHUNK_SIZE", "50")
+    monkeypatch.setenv("KB_CHUNK_OVERLAP", "10")
+    cfg = RetrievalConfig.from_env()
+    assert cfg.kb_chunk_size == 50
+    assert cfg.kb_chunk_overlap == 10
+    assert caplog.text == ""
+
+
 @pytest.mark.parametrize(("var", "field", "default"), INT_FIELDS)
 def test_non_numeric_int_falls_back_with_warning(
     monkeypatch: pytest.MonkeyPatch,

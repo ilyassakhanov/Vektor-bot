@@ -1,11 +1,14 @@
 """Tests for the kb tools + bot wiring — fakes only, no network, no Ollama.
 
 Covers: ingest→search roundtrip with a FakeEmbedder + tmp SQLite DB,
-re-ingest deduplication, fact-sheet formatting (sources tag, no raw scores,
-truncation cap), tool error mapping, KB_ENABLED=0 regression (exact pre-kb
-tool set), KB_ENABLED default-on registration, an agent end-to-end round
-trip through kb_search, and the bot composition roots (build_kb_stack /
-build_retriever) driven by environment variables.
+re-ingest deduplication, stale-chunk removal on re-ingest with a different
+chunking configuration, persisted embed-dim validation, fact-sheet
+formatting (sources tag, no raw scores, truncation cap), tool error
+mapping, KB_ENABLED=0 regression (exact pre-kb tool set), KB_ENABLED
+default-on registration, an agent end-to-end round trip through kb_search,
+and the bot composition roots (build_kb_stack / build_retriever) driven by
+environment variables — including the persisted-embedding-model conflict
+(KBModelError).
 """
 
 from __future__ import annotations
@@ -20,7 +23,12 @@ from llm.base import ChatResponse
 from retrieval.embeddings import Embedder, EmbeddingError
 from retrieval.hybrid import HybridRetriever
 from retrieval.rrf import ChunkHit
-from retrieval.store import ChunkStore
+from retrieval.store import (
+    META_EMBED_DIM,
+    META_EMBED_MODEL,
+    ChunkStore,
+    KBModelError,
+)
 from retrieval.vector_index import VectorIndex
 from tests.fakes import FakeMcpClient, ScriptedLLM, make_tool_call
 from tools.base import ToolError
@@ -134,6 +142,101 @@ def test_reingest_same_text_does_not_duplicate(tmp_path: Path) -> None:
     assert count_after_first > 1
     ingest.execute(text=_TEXT, title="Corpus")
     assert store.count() == count_after_first
+
+
+def test_reingest_with_fewer_chunks_removes_stale_content(tmp_path: Path) -> None:
+    store = ChunkStore(tmp_path / "kb.db")
+    embedder = FakeEmbedder()
+    vector_index = VectorIndex({})
+    metadata: dict[str, ChunkHit] = {}
+
+    def make_ingest(size: int, overlap: int) -> KbIngestTool:
+        return KbIngestTool(
+            store=store,
+            embedder=embedder,
+            vector_index=vector_index,
+            metadata=metadata,
+            chunk_size=size,
+            chunk_overlap=overlap,
+        )
+
+    big_ingest = make_ingest(_CHUNK_SIZE, _CHUNK_OVERLAP)
+    whole_ingest = make_ingest(10_000, 0)
+    big_ingest.execute(text=_TEXT, title="Corpus")
+    assert store.count() > 1
+
+    whole_ingest.execute(text=_TEXT, title="Corpus")
+
+    assert store.count() == 1
+    assert set(dict(store.all_vectors())) == set(metadata)
+    assert [hit.idx for hit in store.search_fts(["needle"], limit=10)] == [0]
+    search = KbSearchTool(
+        retriever=HybridRetriever(
+            embedder=embedder,
+            vector=VectorIndexAdapter(vector_index, metadata),
+            fts=StoreFtsAdapter(store),
+            top_k=5,
+        ),
+        store=store,
+    )
+    result = search.execute(query="needle")
+    assert "needle" in result
+    assert "(chunk 0)" in result
+
+
+def test_reingest_prunes_stale_metadata_cache(tmp_path: Path) -> None:
+    store = ChunkStore(tmp_path / "kb.db")
+    embedder = FakeEmbedder()
+    vector_index = VectorIndex({})
+    metadata: dict[str, ChunkHit] = {}
+    big_ingest = KbIngestTool(
+        store=store,
+        embedder=embedder,
+        vector_index=vector_index,
+        metadata=metadata,
+        chunk_size=_CHUNK_SIZE,
+        chunk_overlap=_CHUNK_OVERLAP,
+    )
+    whole_ingest = KbIngestTool(
+        store=store,
+        embedder=embedder,
+        vector_index=vector_index,
+        metadata=metadata,
+        chunk_size=10_000,
+        chunk_overlap=0,
+    )
+    big_ingest.execute(text=_TEXT, title="Corpus")
+    assert len(metadata) > 1
+
+    whole_ingest.execute(text=_TEXT, title="Corpus")
+
+    assert len(metadata) == 1
+    assert next(iter(metadata.values())).idx == 0
+
+
+def test_ingest_persists_embed_dim_meta(tmp_path: Path) -> None:
+    ingest, _search, store = _make_kb(tmp_path)
+    ingest.execute(text=_TEXT, title="Corpus")
+    assert store.get_meta(META_EMBED_DIM) == str(len(FakeEmbedder.vector_for("x")))
+
+
+def test_ingest_dim_mismatch_raises_tool_error_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    store = ChunkStore(tmp_path / "kb.db")
+    store.set_meta(META_EMBED_DIM, "3")
+    assert len(FakeEmbedder.vector_for("x")) != 3
+    ingest = KbIngestTool(
+        store=store,
+        embedder=FakeEmbedder(),
+        vector_index=VectorIndex({}),
+        metadata={},
+        chunk_size=_CHUNK_SIZE,
+        chunk_overlap=_CHUNK_OVERLAP,
+    )
+    with pytest.raises(ToolError, match="dimension"):
+        ingest.execute(text=_TEXT)
+    assert store.count() == 0
 
 
 def test_ingest_default_title_from_text(tmp_path: Path) -> None:
@@ -352,3 +455,62 @@ def test_build_kb_stack_disabled_returns_none(monkeypatch) -> None:
     monkeypatch.setenv("KB_ENABLED", "0")
     assert build_kb_stack() is None
     assert build_retriever() is None
+
+
+# --- persisted embedding model ----------------------------------------------------
+
+
+def test_build_kb_stack_persists_embed_model(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+    monkeypatch.setenv("OLLAMA_EMBED_MODEL", "persisted-embedder")
+    stack = build_kb_stack()
+    assert stack is not None
+    try:
+        assert stack.store.get_meta(META_EMBED_MODEL) == "persisted-embedder"
+    finally:
+        stack.close()
+
+
+def test_build_kb_stack_model_mismatch_raises(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+    store = ChunkStore(tmp_path / "kb.db")
+    store.set_meta(META_EMBED_MODEL, "old-model")
+    store.close()
+
+    with pytest.raises(KBModelError, match="OLLAMA_EMBED_MODEL"):
+        build_kb_stack()
+
+
+def test_build_kb_stack_model_match_reopens(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+    monkeypatch.setenv("OLLAMA_EMBED_MODEL", "same-model")
+    stack = build_kb_stack()
+    assert stack is not None
+    stack.close()
+
+    stack2 = build_kb_stack()
+    assert stack2 is not None
+    try:
+        assert stack2.store.get_meta(META_EMBED_MODEL) == "same-model"
+    finally:
+        stack2.close()
+
+
+def test_build_tool_registry_model_mismatch_propagates(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+    store = ChunkStore(tmp_path / "kb.db")
+    store.set_meta(META_EMBED_MODEL, "old-model")
+    store.close()
+
+    with pytest.raises(KBModelError):
+        build_tool_registry(None)

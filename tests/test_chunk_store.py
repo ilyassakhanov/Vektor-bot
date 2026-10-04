@@ -16,6 +16,11 @@ Covered acceptance criteria:
    warning, degrades to vector-only mode (add_chunks works, search_fts []).
 6. BLOB round-trip: arbitrary bytes stored and returned via all_vectors.
 7. chunk_id_for is deterministic; idx and doc_id changes alter the id.
+8. meta table: set/get roundtrip, persistence across reopen, works in
+   vector-only mode.
+9. replace_chunks: replaces a whole document atomically — obsolete tail
+   chunks (smaller new chunk count) are gone from chunks, FTS, and
+   all_vectors; other documents are untouched; empty list is a no-op.
 """
 
 from __future__ import annotations
@@ -395,5 +400,143 @@ class TestMetadataByIds:
             assert len(found) == total
             assert found[chunk_id_for("bulk", 0)].content == "bulk chunk 0"
             assert found[chunk_id_for("bulk", total - 1)].idx == total - 1
+        finally:
+            store.close()
+
+
+class TestMeta:
+    def test_missing_key_returns_none(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            assert store.get_meta("embed_model") is None
+        finally:
+            store.close()
+
+    def test_set_get_roundtrip_and_overwrite(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.set_meta("embed_model", "model-a")
+            assert store.get_meta("embed_model") == "model-a"
+            store.set_meta("embed_model", "model-b")
+            assert store.get_meta("embed_model") == "model-b"
+            assert store.get_meta("embed_dim") is None
+        finally:
+            store.close()
+
+    def test_meta_survives_reopen(self, tmp_path: Path) -> None:
+        path = tmp_path / "kb.db"
+        store = ChunkStore(path)
+        store.set_meta("embed_dim", "7")
+        store.close()
+
+        reopened = ChunkStore(path)
+        try:
+            assert reopened.get_meta("embed_dim") == "7"
+        finally:
+            reopened.close()
+
+    def test_meta_works_in_vector_only_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def raise_no_fts5(self: ChunkStore) -> None:
+            raise sqlite3.OperationalError("no such module: fts5")
+
+        monkeypatch.setattr(ChunkStore, "_create_fts_table", raise_no_fts5)
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            assert store.fts_available is False
+            store.set_meta("embed_model", "m")
+            assert store.get_meta("embed_model") == "m"
+        finally:
+            store.close()
+
+
+class TestReplaceChunks:
+    def test_replace_removes_obsolete_tail_chunks(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.replace_chunks(
+                "doc-1",
+                [
+                    _record("doc-1", 0, "alpha content here"),
+                    _record("doc-1", 1, "beta content here"),
+                    _record("doc-1", 2, "gamma content here"),
+                ],
+            )
+            assert store.count() == 3
+
+            written = store.replace_chunks(
+                "doc-1", [_record("doc-1", 0, "alpha content revised")]
+            )
+
+            assert written == 1
+            assert store.count() == 1
+            assert set(dict(store.all_vectors())) == {chunk_id_for("doc-1", 0)}
+            assert store.search_fts(["beta"], limit=10) == []
+            assert store.search_fts(["gamma"], limit=10) == []
+            assert [h.idx for h in store.search_fts(["revised"], limit=10)] == [0]
+        finally:
+            store.close()
+
+    def test_replace_keeps_other_documents(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.add_chunks(
+                [
+                    _record("doc-1", 0, "first doc content"),
+                    _record("doc-1", 1, "first doc tail"),
+                    _record("doc-2", 0, "second doc content"),
+                ]
+            )
+
+            store.replace_chunks("doc-1", [_record("doc-1", 0, "first doc replaced")])
+
+            assert store.count() == 2
+            hits = store.search_fts(["second"], limit=10)
+            assert [h.doc_id for h in hits] == ["doc-2"]
+            assert store.search_fts(["tail"], limit=10) == []
+        finally:
+            store.close()
+
+    def test_replace_empty_list_is_noop(self, tmp_path: Path) -> None:
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.add_chunks(
+                [
+                    _record("doc-1", 0, "kept content"),
+                    _record("doc-1", 1, "also kept"),
+                ]
+            )
+
+            assert store.replace_chunks("doc-1", []) == 0
+            assert store.count() == 2
+            assert len(store.search_fts(["kept"], limit=10)) == 2
+        finally:
+            store.close()
+
+    def test_replace_in_vector_only_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def raise_no_fts5(self: ChunkStore) -> None:
+            raise sqlite3.OperationalError("no such module: fts5")
+
+        monkeypatch.setattr(ChunkStore, "_create_fts_table", raise_no_fts5)
+        store = ChunkStore(tmp_path / "kb.db")
+        try:
+            store.replace_chunks(
+                "doc-1",
+                [
+                    _record("doc-1", 0, "one"),
+                    _record("doc-1", 1, "two"),
+                ],
+            )
+            store.replace_chunks("doc-1", [_record("doc-1", 0, "only")])
+
+            assert store.count() == 1
+            assert set(dict(store.all_vectors())) == {chunk_id_for("doc-1", 0)}
         finally:
             store.close()
