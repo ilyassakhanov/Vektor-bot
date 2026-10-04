@@ -126,7 +126,9 @@ class KbIngestTool(Tool):
     one per :class:`KbStack`): TeleBot handlers run concurrently, and
     interleaved ingests could otherwise publish an older vector-index
     generation over a newer one. The embed call stays outside the lock —
-    it is the slow, network-bound step. The document id is
+    it is the slow, network-bound step. The same lock is shared with
+    :class:`KbSearchTool`, so searches never read a torn generation.
+    The document id is
     ``sha256(text)[:16]`` hex — stable per document, so the same text
     never duplicates and re-ingest removes obsolete chunks (e.g. a tail
     left by a previous chunking configuration). The title defaults to the
@@ -300,6 +302,13 @@ class KbSearchTool(Tool):
     An empty result is the string ``"No matching knowledge found."`` —
     never an error. The whole sheet is capped at ``max_output_chars`` (env
     ``EXEC_MAX_OUTPUT_CHARS``, default 4000) with head+tail truncation.
+    Retrieval runs under the stack's shared ``ingest_lock`` (when wired
+    with it, same lock :class:`KbIngestTool` publishes under): a search
+    holds it across retriever and hydration reads so it can never straddle
+    the ``replace_chunks`` → ``replace_all`` publication window and mix an
+    old vector generation with new FTS content. Direct construction
+    without a lock falls back to a per-instance one, keeping standalone
+    test wiring honest.
     """
 
     def __init__(
@@ -307,10 +316,12 @@ class KbSearchTool(Tool):
         retriever: HybridRetriever,
         store: ChunkStore | None = None,
         max_output_chars: int | None = None,
+        ingest_lock: threading.Lock | None = None,
     ) -> None:
         self._retriever = retriever
         self._store = store
         self._max_output_chars = max_output_chars_from_env(max_output_chars)
+        self._ingest_lock = ingest_lock or threading.Lock()
 
     @property
     def name(self) -> str:
@@ -345,7 +356,10 @@ class KbSearchTool(Tool):
         if not query.strip():
             raise ToolError("query must be a non-empty string.")
 
-        result = self._retriever.search(query)
+        with self._ingest_lock:
+            result = self._retriever.search(query)
+            hits = self._hydrate(result.hits)
+
         if not result.hits:
             sheet = _EMPTY_RESULTS_REPLY
             if result.note:
@@ -353,7 +367,7 @@ class KbSearchTool(Tool):
             return truncate(sheet, self._max_output_chars)
 
         lines: list[str] = []
-        for position, hit in enumerate(self._hydrate(result.hits), start=1):
+        for position, hit in enumerate(hits, start=1):
             sources = "+".join(hit.sources) if hit.sources else "unknown"
             lines.append(
                 f"{position}. [{sources}] {hit.title or 'untitled'} (chunk {hit.idx})"
@@ -419,8 +433,11 @@ class KbStack:
     populates it on ingest and :class:`VectorIndexAdapter` consults it on
     search. ``ingest_lock`` serializes the complete
     write/snapshot/publish sequence of every :class:`KbIngestTool` wired
-    from this stack — the bot constructs fresh tools per upload, so the
-    lock must live on the stack, not on a tool instance. ``close()``
+    from this stack and is shared with :class:`KbSearchTool`, whose
+    retrieval holds it too — readers can then never observe a torn
+    generation (new FTS + old vector index) mid-publication. The bot
+    constructs fresh tools per upload, so the lock must live on the
+    stack, not on a tool instance. ``close()``
     releases the store, embedder and expansion-LLM resources best-effort
     (the expansion LLM, when configured, owns its client).
     """

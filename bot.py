@@ -213,7 +213,13 @@ def build_tool_registry(
                 ingest_lock=kb.ingest_lock,
             )
         )
-        reg.register(KbSearchTool(retriever=kb.retriever, store=kb.store))
+        reg.register(
+            KbSearchTool(
+                retriever=kb.retriever,
+                store=kb.store,
+                ingest_lock=kb.ingest_lock,
+            )
+        )
     return reg
 
 

@@ -4,7 +4,8 @@ Covers: ingest→search roundtrip with a FakeEmbedder + tmp SQLite DB,
 re-ingest deduplication, stale-chunk removal on re-ingest with a different
 chunking configuration, persisted embed-dim validation, shared ingest-lock
 serialization (snapshot + publish inside the critical section; concurrent
-ingests keep the index in sync with the store), fact-sheet formatting
+ingests keep the index in sync with the store; search reads run under the
+same lock and wait out the replace→publish window), fact-sheet formatting
 (sources tag, no raw scores, truncation cap), tool error mapping,
 KB_ENABLED=0 regression (exact pre-kb tool set), KB_ENABLED default-on
 registration, an agent end-to-end round trip through kb_search, and the
@@ -323,6 +324,134 @@ def test_concurrent_ingests_keep_index_in_sync_with_store(tmp_path: Path) -> Non
     }
     assert indexed_ids == stored_ids
     assert set(metadata) == stored_ids
+
+
+def test_search_reads_run_under_shared_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vector reads and store hydration run inside the shared ingest lock."""
+    lock = threading.Lock()
+    store = ChunkStore(tmp_path / "kb.db")
+    embedder = FakeEmbedder()
+    vector_index = VectorIndex({})
+    metadata: dict[str, ChunkHit] = {}
+    ingest = KbIngestTool(
+        store=store,
+        embedder=embedder,
+        vector_index=vector_index,
+        metadata=metadata,
+        chunk_size=_CHUNK_SIZE,
+        chunk_overlap=_CHUNK_OVERLAP,
+        ingest_lock=lock,
+    )
+    ingest.execute(text=_TEXT, title="Corpus")
+    metadata.clear()  # restart: cache empty → hydration must consult the store
+
+    observed: dict[str, bool] = {}
+
+    real_vector_search = vector_index.search
+
+    def vector_search(queries: list[list[float]], limit: int) -> list[ChunkHit]:
+        observed["vector"] = lock.locked()
+        return real_vector_search(queries, limit)
+
+    real_metadata_by_ids = store.metadata_by_ids
+
+    def metadata_by_ids(chunk_ids: list[str]) -> dict[str, ChunkHit]:
+        observed["hydrate"] = lock.locked()
+        return real_metadata_by_ids(chunk_ids)
+
+    monkeypatch.setattr(vector_index, "search", vector_search)
+    monkeypatch.setattr(store, "metadata_by_ids", metadata_by_ids)
+
+    search = KbSearchTool(
+        retriever=HybridRetriever(
+            embedder=embedder,
+            vector=VectorIndexAdapter(vector_index, metadata),
+            fts=None,
+            top_k=5,
+        ),
+        store=store,
+        ingest_lock=lock,
+    )
+    result = search.execute(query="needle")
+
+    assert observed == {"vector": True, "hydrate": True}
+    assert "needle" in result
+
+
+def test_concurrent_search_waits_out_publication_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A search never reads between replace_chunks and the index publish."""
+    lock = threading.Lock()
+    store = ChunkStore(tmp_path / "kb.db")
+    embedder = FakeEmbedder()
+    vector_index = VectorIndex({})
+    metadata: dict[str, ChunkHit] = {}
+
+    def make_ingest(size: int, overlap: int) -> KbIngestTool:
+        return KbIngestTool(
+            store=store,
+            embedder=embedder,
+            vector_index=vector_index,
+            metadata=metadata,
+            chunk_size=size,
+            chunk_overlap=overlap,
+            ingest_lock=lock,
+        )
+
+    make_ingest(_CHUNK_SIZE, _CHUNK_OVERLAP).execute(text=_TEXT, title="Corpus")
+
+    publication_started = threading.Event()
+    release_publication = threading.Event()
+    real_replace_all = vector_index.replace_all
+
+    def replace_all(vectors: dict[str, bytes]) -> None:
+        publication_started.set()
+        release_publication.wait()
+        real_replace_all(vectors)
+
+    monkeypatch.setattr(vector_index, "replace_all", replace_all)
+
+    def reingest() -> None:
+        make_ingest(10_000, 0).execute(text=_TEXT, title="Corpus")
+
+    writer = threading.Thread(target=reingest)
+    writer.start()
+    assert publication_started.wait()
+    # Torn window is open now: the store holds the new generation (old chunks
+    # deleted, cache pruned) while the index still holds the old one.
+
+    reader = KbSearchTool(
+        retriever=HybridRetriever(
+            embedder=embedder,
+            vector=VectorIndexAdapter(vector_index, metadata),
+            fts=StoreFtsAdapter(store),
+            top_k=5,
+        ),
+        store=store,
+        ingest_lock=lock,
+    )
+    results: list[str] = []
+
+    def do_search() -> None:
+        results.append(reader.execute(query="needle"))
+
+    search_thread = threading.Thread(target=do_search)
+    search_thread.start()
+    search_thread.join(timeout=0.2)
+    assert results == []  # blocked on the lock — the torn window is never read
+
+    release_publication.set()
+    writer.join()
+    search_thread.join()
+
+    assert len(results) == 1
+    assert "needle" in results[0]
+    assert "(content unavailable)" not in results[0]
 
 
 def test_ingest_dim_mismatch_raises_tool_error_and_writes_nothing(
