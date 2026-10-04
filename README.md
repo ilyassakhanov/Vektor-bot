@@ -41,7 +41,7 @@ Secrets and settings live in `.env` (gitignored). Real environment variables alw
 | `TELEGRAM_BOT_TOKEN` | yes | Telegram bot token (must contain a colon) |
 | `OLLAMA_BASE_URL` | no | Ollama HTTP base URL (default `http://localhost:11434`) |
 | `OLLAMA_MODEL` | no | Ollama model name (default `llama3.2`) |
-| `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed) |
+| `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed). With `KB_ENABLED=1` at most one username is permitted — the KB has no per-user namespace |
 
 ## Architecture
 

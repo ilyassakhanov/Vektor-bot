@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache
 .mypi_cache
 benchmarks/results.json
+data/
 dashboard/venv/
 dashboard/grafana.db
 .opencode/

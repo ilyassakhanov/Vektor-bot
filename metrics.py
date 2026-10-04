@@ -65,6 +65,26 @@ mcp_restarts_total = Counter(
     "MCP server subprocess restarts",
 )
 
+retrieval_expansion_total = Counter(
+    "vektor_retrieval_expansion_total",
+    "Query expansion outcomes (ok = produced terms, fallback = expander ran but produced nothing new)",
+    ["status"],
+)
+
+retrieval_latency_seconds = Histogram(
+    "vektor_retrieval_latency_seconds",
+    "Hybrid retrieval per-stage latency in seconds",
+    ["stage"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+
+retrieval_results = Histogram(
+    "vektor_retrieval_results",
+    "Retrieval hit counts per source (before fusion) and fused final length",
+    ["source"],
+    buckets=(0, 1, 2, 5, 10, 20, 50, 100),
+)
+
 
 def start_metrics_server(port: int) -> None:
     """Start the Prometheus metrics HTTP server on the given port."""

@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from llm import LLMError
+from llm import LLMError, Message
 from llm.ollama import OllamaLLM
 
 
@@ -156,3 +156,71 @@ def test_generate_payload_no_options_when_env_unset(monkeypatch):
     body = captured["body"]
     assert "options" not in body
     assert "keep_alive" not in body
+
+
+# --- Temperature payload option ---------------------------------------------
+
+
+def _capturing_client() -> tuple[httpx.Client, dict[str, Any]]:
+    captured: dict[str, Any] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(req.content)
+        return httpx.Response(
+            200, json={"response": "ok", "message": {"content": "ok"}}
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), timeout=5.0)
+    return client, captured
+
+
+def test_generate_payload_includes_temperature_when_set():
+    client, captured = _capturing_client()
+    llm = OllamaLLM(client=client, temperature=0.0)
+    llm.generate("Hi")
+    assert captured["body"]["options"]["temperature"] == 0.0
+
+
+def test_chat_payload_includes_temperature_when_set():
+    client, captured = _capturing_client()
+    llm = OllamaLLM(client=client, temperature=0.7)
+    llm.chat([Message(role="user", content="hi")], [])
+    assert captured["body"]["options"]["temperature"] == 0.7
+
+
+def test_generate_payload_temperature_absent_when_unset(monkeypatch):
+    monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+    monkeypatch.delenv("OLLAMA_KEEP_ALIVE", raising=False)
+    client, captured = _capturing_client()
+    llm = OllamaLLM(client=client)
+    llm.generate("Hi")
+    assert "options" not in captured["body"]
+
+
+def test_chat_payload_temperature_absent_when_unset(monkeypatch):
+    monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+    monkeypatch.delenv("OLLAMA_KEEP_ALIVE", raising=False)
+    client, captured = _capturing_client()
+    llm = OllamaLLM(client=client)
+    llm.chat([Message(role="user", content="hi")], [])
+    assert "options" not in captured["body"]
+
+
+def test_generate_payload_temperature_and_num_ctx_coexist(monkeypatch):
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "4096")
+    client, captured = _capturing_client()
+    llm = OllamaLLM(client=client, temperature=0.2)
+    llm.generate("Hi")
+    options = captured["body"]["options"]
+    assert options["num_ctx"] == 4096
+    assert options["temperature"] == 0.2
+
+
+def test_chat_payload_temperature_and_num_ctx_coexist(monkeypatch):
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "4096")
+    client, captured = _capturing_client()
+    llm = OllamaLLM(client=client, temperature=0.2)
+    llm.chat([Message(role="user", content="hi")], [])
+    options = captured["body"]["options"]
+    assert options["num_ctx"] == 4096
+    assert options["temperature"] == 0.2

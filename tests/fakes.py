@@ -60,6 +60,22 @@ class FakeLLM(LLM):
         return ChatResponse(content=self._reply)
 
 
+class CloseableLLM(FakeLLM):
+    """FakeLLM that records ``close()`` calls — mirrors ``OllamaLLM.close``."""
+
+    def __init__(
+        self,
+        reply: str = "ok",
+        *,
+        error: LLMError | None = None,
+    ) -> None:
+        super().__init__(reply, error=error)
+        self.close_calls: int = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 class ScriptedLLM(LLM):
     """LLM that plays back a pre-seeded list of :class:`ChatResponse`.
 

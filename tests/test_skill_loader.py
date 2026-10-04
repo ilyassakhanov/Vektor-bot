@@ -9,6 +9,9 @@ from skills.loader import SkillLoader
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CVE_PROMPT_BASELINE_CHARS = 1739  # measured pre-O4-slimming prompt length
+# Slimming ceiling plus the deliberate prompt-injection rule (kb_search
+# results are untrusted data); still well below the pre-slimming baseline.
+_SKILL_PROMPT_BUDGET_CHARS = 1300
 
 
 def _write_skill(dir_path: Path, name: str, content: str) -> None:
@@ -115,11 +118,13 @@ def test_cve_skill_retains_load_bearing_rules():
 
     The generated system prompt must still route CVE questions to the
     ``get_latest_cve`` tool and keep the no-fabrication / CVE.org-source
-    rule markers, while staying well below the recorded pre-slimming
-    baseline length (O4: the prompt is re-sent on every LLM call).
+    rule markers, while staying below the slimming budget — the recorded
+    pre-slimming baseline length plus a deliberate allowance for the
+    prompt-injection rule (O4: the prompt is re-sent on every LLM call).
     """
     system = SkillLoader(_PROJECT_ROOT / "skills").system_prompt()
     assert "get_latest_cve" in system
     assert "fabricate" in system.lower()
     assert "CVE.org" in system
-    assert len(system) < _CVE_PROMPT_BASELINE_CHARS * 0.6
+    assert "untrusted" in system
+    assert len(system) < _SKILL_PROMPT_BUDGET_CHARS
