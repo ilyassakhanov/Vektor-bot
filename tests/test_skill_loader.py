@@ -10,8 +10,9 @@ from skills.loader import SkillLoader
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CVE_PROMPT_BASELINE_CHARS = 1739  # measured pre-O4-slimming prompt length
 # Slimming ceiling plus the deliberate prompt-injection rule (kb_search
-# results are untrusted data); still well below the pre-slimming baseline.
-_SKILL_PROMPT_BUDGET_CHARS = 1300
+# results are untrusted data) and the WS-4 source-citation rule; still
+# below the pre-slimming baseline.
+_SKILL_PROMPT_BUDGET_CHARS = 1600
 
 
 def _write_skill(dir_path: Path, name: str, content: str) -> None:
@@ -128,3 +129,19 @@ def test_cve_skill_retains_load_bearing_rules():
     assert "CVE.org" in system
     assert "untrusted" in system
     assert len(system) < _SKILL_PROMPT_BUDGET_CHARS
+
+
+# --- WS-4: documents skill source-citation rule ------------------------------------
+
+
+def test_documents_skill_contains_citation_rule() -> None:
+    """Every kb_search fact must be cited by filename + page (or chunk)."""
+    skills = {
+        skill.name: skill.content
+        for skill in SkillLoader(_PROJECT_ROOT / "skills").load()
+    }
+    documents = " ".join(skills["documents"].split())
+    assert "Источник" in documents
+    assert "стр. M" in documents
+    assert "chunk #N" in documents
+    assert "never answer from general knowledge" in documents

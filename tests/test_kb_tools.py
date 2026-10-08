@@ -1,22 +1,15 @@
 """Tests for the kb tools + bot wiring — fakes only, no network, no Ollama.
 
-Covers: ingest→search roundtrip with a FakeEmbedder + tmp SQLite DB,
-re-ingest deduplication, stale-chunk removal on re-ingest with a different
-chunking configuration, persisted embed-dim validation, shared ingest-lock
-serialization (snapshot + publish inside the critical section; concurrent
-ingests keep the index in sync with the store; search reads run under the
-same lock and wait out the replace→publish window), fact-sheet formatting
-(sources tag, no raw scores, truncation cap), tool error mapping,
-KB_ENABLED=0 regression (exact pre-kb tool set), KB_ENABLED default-on
-registration, an agent end-to-end round trip through kb_search, and the
-bot composition roots (build_kb_stack / build_retriever) driven by
-environment variables — including the persisted-embedding-model conflict
-(KBModelError) — and shutdown closing the expansion LLM's client.
+Covers: ingest→search roundtrips, re-ingest dedup, dim validation, concurrent
+ingests, fact sheets, tool errors, the ``{text, title}``-only execute schema,
+KB_ENABLED regressions, agent end-to-end search, and the bot composition roots.
 """
 
 from __future__ import annotations
 
+import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -27,14 +20,13 @@ from llm.base import ChatResponse
 from retrieval.embeddings import Embedder, EmbeddingError
 from retrieval.expansion import QueryExpander
 from retrieval.hybrid import HybridRetriever
-from retrieval.rrf import ChunkHit
+from retrieval.principal import get_user, reset_user, set_user
 from retrieval.store import (
     META_EMBED_DIM,
     META_EMBED_MODEL,
     ChunkStore,
     KBModelError,
 )
-from retrieval.vector_index import VectorIndex
 from tests.fakes import (
     CloseableLLM,
     FakeLLM,
@@ -43,7 +35,12 @@ from tests.fakes import (
     make_tool_call,
 )
 from tools.base import ToolError
-from tools.kb import KbIngestTool, KbSearchTool, StoreFtsAdapter, VectorIndexAdapter
+from tools.kb import (
+    KbIngestTool,
+    KbSearchTool,
+    StoreFtsAdapter,
+    StoreVecAdapter,
+)
 from tools.registry import ToolRegistry
 
 _CHUNK_SIZE = 60
@@ -89,33 +86,23 @@ def _make_kb(
     embedder: Embedder | None = None,
     *,
     fts: bool = True,
-    restart: bool = False,
 ) -> tuple[KbIngestTool, KbSearchTool, ChunkStore]:
-    """Wire the kb tools over a tmp SQLite DB with fakes (composition mirror).
-
-    ``restart=True`` simulates a fresh process over an existing DB file: a
-    new store/index/adapter set with an EMPTY metadata cache, the vector
-    index seeded from the persisted vectors.
-    """
+    """Wire the kb tools over a tmp SQLite DB with fakes (composition mirror)."""
     store = ChunkStore(tmp_path / "kb.db")
     the_embedder = embedder or FakeEmbedder()
-    vector_index = VectorIndex(dict(store.all_vectors()) if restart else {})
-    metadata: dict[str, ChunkHit] = {}
     retriever = HybridRetriever(
         embedder=the_embedder,
-        vector=VectorIndexAdapter(vector_index, metadata),
+        vector=StoreVecAdapter(store),
         fts=StoreFtsAdapter(store) if fts else None,
         top_k=5,
     )
     ingest = KbIngestTool(
         store=store,
         embedder=the_embedder,
-        vector_index=vector_index,
-        metadata=metadata,
         chunk_size=_CHUNK_SIZE,
         chunk_overlap=_CHUNK_OVERLAP,
     )
-    search = KbSearchTool(retriever=retriever, store=store)
+    search = KbSearchTool(retriever=retriever)
     return ingest, search, store
 
 
@@ -158,15 +145,11 @@ def test_reingest_same_text_does_not_duplicate(tmp_path: Path) -> None:
 def test_reingest_with_fewer_chunks_removes_stale_content(tmp_path: Path) -> None:
     store = ChunkStore(tmp_path / "kb.db")
     embedder = FakeEmbedder()
-    vector_index = VectorIndex({})
-    metadata: dict[str, ChunkHit] = {}
 
     def make_ingest(size: int, overlap: int) -> KbIngestTool:
         return KbIngestTool(
             store=store,
             embedder=embedder,
-            vector_index=vector_index,
-            metadata=metadata,
             chunk_size=size,
             chunk_overlap=overlap,
         )
@@ -179,118 +162,31 @@ def test_reingest_with_fewer_chunks_removes_stale_content(tmp_path: Path) -> Non
     whole_ingest.execute(text=_TEXT, title="Corpus")
 
     assert store.count() == 1
-    assert set(dict(store.all_vectors())) == set(metadata)
-    assert [hit.idx for hit in store.search_fts(["needle"], limit=10)] == [0]
+    assert [hit.idx for hit in store.search_fts("0", ["needle"], limit=10)] == [0]
     search = KbSearchTool(
         retriever=HybridRetriever(
             embedder=embedder,
-            vector=VectorIndexAdapter(vector_index, metadata),
+            vector=StoreVecAdapter(store),
             fts=StoreFtsAdapter(store),
             top_k=5,
         ),
-        store=store,
     )
     result = search.execute(query="needle")
     assert "needle" in result
     assert "(chunk 0)" in result
 
 
-def test_reingest_prunes_stale_metadata_cache(tmp_path: Path) -> None:
+def test_concurrent_ingests_over_one_store_stay_consistent(tmp_path: Path) -> None:
+    """Two tools sharing one store: both persist, everything is searchable."""
     store = ChunkStore(tmp_path / "kb.db")
     embedder = FakeEmbedder()
-    vector_index = VectorIndex({})
-    metadata: dict[str, ChunkHit] = {}
-    big_ingest = KbIngestTool(
-        store=store,
-        embedder=embedder,
-        vector_index=vector_index,
-        metadata=metadata,
-        chunk_size=_CHUNK_SIZE,
-        chunk_overlap=_CHUNK_OVERLAP,
-    )
-    whole_ingest = KbIngestTool(
-        store=store,
-        embedder=embedder,
-        vector_index=vector_index,
-        metadata=metadata,
-        chunk_size=10_000,
-        chunk_overlap=0,
-    )
-    big_ingest.execute(text=_TEXT, title="Corpus")
-    assert len(metadata) > 1
-
-    whole_ingest.execute(text=_TEXT, title="Corpus")
-
-    assert len(metadata) == 1
-    assert next(iter(metadata.values())).idx == 0
-
-
-def test_ingest_persists_embed_dim_meta(tmp_path: Path) -> None:
-    ingest, _search, store = _make_kb(tmp_path)
-    ingest.execute(text=_TEXT, title="Corpus")
-    assert store.get_meta(META_EMBED_DIM) == str(len(FakeEmbedder.vector_for("x")))
-
-
-# --- shared ingest lock ------------------------------------------------------------
-
-
-def test_ingest_snapshots_and_publishes_under_shared_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The store snapshot and the index publish run inside the ingest lock."""
-    lock = threading.Lock()
-    store = ChunkStore(tmp_path / "kb.db")
-    vector_index = VectorIndex({})
-    metadata: dict[str, ChunkHit] = {}
-    observed: dict[str, bool] = {}
-
-    real_all_vectors = store.all_vectors
-
-    def all_vectors() -> list[tuple[str, bytes]]:
-        observed["snapshot"] = lock.locked()
-        return real_all_vectors()
-
-    real_replace_all = vector_index.replace_all
-
-    def replace_all(vectors: dict[str, bytes]) -> None:
-        observed["publish"] = lock.locked()
-        real_replace_all(vectors)
-
-    monkeypatch.setattr(store, "all_vectors", all_vectors)
-    monkeypatch.setattr(vector_index, "replace_all", replace_all)
-
-    ingest = KbIngestTool(
-        store=store,
-        embedder=FakeEmbedder(),
-        vector_index=vector_index,
-        metadata=metadata,
-        chunk_size=_CHUNK_SIZE,
-        chunk_overlap=_CHUNK_OVERLAP,
-        ingest_lock=lock,
-    )
-    ingest.execute(text=_TEXT, title="Corpus")
-
-    assert observed == {"snapshot": True, "publish": True}
-
-
-def test_concurrent_ingests_keep_index_in_sync_with_store(tmp_path: Path) -> None:
-    """Two tools sharing one lock: the final index covers everything stored."""
-    lock = threading.Lock()
-    store = ChunkStore(tmp_path / "kb.db")
-    embedder = FakeEmbedder()
-    vector_index = VectorIndex({})
-    metadata: dict[str, ChunkHit] = {}
 
     def make_tool() -> KbIngestTool:
         return KbIngestTool(
             store=store,
             embedder=embedder,
-            vector_index=vector_index,
-            metadata=metadata,
             chunk_size=_CHUNK_SIZE,
             chunk_overlap=_CHUNK_OVERLAP,
-            ingest_lock=lock,
         )
 
     errors: list[BaseException] = []
@@ -317,141 +213,18 @@ def test_concurrent_ingests_keep_index_in_sync_with_store(tmp_path: Path) -> Non
         thread.join()
 
     assert not errors
-    stored_ids = set(dict(store.all_vectors()))
-    indexed_ids = {
-        hit.chunk_id
-        for hit in vector_index.search([FakeEmbedder.vector_for("x")], limit=100)
+    assert {
+        hit.title for hit in store.search_fts("0", ["alpha", "zeta"], limit=10)
+    } == {
+        "A",
+        "B",
     }
-    assert indexed_ids == stored_ids
-    assert set(metadata) == stored_ids
 
 
-def test_search_reads_run_under_shared_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Vector reads and store hydration run inside the shared ingest lock."""
-    lock = threading.Lock()
-    store = ChunkStore(tmp_path / "kb.db")
-    embedder = FakeEmbedder()
-    vector_index = VectorIndex({})
-    metadata: dict[str, ChunkHit] = {}
-    ingest = KbIngestTool(
-        store=store,
-        embedder=embedder,
-        vector_index=vector_index,
-        metadata=metadata,
-        chunk_size=_CHUNK_SIZE,
-        chunk_overlap=_CHUNK_OVERLAP,
-        ingest_lock=lock,
-    )
+def test_ingest_persists_embed_dim_meta(tmp_path: Path) -> None:
+    ingest, _search, store = _make_kb(tmp_path)
     ingest.execute(text=_TEXT, title="Corpus")
-    metadata.clear()  # restart: cache empty → hydration must consult the store
-
-    observed: dict[str, bool] = {}
-
-    real_vector_search = vector_index.search
-
-    def vector_search(queries: list[list[float]], limit: int) -> list[ChunkHit]:
-        observed["vector"] = lock.locked()
-        return real_vector_search(queries, limit)
-
-    real_metadata_by_ids = store.metadata_by_ids
-
-    def metadata_by_ids(chunk_ids: list[str]) -> dict[str, ChunkHit]:
-        observed["hydrate"] = lock.locked()
-        return real_metadata_by_ids(chunk_ids)
-
-    monkeypatch.setattr(vector_index, "search", vector_search)
-    monkeypatch.setattr(store, "metadata_by_ids", metadata_by_ids)
-
-    search = KbSearchTool(
-        retriever=HybridRetriever(
-            embedder=embedder,
-            vector=VectorIndexAdapter(vector_index, metadata),
-            fts=None,
-            top_k=5,
-        ),
-        store=store,
-        ingest_lock=lock,
-    )
-    result = search.execute(query="needle")
-
-    assert observed == {"vector": True, "hydrate": True}
-    assert "needle" in result
-
-
-def test_concurrent_search_waits_out_publication_window(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A search never reads between replace_chunks and the index publish."""
-    lock = threading.Lock()
-    store = ChunkStore(tmp_path / "kb.db")
-    embedder = FakeEmbedder()
-    vector_index = VectorIndex({})
-    metadata: dict[str, ChunkHit] = {}
-
-    def make_ingest(size: int, overlap: int) -> KbIngestTool:
-        return KbIngestTool(
-            store=store,
-            embedder=embedder,
-            vector_index=vector_index,
-            metadata=metadata,
-            chunk_size=size,
-            chunk_overlap=overlap,
-            ingest_lock=lock,
-        )
-
-    make_ingest(_CHUNK_SIZE, _CHUNK_OVERLAP).execute(text=_TEXT, title="Corpus")
-
-    publication_started = threading.Event()
-    release_publication = threading.Event()
-    real_replace_all = vector_index.replace_all
-
-    def replace_all(vectors: dict[str, bytes]) -> None:
-        publication_started.set()
-        release_publication.wait()
-        real_replace_all(vectors)
-
-    monkeypatch.setattr(vector_index, "replace_all", replace_all)
-
-    def reingest() -> None:
-        make_ingest(10_000, 0).execute(text=_TEXT, title="Corpus")
-
-    writer = threading.Thread(target=reingest)
-    writer.start()
-    assert publication_started.wait()
-    # Torn window is open now: the store holds the new generation (old chunks
-    # deleted, cache pruned) while the index still holds the old one.
-
-    reader = KbSearchTool(
-        retriever=HybridRetriever(
-            embedder=embedder,
-            vector=VectorIndexAdapter(vector_index, metadata),
-            fts=StoreFtsAdapter(store),
-            top_k=5,
-        ),
-        store=store,
-        ingest_lock=lock,
-    )
-    results: list[str] = []
-
-    def do_search() -> None:
-        results.append(reader.execute(query="needle"))
-
-    search_thread = threading.Thread(target=do_search)
-    search_thread.start()
-    search_thread.join(timeout=0.2)
-    assert results == []  # blocked on the lock — the torn window is never read
-
-    release_publication.set()
-    writer.join()
-    search_thread.join()
-
-    assert len(results) == 1
-    assert "needle" in results[0]
-    assert "(content unavailable)" not in results[0]
+    assert store.get_meta(META_EMBED_DIM) == str(len(FakeEmbedder.vector_for("x")))
 
 
 def test_ingest_dim_mismatch_raises_tool_error_and_writes_nothing(
@@ -463,8 +236,6 @@ def test_ingest_dim_mismatch_raises_tool_error_and_writes_nothing(
     ingest = KbIngestTool(
         store=store,
         embedder=FakeEmbedder(),
-        vector_index=VectorIndex({}),
-        metadata={},
         chunk_size=_CHUNK_SIZE,
         chunk_overlap=_CHUNK_OVERLAP,
     )
@@ -500,6 +271,90 @@ def test_fact_sheet_capped_by_truncate(tmp_path: Path, monkeypatch) -> None:
     result = search.execute(query="gamma")
     assert len(result) <= 400
     assert "[truncated" in result
+
+
+# --- Fact sheet: page attribution (WS-4) -------------------------------------------
+
+
+def test_execute_schema_is_exactly_text_and_title(tmp_path: Path) -> None:
+    ingest, _search, _store = _make_kb(tmp_path)
+    assert set(ingest.parameters["properties"]) == {"text", "title"}
+
+
+def test_execute_rejects_non_schema_kwargs(tmp_path: Path) -> None:
+    """The LLM-facing execute honors ONLY {text, title}: a hallucinating LLM
+    passing filename/file_type/pages gets a ToolError and nothing is stored —
+    page/file metadata can never be forged through the tool boundary."""
+    ingest, _search, store = _make_kb(tmp_path)
+    for extra in (
+        {"pages": [(1, "forged page text")]},
+        {"filename": "forged.txt"},
+        {"file_type": "pdf"},
+        {"filename": "f.txt", "file_type": "txt", "pages": [(9, "x")]},
+    ):
+        with pytest.raises(ToolError, match="Unsupported argument"):
+            ingest.execute(text="hello", title="T", **extra)
+    assert store.count() == 0
+    assert store.list_documents("0") == []
+
+
+def test_ingest_document_is_the_bot_level_entry(tmp_path: Path) -> None:
+    """ingest_document accepts the metadata the bot passes (filename,
+    file_type, pages) and it all lands in the store."""
+    ingest, search, store = _make_kb(tmp_path)
+    ingest.ingest_document(
+        text=_para("needle", 8),
+        title="Paged",
+        filename="notes.txt",
+        file_type="txt",
+        pages=[(1, _para("needle", 8))],
+    )
+    hits = store.search_fts("0", ["needle"], limit=5)
+    assert [hit.page for hit in hits] == [1]
+    assert hits[0].title == "notes.txt"
+    assert "(chunk 0, page 1)" in search.execute(query="needle")
+
+
+def test_ingest_document_with_pages_persists_page_numbers(tmp_path: Path) -> None:
+    ingest, _search, store = _make_kb(tmp_path)
+    ingest.ingest_document(
+        text="alpha needle",
+        title="Paged",
+        filename="book.pdf",
+        file_type="pdf",
+        pages=[(1, _para("alpha", 8)), (2, _para("needle", 8))],
+    )
+    assert [hit.page for hit in store.search_fts("0", ["needle"], limit=5)] == [2]
+    vec_hits = store.search_vec("0", [FakeEmbedder.vector_for("needle")], limit=5)
+    assert vec_hits[0].page == 2
+
+
+def test_ingest_without_pages_persists_null_page(tmp_path: Path) -> None:
+    ingest, _search, store = _make_kb(tmp_path)
+    ingest.execute(text=_para("needle", 8), title="Plain")
+    assert [hit.page for hit in store.search_fts("0", ["needle"], limit=5)] == [None]
+
+
+def test_fact_sheet_shows_page_when_present(tmp_path: Path) -> None:
+    ingest, search, _store = _make_kb(tmp_path)
+    ingest.ingest_document(
+        text="alpha needle",
+        title="Paged",
+        filename="book.pdf",
+        file_type="pdf",
+        pages=[(1, _para("alpha", 8)), (2, _para("needle", 8))],
+    )
+    result = search.execute(query="needle")
+    line = next(line for line in result.splitlines() if "(chunk " in line)
+    assert "(chunk 1, page 2)" in line
+
+
+def test_fact_sheet_omits_page_when_absent(tmp_path: Path) -> None:
+    ingest, search, _store = _make_kb(tmp_path)
+    ingest.execute(text=_para("needle", 8), title="Plain")
+    result = search.execute(query="needle")
+    assert "(chunk 0)" in result
+    assert ", page" not in result
 
 
 # --- Tool errors / degradation ---------------------------------------------------
@@ -540,32 +395,106 @@ def test_search_never_raises_when_embedding_fails(tmp_path: Path) -> None:
     assert "No matching knowledge found." in result
 
 
-# --- Restart simulation (fresh process, same DB file, empty metadata cache) ------
+# --- Restart simulation (fresh process, same DB file) -----------------------------
 
 
 def test_restart_hybrid_search_returns_full_metadata(tmp_path: Path) -> None:
-    process_a_ingest, _search, _store = _make_kb(tmp_path)
+    process_a_ingest, _search, store = _make_kb(tmp_path)
     process_a_ingest.execute(text=_TEXT, title="Corpus")
+    store.close()
 
-    _ingest, process_b_search, _store2 = _make_kb(tmp_path, restart=True)
-    result = process_b_search.execute(query="needle")
-
-    assert "needle" in result
-    assert "Corpus" in result
-    assert "(content unavailable)" not in result
-    assert "untitled" not in result
+    _ingest, process_b_search, store2 = _make_kb(tmp_path)
+    try:
+        result = process_b_search.execute(query="needle")
+        assert "needle" in result
+        assert "Corpus" in result
+        assert "(content unavailable)" not in result
+        assert "untitled" not in result
+    finally:
+        store2.close()
 
 
 def test_restart_vector_only_search_returns_full_metadata(tmp_path: Path) -> None:
-    process_a_ingest, _search, _store = _make_kb(tmp_path, fts=False)
+    process_a_ingest, _search, store = _make_kb(tmp_path, fts=False)
     process_a_ingest.execute(text=_TEXT, title="Corpus")
+    store.close()
 
-    _ingest, process_b_search, _store2 = _make_kb(tmp_path, fts=False, restart=True)
-    result = process_b_search.execute(query="needle")
+    _ingest, process_b_search, store2 = _make_kb(tmp_path, fts=False)
+    try:
+        result = process_b_search.execute(query="needle")
+        assert "needle" in result
+        assert "Corpus" in result
+        assert "(content unavailable)" not in result
+    finally:
+        store2.close()
 
-    assert "needle" in result
-    assert "Corpus" in result
-    assert "(content unavailable)" not in result
+
+# --- Principal contextvar (WS-2) ---------------------------------------------------
+
+
+def test_tool_schemas_expose_no_user_id(tmp_path: Path) -> None:
+    ingest, search, _store = _make_kb(tmp_path)
+    for tool in (ingest, search):
+        properties = tool.parameters["properties"]
+        assert "user_id" not in properties
+        assert "user_id" not in tool.parameters.get("required", [])
+
+
+def test_no_principal_falls_back_to_zero_owner(tmp_path: Path) -> None:
+    """Explicit fallback: without a principal everything lands under "0"
+    and is only visible to "0" — never silently re-scoped."""
+    ingest, search, store = _make_kb(tmp_path)
+    ingest.execute(text=_TEXT, title="Corpus")
+    assert {h.title for h in store.search_fts("0", ["needle"], limit=5)} == {"Corpus"}
+    assert "needle" in search.execute(query="needle")
+
+
+def test_principal_scopes_ingest_and_search(tmp_path: Path) -> None:
+    ingest, search, _store = _make_kb(tmp_path)
+    owner = set_user("101")
+    try:
+        ingest.execute(text=_TEXT, title="Corpus")
+    finally:
+        reset_user(owner)
+
+    other = set_user("202")
+    try:
+        assert search.execute(query="needle") == "No matching knowledge found."
+    finally:
+        reset_user(other)
+
+    owner = set_user("101")
+    try:
+        result = search.execute(query="needle")
+        assert "needle" in result
+        assert "Corpus" in result
+    finally:
+        reset_user(owner)
+
+
+def test_ingest_document_uses_filename_file_type_and_utc_created_at(
+    tmp_path: Path,
+) -> None:
+    ingest, _search, _store = _make_kb(tmp_path)
+    ingest.ingest_document(
+        text=_TEXT, title="Corpus", filename="notes.txt", file_type="txt"
+    )
+    conn = sqlite3.connect(tmp_path / "kb.db")
+    try:
+        row = conn.execute(
+            "SELECT user_id, filename, file_type, created_at FROM documents"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == "0"
+    assert row[1] == "notes.txt"
+    assert row[2] == "txt"
+    parsed = datetime.fromisoformat(row[3])
+    assert parsed.tzinfo is not None
+
+
+def test_get_user_default_is_zero_without_principal() -> None:
+    assert get_user() == "0"
 
 
 # --- KB_ENABLED regression / default-on ------------------------------------------
@@ -805,3 +734,20 @@ def test_build_tool_registry_model_mismatch_propagates(
 
     with pytest.raises(KBModelError):
         build_tool_registry(None)
+
+
+def test_kb_stack_exports_store_backed_adapters(monkeypatch, tmp_path: Path) -> None:
+    """KbStack wires StoreVecAdapter/StoreFtsAdapter over the shared store."""
+    monkeypatch.delenv("KB_ENABLED", raising=False)
+    monkeypatch.setenv("KB_DB_PATH", str(tmp_path / "kb.db"))
+    monkeypatch.setenv("KB_EXPANSION_ENABLED", "0")
+    stack = build_kb_stack()
+    assert stack is not None
+    try:
+        assert isinstance(stack.vector, StoreVecAdapter)
+        assert stack.fts is not None
+        assert not hasattr(stack, "vector_index")
+        assert not hasattr(stack, "metadata")
+        assert not hasattr(stack, "ingest_lock")
+    finally:
+        stack.close()

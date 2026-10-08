@@ -71,6 +71,12 @@ retrieval_expansion_total = Counter(
     ["status"],
 )
 
+retrieval_rerank_total = Counter(
+    "vektor_retrieval_rerank_total",
+    "Rerank stage outcomes (ok = rescored, fallback = kept RRF order)",
+    ["status"],
+)
+
 retrieval_latency_seconds = Histogram(
     "vektor_retrieval_latency_seconds",
     "Hybrid retrieval per-stage latency in seconds",

@@ -1,17 +1,14 @@
-"""Tests for the document-upload flow — bot-level ingest, then every upload
-routes an upload notice (+ caption) through the conversation: confirmation
-+ agent reply.
+"""Tests for the document-upload flow — staged progress → conversation.
 
-Offline: a fake TeleBot records get_file/download_file calls and hands out
-canned bytes; the kb stack is real over a tmp SQLite DB with a deterministic
-fake embedder; the agent runs against ScriptedLLM/FakeLLM. No network, no
-Ollama, no real Telegram.
+Offline: fake TeleBot (canned bytes), real kb stack over tmp SQLite with a
+deterministic fake embedder (uploads via ``ingest_document``), ScriptedLLM.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,17 +18,24 @@ from telebot.apihelper import ApiTelegramException
 import bot as bot_module
 from agent.agent import Agent
 from agent.conversation import ConversationManager
-from bot import build_document_handler, create_bot, handle_message
+from bot import (
+    _DOCUMENT_READY_REPLY,
+    _DOCUMENT_RECEIVED_REPLY,
+    _EMBEDDING_REPLY,
+    _EXTRACTING_REPLY,
+    build_document_handler,
+    create_bot,
+    handle_message,
+)
 from llm import LLMError
 from llm.base import ChatResponse
 from retrieval.config import RetrievalConfig
 from retrieval.embeddings import Embedder, EmbeddingError
 from retrieval.hybrid import HybridRetriever
-from retrieval.rrf import ChunkHit
+from retrieval.principal import get_user, reset_user, set_user
 from retrieval.store import ChunkStore
-from retrieval.vector_index import VectorIndex
-from tests.fakes import FakeLLM, ScriptedLLM
-from tools.kb import KbSearchTool, KbStack, StoreFtsAdapter, VectorIndexAdapter
+from tests.fakes import FakeLLM, ScriptedLLM, make_tool_call
+from tools.kb import KbSearchTool, KbStack, StoreFtsAdapter, StoreVecAdapter
 from tools.registry import ToolRegistry
 
 _FILE_ID = "f1"
@@ -40,10 +44,69 @@ _CHUNK_SIZE = 60
 _CHUNK_OVERLAP = 10
 _KEYWORDS = ("needle", "haystack", "alpha", "beta")
 _DOC_BODY = " ".join(["needle"] * 20)
-_CONFIRMATION_PREFIX = "Ingested "
+_CONFIRMATION_PREFIX = "✅ Ingested "
 _DISABLED_REPLY = "Document uploads are not enabled."
 _LLM_ERROR_REPLY = "Sorry, I couldn't generate a response."
 _DOC_ERROR_REPLY = "Sorry, I couldn't process that document."
+
+
+def _staged_progress() -> list[str]:
+    """The three progress replies sent before the ingest confirmation."""
+    return [_DOCUMENT_RECEIVED_REPLY, _EXTRACTING_REPLY, _EMBEDDING_REPLY]
+
+
+def _para(word: str, count: int) -> str:
+    return " ".join([word] * count)
+
+
+def _build_multipage_pdf(texts: list[str]) -> bytes:
+    """Build an N-page PDF whose page i shows ``texts[i]`` via ``Tj``."""
+    font_number = 3 + 2 * len(texts)
+    page_numbers = [3 + 2 * i for i in range(len(texts))]
+    stream_numbers = [4 + 2 * i for i in range(len(texts))]
+    objects: dict[int, bytes] = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: (
+            b"<< /Type /Pages /Kids ["
+            + b" ".join(f"{number} 0 R".encode("ascii") for number in page_numbers)
+            + b"] /Count "
+            + str(len(texts)).encode("ascii")
+            + b" >>"
+        ),
+        font_number: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    for i, text in enumerate(texts):
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("latin-1")
+        objects[page_numbers[i]] = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 "
+            + str(font_number).encode("ascii")
+            + b" 0 R >> >> /Contents "
+            + str(stream_numbers[i]).encode("ascii")
+            + b" 0 R >>"
+        )
+        objects[stream_numbers[i]] = (
+            b"<< /Length "
+            + str(len(stream)).encode("ascii")
+            + b" >>\nstream\n"
+            + stream
+            + b"\nendstream"
+        )
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number in range(1, font_number + 1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode("ascii") + objects[number] + b"\nendobj\n"
+    xref_offset = len(out)
+    out += f"xref\n0 {font_number + 1}\n".encode("ascii")
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode("ascii")
+    out += (
+        f"trailer\n<< /Size {font_number + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n"
+    ).encode("ascii")
+    return bytes(out)
 
 
 # --- Fakes and stack helpers (self-contained, no cross-test imports) -----------
@@ -111,9 +174,7 @@ def _make_kb(tmp_path: Path, embedder: Embedder | None = None) -> KbStack:
     )
     store = ChunkStore(cfg.kb_db_path)
     emb = embedder if embedder is not None else FakeEmbedder()
-    vector_index = VectorIndex(dict(store.all_vectors()))
-    metadata: dict[str, ChunkHit] = {}
-    vector = VectorIndexAdapter(vector_index, metadata)
+    vector = StoreVecAdapter(store)
     fts = StoreFtsAdapter(store)
     retriever = HybridRetriever(
         embedder=emb,
@@ -128,10 +189,8 @@ def _make_kb(tmp_path: Path, embedder: Embedder | None = None) -> KbStack:
         cfg=cfg,
         store=store,
         embedder=emb,
-        vector_index=vector_index,
         vector=vector,
         retriever=retriever,
-        metadata=metadata,
         fts=fts,
     )
 
@@ -144,11 +203,12 @@ def _make_doc_message(
     file_name: str | None,
     caption: str | None = None,
     username: str | None = "tester",
+    user_id: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         message_id=1,
         chat=SimpleNamespace(id=42, type="private"),
-        from_user=SimpleNamespace(id=1, username=username, first_name="Tester"),
+        from_user=SimpleNamespace(id=user_id, username=username, first_name="Tester"),
         document=SimpleNamespace(file_id=_FILE_ID, file_name=file_name),
         caption=caption,
     )
@@ -157,12 +217,13 @@ def _make_doc_message(
 def _make_text_message(
     text: str,
     username: str | None = "tester",
+    user_id: int = 1,
 ) -> SimpleNamespace:
     """Existing-style fixture WITHOUT a ``document`` attribute."""
     return SimpleNamespace(
         message_id=1,
         chat=SimpleNamespace(id=42, type="private"),
-        from_user=SimpleNamespace(id=1, username=username, first_name="Tester"),
+        from_user=SimpleNamespace(id=user_id, username=username, first_name="Tester"),
         text=text,
     )
 
@@ -197,10 +258,12 @@ def test_document_downloaded_extracted_ingested_confirmed(tmp_path: Path) -> Non
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
     assert bot.get_file_calls == [_FILE_ID]
     assert bot.download_calls == [_FILE_PATH]
-    assert len(replies) == 2
-    assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert "notes.txt" in replies[0]
-    assert replies[1] == "noted"
+    assert len(replies) == 6
+    assert replies[:3] == _staged_progress()
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    assert "notes.txt" in replies[3]
+    assert replies[4] == _DOCUMENT_READY_REPLY
+    assert replies[5] == "noted"
     assert len(llm.chat_calls) == 1
 
 
@@ -212,11 +275,15 @@ def test_ingested_document_findable_via_kb_search(tmp_path: Path) -> None:
         bot,
         kb,
         _make_conv(ScriptedLLM([ChatResponse(content="done")])),
-        _make_doc_message("notes.txt"),
+        _make_doc_message("notes.txt", user_id=101),
         replies,
     )
-    search = KbSearchTool(retriever=kb.retriever, store=kb.store)
-    result = search.execute(query="needle")
+    search = KbSearchTool(retriever=kb.retriever)
+    owner = set_user("101")
+    try:
+        result = search.execute(query="needle")
+    finally:
+        reset_user(owner)
     assert "needle" in result
     assert "notes.txt" in result
 
@@ -231,16 +298,91 @@ def test_document_without_name_gets_friendly_error(tmp_path: Path) -> None:
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message(None), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies == [_DOCUMENT_RECEIVED_REPLY, _EXTRACTING_REPLY, _DOC_ERROR_REPLY]
     assert bot.get_file_calls == [_FILE_ID]
     assert bot.download_calls == [_FILE_PATH]
     assert llm.chat_calls == []
 
 
+# --- Staged progress (WS-3) ---------------------------------------------------------
+
+
+def test_progress_sequence_ordering(tmp_path: Path) -> None:
+    """Successful upload: received → extracting → embeddings → ✅ N chunks →
+    ready → agent reply — the staged-progress bonus, in exact order."""
+    bot = FakeBot(_DOC_BODY.encode())
+    kb = _make_kb(tmp_path)
+    llm = ScriptedLLM([ChatResponse(content="agent ack")])
+    conv = _make_conv(llm)
+    replies: list[str] = []
+    _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
+    assert replies == [
+        _DOCUMENT_RECEIVED_REPLY,
+        _EXTRACTING_REPLY,
+        _EMBEDDING_REPLY,
+        replies[3],
+        _DOCUMENT_READY_REPLY,
+        "agent ack",
+    ]
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+
+
+def test_pdf_page_numbers_reach_the_store(tmp_path: Path) -> None:
+    """A PDF upload extracts per-page text; pages land in chunks.page."""
+    pdf = _build_multipage_pdf(["Alpha intro page", _para("needle", 30)])
+    bot = FakeBot(pdf)
+    kb = _make_kb(tmp_path)
+    conv = _make_conv(ScriptedLLM([ChatResponse(content="ack")]))
+    replies: list[str] = []
+    _handle_document(bot, kb, conv, _make_doc_message("book.pdf", user_id=101), replies)
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    conn = sqlite3.connect(tmp_path / "kb.db")
+    try:
+        pages = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT page FROM chunks ORDER BY page"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert pages == [1, 2]
+
+
+def test_txt_chunks_have_null_page_and_fact_sheet_omits_page(tmp_path: Path) -> None:
+    """A txt upload stores page=NULL chunks; the fact sheet cites
+    "(chunk N)" with no page marker (pages are PDF-only per plan)."""
+    bot = FakeBot(_DOC_BODY.encode())
+    kb = _make_kb(tmp_path)
+    conv = _make_conv(ScriptedLLM([ChatResponse(content="ack")]))
+    replies: list[str] = []
+    _handle_document(
+        bot, kb, conv, _make_doc_message("notes.txt", user_id=101), replies
+    )
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    conn = sqlite3.connect(tmp_path / "kb.db")
+    try:
+        stored_pages = [
+            row[0] for row in conn.execute("SELECT DISTINCT page FROM chunks")
+        ]
+    finally:
+        conn.close()
+    assert stored_pages == [None]
+    search = KbSearchTool(retriever=kb.retriever)
+    owner = set_user("101")
+    try:
+        result = search.execute(query="needle")
+    finally:
+        reset_user(owner)
+    assert "notes.txt" in result
+    assert "(chunk " in result
+    assert "page" not in result
+
+
 # --- Caption routing ---------------------------------------------------------------
 
 
-def test_caption_routed_to_agent_two_replies_in_order(tmp_path: Path) -> None:
+def test_caption_routed_to_agent_staged_replies_in_order(tmp_path: Path) -> None:
     llm = ScriptedLLM([ChatResponse(content="agent answer")])
     conv = _make_conv(llm)
     bot = FakeBot(_DOC_BODY.encode())
@@ -249,9 +391,10 @@ def test_caption_routed_to_agent_two_replies_in_order(tmp_path: Path) -> None:
     caption = "What is in the document?"
     message = _make_doc_message("notes.txt", caption=caption)
     _handle_document(bot, kb, conv, message, replies)
-    assert len(replies) == 2
-    assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert replies[1] == "agent answer"
+    assert len(replies) == 6
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    assert replies[4] == _DOCUMENT_READY_REPLY
+    assert replies[5] == "agent answer"
     messages, _tools, _system = llm.chat_calls[0]
     assert messages[-1].role == "user"
     prompt = messages[-1].content
@@ -260,16 +403,17 @@ def test_caption_routed_to_agent_two_replies_in_order(tmp_path: Path) -> None:
     assert prompt.endswith(caption)
 
 
-def test_no_caption_two_replies_confirmation_then_agent(tmp_path: Path) -> None:
+def test_no_caption_staged_replies_then_agent(tmp_path: Path) -> None:
     llm = ScriptedLLM([ChatResponse(content="ack — the document is searchable")])
     conv = _make_conv(llm)
     bot = FakeBot(_DOC_BODY.encode())
     kb = _make_kb(tmp_path)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert len(replies) == 2
-    assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert replies[1] == "ack — the document is searchable"
+    assert len(replies) == 6
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    assert replies[4] == _DOCUMENT_READY_REPLY
+    assert replies[5] == "ack — the document is searchable"
 
 
 def test_caption_llm_error_confirmation_then_friendly_reply(tmp_path: Path) -> None:
@@ -280,9 +424,10 @@ def test_caption_llm_error_confirmation_then_friendly_reply(tmp_path: Path) -> N
     replies: list[str] = []
     message = _make_doc_message("notes.txt", caption="Summarize this")
     _handle_document(bot, kb, conv, message, replies)
-    assert len(replies) == 2
-    assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert replies[1] == _LLM_ERROR_REPLY
+    assert len(replies) == 6
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    assert replies[4] == _DOCUMENT_READY_REPLY
+    assert replies[5] == _LLM_ERROR_REPLY
 
 
 # --- KB-disabled and auth-gate routing via handle_message -------------------------
@@ -340,25 +485,33 @@ def test_message_without_document_attribute_text_path_unchanged(tmp_path: Path) 
 # --- Error paths: one friendly reply, never a crash --------------------------------
 
 
-def test_unknown_extension_friendly_single_error_reply(tmp_path: Path) -> None:
+def test_unknown_extension_friendly_error_reply_last(tmp_path: Path) -> None:
     bot = FakeBot(b"MZ fake binary")
     kb = _make_kb(tmp_path)
     llm = ScriptedLLM([])
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("virus.exe"), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies == [
+        _DOCUMENT_RECEIVED_REPLY,
+        _EXTRACTING_REPLY,
+        _DOC_ERROR_REPLY,
+    ]
     assert llm.chat_calls == []
 
 
-def test_corrupt_pdf_bytes_friendly_single_error_reply(tmp_path: Path) -> None:
+def test_corrupt_pdf_bytes_friendly_error_reply_last(tmp_path: Path) -> None:
     bot = FakeBot(b"%PDF- not really a pdf at all")
     kb = _make_kb(tmp_path)
     llm = ScriptedLLM([])
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("broken.pdf"), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies == [
+        _DOCUMENT_RECEIVED_REPLY,
+        _EXTRACTING_REPLY,
+        _DOC_ERROR_REPLY,
+    ]
     assert llm.chat_calls == []
 
 
@@ -374,7 +527,11 @@ def test_api_error_on_get_file_friendly_reply(tmp_path: Path) -> None:
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies == [
+        _DOCUMENT_RECEIVED_REPLY,
+        _EXTRACTING_REPLY,
+        _DOC_ERROR_REPLY,
+    ]
     assert llm.chat_calls == []
 
 
@@ -390,7 +547,11 @@ def test_api_error_on_download_file_friendly_reply(tmp_path: Path) -> None:
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies == [
+        _DOCUMENT_RECEIVED_REPLY,
+        _EXTRACTING_REPLY,
+        _DOC_ERROR_REPLY,
+    ]
     assert llm.chat_calls == []
 
 
@@ -401,7 +562,8 @@ def test_ingest_embedder_failure_friendly_reply(tmp_path: Path) -> None:
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies[:3] == _staged_progress()
+    assert replies[-1] == _DOC_ERROR_REPLY
     assert bot.get_file_calls == [_FILE_ID]
     assert llm.chat_calls == []
 
@@ -409,28 +571,29 @@ def test_ingest_embedder_failure_friendly_reply(tmp_path: Path) -> None:
 def test_unexpected_ingest_error_friendly_reply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unexpected error inside the ingest boundary (SQLite/I/O/vector-index)
-    must not escape into the polling loop: exactly one friendly error reply,
-    no agent run."""
+    """An unexpected error inside the ingest boundary (SQLite/I/O/store)
+    must not escape into the polling loop: staged progress stays sent, the
+    friendly error reply is last, no agent run."""
     bot = FakeBot(_DOC_BODY.encode())
     kb = _make_kb(tmp_path)
     llm = ScriptedLLM([])
     conv = _make_conv(llm)
     replies: list[str] = []
 
-    def locked(doc_id, chunks, meta=None):
+    def locked(doc):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(kb.store, "replace_chunks", locked)
+    monkeypatch.setattr(kb.store, "add_document", locked)
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies[:3] == _staged_progress()
+    assert replies[-1] == _DOC_ERROR_REPLY
     assert bot.get_file_calls == [_FILE_ID]
     assert bot.download_calls == [_FILE_PATH]
     assert llm.chat_calls == []
 
 
 def test_missing_file_path_friendly_error_no_download(tmp_path: Path) -> None:
-    """get_file returning a File without a file_path → one friendly error,
+    """get_file returning a File without a file_path → friendly error last,
     download never attempted (defensive narrowing is covered)."""
     bot = FakeBot(_DOC_BODY.encode(), file_path=None)
     kb = _make_kb(tmp_path)
@@ -438,7 +601,11 @@ def test_missing_file_path_friendly_error_no_download(tmp_path: Path) -> None:
     conv = _make_conv(llm)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert replies == [_DOC_ERROR_REPLY]
+    assert replies == [
+        _DOCUMENT_RECEIVED_REPLY,
+        _EXTRACTING_REPLY,
+        _DOC_ERROR_REPLY,
+    ]
     assert bot.get_file_calls == [_FILE_ID]
     assert bot.download_calls == []
     assert llm.chat_calls == []
@@ -447,16 +614,16 @@ def test_missing_file_path_friendly_error_no_download(tmp_path: Path) -> None:
 def test_caption_non_llm_error_still_gets_friendly_reply(tmp_path: Path) -> None:
     """A non-LLMError escaping conv.handle (agent/registry bug) after a
     successful ingest must not escape into the polling loop: exactly one
-    friendly caption reply, after the confirmation."""
+    friendly caption reply, last after the staged confirmation."""
     conv = _make_conv(ScriptedLLM([]))  # exhausted script → IndexError
     bot = FakeBot(_DOC_BODY.encode())
     kb = _make_kb(tmp_path)
     replies: list[str] = []
     message = _make_doc_message("notes.txt", caption="Summarize this")
     _handle_document(bot, kb, conv, message, replies)
-    assert len(replies) == 2
-    assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert replies[1] == _LLM_ERROR_REPLY
+    assert len(replies) == 6
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    assert replies[5] == _LLM_ERROR_REPLY
 
 
 def test_document_wins_over_text(tmp_path: Path) -> None:
@@ -474,9 +641,9 @@ def test_document_wins_over_text(tmp_path: Path) -> None:
     handle_message(message, conv, _capture(replies), None, handler)
     assert bot.get_file_calls == [_FILE_ID]
     assert bot.download_calls == [_FILE_PATH]
-    assert len(replies) == 2
-    assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert replies[1] == "text answer"
+    assert len(replies) == 6
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    assert replies[5] == "text answer"
     assert len(llm.chat_calls) == 1
     messages, _tools, _system = llm.chat_calls[0]
     assert "hello as plain text" not in messages[-1].content
@@ -495,13 +662,122 @@ def test_document_upload_propagates_context_to_next_message(tmp_path: Path) -> N
     kb = _make_kb(tmp_path)
     replies: list[str] = []
     _handle_document(bot, kb, conv, _make_doc_message("notes.txt"), replies)
-    assert len(replies) == 2
-    assert replies[0].startswith(_CONFIRMATION_PREFIX)
-    assert replies[1] == "ack"
+    assert len(replies) == 6
+    assert replies[3].startswith(_CONFIRMATION_PREFIX)
+    assert replies[5] == "ack"
     follow_up = conv.handle(42, "what was in the document?")
     assert follow_up == "it has needles"
     history, _tools, _system = llm.chat_calls[1]
     assert any(m.role == "user" and "notes.txt" in m.content for m in history)
+
+
+# --- Principal isolation (WS-2) ------------------------------------------------------
+
+
+def _documents_rows(tmp_path: Path) -> list[tuple[str, str, str, str]]:
+    conn = sqlite3.connect(tmp_path / "kb.db")
+    try:
+        return conn.execute(
+            "SELECT user_id, filename, file_type, created_at FROM documents"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_user_a_upload_invisible_to_user_b(tmp_path: Path) -> None:
+    bot = FakeBot(_DOC_BODY.encode())
+    kb = _make_kb(tmp_path)
+    conv = _make_conv(ScriptedLLM([ChatResponse(content="ack")]))
+    replies: list[str] = []
+    _handle_document(
+        bot,
+        kb,
+        conv,
+        _make_doc_message("notes.txt", user_id=101),
+        replies,
+    )
+    assert len(replies) == 6
+    assert get_user() == "0"
+
+    search = KbSearchTool(retriever=kb.retriever)
+    other = set_user("202")
+    try:
+        assert search.execute(query="needle") == "No matching knowledge found."
+    finally:
+        reset_user(other)
+
+    owner = set_user("101")
+    try:
+        result = search.execute(query="needle")
+        assert "needle" in result
+        assert "notes.txt" in result
+    finally:
+        reset_user(owner)
+
+    assert search.execute(query="needle") == "No matching knowledge found."
+
+
+def test_upload_writes_documents_row_with_owner_and_type(tmp_path: Path) -> None:
+    bot = FakeBot(_DOC_BODY.encode())
+    kb = _make_kb(tmp_path)
+    conv = _make_conv(ScriptedLLM([ChatResponse(content="ack")]))
+    replies: list[str] = []
+    _handle_document(
+        bot,
+        kb,
+        conv,
+        _make_doc_message("Notes.TXT", user_id=101),
+        replies,
+    )
+    rows = _documents_rows(tmp_path)
+    assert len(rows) == 1
+    user_id, filename, file_type, created_at = rows[0]
+    assert user_id == "101"
+    assert filename == "Notes.TXT"
+    assert file_type == "txt"
+    assert datetime.fromisoformat(created_at).tzinfo is not None
+
+
+def test_follow_up_in_same_chat_searches_with_owner_principal(tmp_path: Path) -> None:
+    """Upload then a text follow-up through handle_message: the agent's
+    kb_search tool call must run with the uploader's principal."""
+    llm = ScriptedLLM(
+        [
+            ChatResponse(content="ack"),
+            ChatResponse(
+                content="",
+                tool_calls=[make_tool_call("t1", "kb_search", {"query": "needle"})],
+            ),
+            ChatResponse(content="found the needle"),
+        ]
+    )
+    reg = ToolRegistry()
+    conv = ConversationManager(Agent(llm, reg))
+    bot = FakeBot(_DOC_BODY.encode())
+    kb = _make_kb(tmp_path)
+    reg.register(KbSearchTool(retriever=kb.retriever))
+    handler = build_document_handler(bot, kb, conv)
+    replies: list[str] = []
+    handle_message(
+        _make_doc_message("notes.txt", user_id=101, username="alice"),
+        conv,
+        _capture(replies),
+        frozenset({"alice"}),
+        handler,
+    )
+    assert len(replies) == 6
+    handle_message(
+        _make_text_message("what is in it?", username="alice", user_id=101),
+        conv,
+        _capture(replies),
+        frozenset({"alice"}),
+        handler,
+    )
+    assert replies[-1] == "found the needle"
+    tool_msgs = [m for m in llm.chat_calls[-1][0] if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "needle" in tool_msgs[0].content
+    assert "notes.txt" in tool_msgs[0].content
 
 
 # --- Composition roots ---------------------------------------------------------------
@@ -549,6 +825,11 @@ def test_create_bot_registers_document_content_type(tmp_path: Path) -> None:
     conv = _make_conv(ScriptedLLM([]))
     tb = create_bot(conv, kb=kb)
     assert tb.message_handlers, "no message handlers registered"
-    content_types = tb.message_handlers[0]["filters"]["content_types"]
+    catch_all = next(
+        handler
+        for handler in tb.message_handlers
+        if not handler["filters"].get("commands")
+    )
+    content_types = catch_all["filters"]["content_types"]
     assert "document" in content_types
     assert "text" in content_types

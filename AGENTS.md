@@ -32,7 +32,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `OLLAMA_MODEL` | no | Ollama model name (default `llama3.2`) |
 | `OLLAMA_NUM_CTX` | no | Ollama context window size sent as payload `options.num_ctx`; unset = Ollama's own default (a too-small value silently truncates context — set only if prompts approach the default window) |
 | `OLLAMA_KEEP_ALIVE` | no | Ollama model keep-alive duration (e.g. `30m`) sent as payload `keep_alive` — keeps the model (and its prompt cache) loaded between calls; unset = Ollama default |
-| `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed). With `KB_ENABLED=1` at most one username is permitted — the KB has no per-user namespace, so `main()` exits non-zero when several are listed |
+| `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed). Auth gate only — multiple users are fine; each user's KB data is scoped by their Telegram numeric id |
 | `EXEC_TIMEOUT` | no | Timeout in seconds for the `exec` tool, the MCP CVE server httpx calls, and the MCP round-trip (default `30`) |
 | `EXEC_MAX_OUTPUT_CHARS` | no | Cap for tool output (combined exec stdout/stderr body and CVE fact sheet); over-cap output keeps head+tail with a `... [truncated N chars] ...` marker, exit-code line always preserved (default `4000`) |
 | `AGENT_MAX_ITERATIONS` | no | Maximum agent loop iterations (default `8`) |
@@ -45,7 +45,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `MCP_STARTUP_TIMEOUT` | no | Seconds to wait for the MCP CVE server subprocess to initialize before falling back to exec-only mode (default `10`) |
 | `MCP_CVE_SERVER_CMD` | no | MCP CVE server subprocess command (space-separated; first token is the executable). Default: `python mcp_servers/cve_server.py` |
 | `KB_ENABLED` | no | Register the knowledge-base tools `kb_ingest`/`kb_search` (default `1`; `0` = exact pre-kb tool set) |
-| `KB_DB_PATH` | no | SQLite file holding chunks + FTS5 (default `data/vektor.db`) |
+| `KB_DB_PATH` | no | SQLite file holding documents + chunks + FTS5 + sqlite-vec vec0 vectors (default `data/vektor.db`) |
 | `KB_CHUNK_SIZE` | no | Chunking window in characters (default `800`) |
 | `KB_CHUNK_OVERLAP` | no | Word-aligned overlap between consecutive chunks (default `100`) |
 | `KB_VECTOR_LIMIT` | no | Per-source result limit forwarded to vector search (default `20`) |
@@ -56,7 +56,9 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `KB_EXPANSION_ENABLED` | no | LLM query expansion before retrieval (default `1`) |
 | `KB_EXPANSION_TIMEOUT` | no | Expansion LLM call timeout in seconds (default `10.0`) |
 | `KB_EXPANSION_TEMPERATURE` | no | Expansion sampling temperature (default `0.0`) |
-| `OLLAMA_EXPANSION_MODEL` | no | Query-expansion model (default `qwen3:0.6b`) |
+| `KB_RERANK_ENABLED` | no | Pointwise LLM rerank of the fused hits after RRF (default `1`; `0` = keep RRF order) |
+| `KB_RERANK_TIMEOUT` | no | Rerank LLM call timeout in seconds (default `10.0`; on timeout/failure falls back to RRF order) |
+| `OLLAMA_EXPANSION_MODEL` | no | Query-expansion + rerank model (default `qwen3:0.6b`; there is no separate rerank-model knob) |
 | `OLLAMA_EMBED_MODEL` | no | Embedding model for `/api/embed` (default `qwen3-embedding:0.6b`) |
 
 ## Project structure
@@ -66,7 +68,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `bot.py` | Entrypoint — composition root, wires TeleBot with Agent + ConversationManager + LLM |
 | `config.py` | `.env` loader (stdlib only) |
 | `.env.example` | Template for `.env` |
-| `documents.py` | Document text extraction — `extract_text()`, `DocumentError`, `SUPPORTED_EXTENSIONS`; .txt/.pdf/.docx via pypdf + python-docx (Telegram-free) |
+| `documents.py` | Document text extraction — `extract_pages()` (per-page) / `extract_text()` (join wrapper), `DocumentError`, `SUPPORTED_EXTENSIONS`; .txt/.md/.pdf/.docx via pypdf + python-docx (Telegram-free) |
 | `llm/base.py` | Abstract `LLM` interface, `LLMResponse`, `ChatResponse`, `Message`, `ToolSpec`, `ToolCall`, `ToolResult`, `LLMError` |
 | `llm/ollama.py` | `OllamaLLM` — Ollama HTTP API via `httpx` (no Ollama SDK) |
 | `llm/__init__.py` | Re-exports LLM types; lazy-loads `OllamaLLM` |
@@ -89,14 +91,16 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `llm/instrumented.py` | `InstrumentedLLM` — records token/latency/cost metrics around an LLM |
 | `tools/instrumented_registry.py` | `InstrumentedToolRegistry` — records tool call/duration metrics |
 | `retrieval/rrf.py` | `rrf_fuse()` — pure Reciprocal Rank Fusion (`ChunkHit`/`FusedHit`); raw per-source scores never mixed, ties by chunk_id |
-| `retrieval/store.py` | `ChunkStore` — one SQLite file: chunks + FTS5 synced in a single transaction; stable sha256 chunk ids; FTS5 probe → vector-only degradation |
-| `retrieval/chunking.py` | `chunk_text()` — word-aligned fixed-size windows with overlap |
+| `retrieval/store.py` | `ChunkStore` — one SQLite file: documents + chunks (+`page`) + FTS5 + sqlite-vec `vec_chunks` synced in a single transaction; stable sha256 ids; mandatory `user_id` owner filter on every read; legacy-schema DB → `KBModelError` |
+| `retrieval/vec.py` | `load(conn)` — sqlite-vec extension loader (vec0 KNN virtual table support) |
+| `retrieval/chunking.py` | `chunk_text()` — word-aligned fixed-size windows with overlap; `chunk_pages()` — per-page chunking (chunks never span pages, PDF chunks carry page numbers) |
 | `retrieval/embeddings.py` | `Embedder` ABC + `OllamaEmbedder` — `/api/embed` via httpx, MockTransport-testable |
 | `retrieval/expansion.py` | `QueryExpander` — small-model query expansion (temp 0, JSON/comma parsing); never fails, falls back to the original query |
 | `retrieval/config.py` | `RetrievalConfig.from_env()` — single read boundary for all retrieval env knobs, warn-and-fallback |
-| `retrieval/vector_index.py` | `VectorIndex` — numpy float32 cosine search, multi-query max-sim; `to_blob()` BLOB serialization |
-| `retrieval/hybrid.py` | `HybridRetriever` — expand → batch embed → vector ‖ FTS → RRF → top-k; per-source degradation; `vektor_retrieval_*` instrumentation |
-| `tools/kb.py` | `KbIngestTool`/`KbSearchTool` (`kb_ingest`/`kb_search`), `KbStack`, `VectorIndexAdapter`/`StoreFtsAdapter` adapters |
+| `retrieval/principal.py` | `ContextVar` "vektor.user" — carries the Telegram numeric user id from the handler boundary (set after the auth gate, reset in `finally`) |
+| `retrieval/rerank.py` | `Reranker` — pointwise LLM rerank of fused hits (ONE call, 0–10 scores, stable re-sort, truncate top-k); never raises, falls back to RRF order |
+| `retrieval/hybrid.py` | `HybridRetriever` — expand → batch embed → vector ‖ FTS → RRF → top-k → rerank; per-source degradation; `vektor_retrieval_*` instrumentation |
+| `tools/kb.py` | `KbIngestTool`/`KbSearchTool` (`kb_ingest`/`kb_search`), `KbStack`, `StoreVecAdapter`/`StoreFtsAdapter` adapters |
 | `benchmarks/` | LLM benchmark (`prompts.json` + `run.py`) and retrieval benchmark (`retrieval_bench.py`) — require Ollama |
 | `tasks/` | Plan + checklist for the hybrid-search feature (`plan.md`, `todo.md`) |
 | `mypy.ini` | mypy configuration |
@@ -111,9 +115,9 @@ Telegram → ConversationManager → Agent → LLM interface → OllamaLLM
                                     │                → KbIngestTool / KbSearchTool → retrieval stack (see Retrieval)
                                     └── SkillLoader → skills/*.md
 
-Telegram document → bot.get_file + download_file → documents.extract_text
+Telegram document → bot.get_file + download_file → documents.extract_pages
                   → KbIngestTool → retrieval stack (before the agent)
-                  → upload notice [+ caption] → ConversationManager → Agent (second reply)
+                  → staged progress replies → upload notice [+ caption] → ConversationManager → Agent (final reply)
 ```
 
 ### LLM layer
@@ -165,25 +169,26 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 
 `kb_ingest`/`kb_search` (`tools/kb.py`) are registered behind `KB_ENABLED=1` and drive the retrieval stack:
 
-- Pipeline: optional expansion → embed `[original + alt queries]` in one batch → `ThreadPoolExecutor(max_workers=2)` running vector and FTS in parallel → `rrf_fuse` (k=60) → top-k.
-- Vector search scores each chunk by max cosine across the query vectors (multi-query max-sim, numpy float32). Expansion **keywords stay FTS-side only** — they are BM25 terms, not sentences.
-- Fallbacks, never failures: expansion degrades to the original query; a failing source is skipped while the other still answers (recorded in `note`); FTS5 unavailable or `KB_FTS_ENABLED=0` → vector-only mode.
-- Storage: one SQLite file (`KB_DB_PATH`) holds the chunks table and the FTS5 index, synced in a single transaction per write; chunk ids are stable sha256 (`doc_id:idx`), so re-ingest is an upsert; embeddings are float32 BLOBs via `to_blob()`; the embedder rejects components outside the finite float32 range and `to_blob()` re-checks the cast.
-- Single-user scope: the KB has no per-user namespace (tools receive no principal context — the shared agent calls `kb_search`/`kb_ingest` without knowing the chat), so `ensure_kb_single_user` makes `main()` exit non-zero when `KB_ENABLED=1` and `ALLOWED_USERNAMES` lists more than one user. Per-chat namespacing (context plumbing + owner-scoped `doc_id`) is future work.
-- `kb_search` renders a compact fact sheet (`[sources] title (chunk N)` + capped content; raw scores never shown), capped at `EXEC_MAX_OUTPUT_CHARS`.
+- Pipeline: optional expansion → embed `[original + alt queries]` in one batch → `ThreadPoolExecutor(max_workers=2)` running vector and FTS in parallel → `rrf_fuse` (k=60) → top-k → optional pointwise rerank (`KB_RERANK_ENABLED`, one LLM call with the expansion model, rerank timeout `KB_RERANK_TIMEOUT`).
+- Vector search is sqlite-vec `vec0` KNN over L2-normalized float32 BLOB vectors (per-query KNN results merged by min distance; normalization makes the default distance rank cosine-equivalent). Expansion **keywords stay FTS-side only** — they are BM25 terms, not sentences.
+- Fallbacks, never failures: expansion degrades to the original query; a failing source is skipped while the other still answers (recorded in `note`); FTS5 unavailable or `KB_FTS_ENABLED=0` → vector-only mode; rerank failure/timeout → RRF order.
+- Storage: one SQLite file (`KB_DB_PATH`) holds `documents`, `chunks` (+`page`, NULL for non-PDF), `chunks_fts` and the vec0 `vec_chunks` table (created lazily at first ingest, dim from `meta`), written in a single transaction per ingest; chunk ids are stable sha256 (`doc_id:idx`), so re-ingest is an upsert; embeddings are L2-normalized float32 BLOBs; `/delete` cascades all four tables in one transaction; a legacy-schema DB raises `KBModelError` (delete the file). Same text ingested by two users collides on the document id — last writer owns the document row.
+- User isolation: `user_id` is the Telegram numeric `from_user.id`, captured in the `retrieval/principal.py` `ContextVar` right after the auth gate and passed down as an explicit argument (contextvars don't cross the `ThreadPoolExecutor`). Every store read (`search_vec`/`search_fts`/`list_documents`/`delete_document`) takes a mandatory `user_id` — SQL-level owner filtering (vec0 KNN pre-filters on the `owner` aux column), no unfiltered search entry point. The owner is never LLM-controlled: tool schemas are `kb_ingest {text, title}` and `kb_search {query}`. Multiple `ALLOWED_USERNAMES` users are supported (`ensure_kb_single_user`/`KBMultiUserError` were removed); the allowlist stays as the auth gate only.
+- `kb_search` renders a compact fact sheet (`[sources] title (chunk N, page M)` + capped content; page shown only when present, raw scores never shown), capped at `EXEC_MAX_OUTPUT_CHARS`.
 
 ### Documents
 
-Messages with a document (.txt/.pdf/.docx) are ingested by the bot before the agent runs:
+Messages with a document (.txt/.md/.pdf/.docx) are ingested by the bot before the agent runs:
 
-- **Bot-level ingestion** — `build_document_handler` (`bot.py`) downloads the file (Telegram caps bot downloads at 20 MB — that is the size limit; no env knob), extracts text via `documents.extract_text`, and ingests it with a fresh `KbIngestTool` BEFORE the agent runs. Rationale: extraction output (potentially megabytes) must never cross the LLM tool boundary as an argument.
-- **Two-reply UX** — EVERY successful upload produces exactly two replies: the ingest confirmation, then the agent's response. The agent always runs on a synthetic upload notice (`[document uploaded: "{file_name}", {N} chunks ingested; content is now searchable via kb_search]`), with the caption appended when present; no-caption uploads get an agent acknowledgement as the second reply. The upload turn is recorded in the conversation context (`ConversationManager`), so follow-up questions can `kb_search` it.
-- **Never crash polling** — download/extract/ingest failures produce exactly one friendly reply (no agent run); LLM/agent errors on the upload turn produce the confirmation + exactly one friendly reply. Logs carry file name and outcome only, never file content or captions.
+- **Bot-level ingestion** — `build_document_handler` (`bot.py`) downloads the file (Telegram caps bot downloads at 20 MB — that is the size limit; no env knob), extracts pages via `documents.extract_pages`, and ingests it with a fresh `KbIngestTool` BEFORE the agent runs (PDF pages flow through so chunks carry page numbers). Rationale: extraction output (potentially megabytes) must never cross the LLM tool boundary as an argument.
+- **Staged-progress UX** — an upload produces staged replies (`📄 Document received` → `⏳ Extracting text…` → `⏳ Generating embeddings…` → `✅ Ingested N chunks (doc <id>, title '<file>')` → `✅ Document ready. Now you can ask questions.`) followed by the agent's response on the synthetic upload notice (`[document uploaded: "{file_name}", {N} chunks ingested; content is now searchable via kb_search]`, caption appended when present; no-caption uploads get an agent acknowledgement). The upload turn is recorded in the conversation context (`ConversationManager`), so follow-up questions can `kb_search` it.
+- **Never crash polling** — download/extract/ingest failures end with exactly one friendly reply (no agent run); LLM/agent errors on the upload turn produce the progress replies + exactly one friendly reply. Logs carry file name and outcome only, never file content or captions.
+- **Source attribution** — `skills/documents.md` mandates that every fact taken from `kb_search` is cited as `Источник: <filename>, стр. M` (or `, chunk #N` when there is no page) and that the model says so explicitly when nothing relevant is found, never answering from general knowledge.
 - **Gates** — the auth check runs FIRST (unauthorized users' documents are never downloaded); with the KB disabled (`kb=None` / `KB_ENABLED=0`) documents get "Document uploads are not enabled."; a message with both `text` and `document` takes the document branch.
 
 ### Observability
 
-`build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `HybridRetriever` additionally records `vektor_retrieval_expansion_total{status=ok|fallback}`, `vektor_retrieval_latency_seconds{stage=expansion|vector|fts|total}`, and `vektor_retrieval_results{source=vector|fts|final}` — enum labels only. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
+`build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `HybridRetriever` additionally records `vektor_retrieval_expansion_total{status=ok|fallback}`, `vektor_retrieval_latency_seconds{stage=expansion|vector|fts|rerank|total}`, `vektor_retrieval_results{source=vector|fts|final}`, and `vektor_retrieval_rerank_total{status=ok|fallback}` — enum labels only. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
 
 ## Code conventions
 
@@ -213,7 +218,7 @@ python -m pytest
 - CVE selector tests use raw CVE record dicts — no network access needed.
 - CveTool tests use `httpx.MockTransport` — no network access needed.
 - Integration tests (`tests/test_cve_integration.py`) are skipped when CVE.org is unreachable.
-- Retrieval tests (RRF, store, chunking, vector index, hybrid, expansion, kb tools, config) use fakes, `httpx.MockTransport`, and tmp SQLite files — no Ollama/network needed.
+- Retrieval tests (RRF, sqlite-vec store, chunking + per-page chunking, hybrid, expansion, rerank, kb tools, config, user isolation) use fakes, `httpx.MockTransport`, and tmp SQLite files — no Ollama/network needed.
 - Document tests (`tests/test_documents.py`) build fixtures in-test — a handcrafted minimal PDF (known `Tj` text operator), a python-docx-generated DOCX, plain bytes — fully offline, no binary fixtures committed.
 - Document bot-flow tests (`tests/test_bot_documents.py`) use a fake TeleBot (records get_file/download_file, canned bytes or raises), a real kb stack over tmp SQLite with a deterministic fake embedder, and `ScriptedLLM`/`FakeLLM` — no network, no Ollama.
 - Retrieval-benchmark tests cover only the scoring math and labeled dataset — offline.
@@ -227,7 +232,10 @@ python -m pytest
 - Tools: registration, execution, failure handling, unknown tool, adding tools without loop changes.
 - CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, data-source attribution.
 - Skill loader: discovers `.md` files, ignores non-`.md`, system prompt generation.
-- Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling, document flow (download/extract/ingest roundtrip, ingestion searchable via kb_search, two-reply invariant — every upload gets confirmation + agent reply via the upload notice [+ caption] — and upload context propagating to follow-up messages, auth gate with no download, KB-disabled reply, error paths — unknown ext, corrupt bytes, API error, embedder failure, agent-turn LLM/agent errors, missing file_path — and document-wins-over-text).
-- Documents: extraction per format (.txt replacement decode, handcrafted PDF `Tj` text, python-docx paragraphs), case-insensitive extensions, unsupported/missing extension and empty filename → `DocumentError`, corrupt bytes → `DocumentError`, content-independence from filename, exact `SUPPORTED_EXTENSIONS`, no Telegram imports (AST-checked).
-- Retrieval: RRF fusion and tie-breaking, store upsert + one-transaction FTS sync + restart hydration, chunking windows, VectorIndex cosine/zero vectors/multi-query max-sim, HybridRetriever fallbacks/concurrency/metrics, expansion ok/fallback parsing, kb ingest→search roundtrips, KB_ENABLED=0 regression, bot composition roots.
+- Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling, document flow (download/extract/ingest roundtrip, staged progress sequence ordering with the agent reply via the upload notice [+ caption], ingestion searchable via kb_search, upload context propagating to follow-up messages, PDF page numbers reaching the store while txt chunks keep a NULL page and the fact sheet omits it, user A's upload invisible to user B, documents row written with owner and file type, auth gate with no download, KB-disabled reply, error paths — unknown ext, corrupt bytes, API error, embedder failure, agent-turn LLM/agent errors, missing file_path — and document-wins-over-text).
+- Bot commands: `/documents` listing (filename, created date, chunk count) scoped to the caller, empty state, auth gates, KB-disabled; `/delete` cascade visible in search, unknown/not-yours replies, usage hint (incl. filenames with spaces), command registration and precedence over the catch-all handler.
+- Documents: extraction per format (.txt/.md replacement decode, handcrafted PDF `Tj` text, python-docx paragraphs), `extract_pages` (single first page for txt/md/docx, one entry per PDF page incl. empty pages, join wrapper), case-insensitive extensions, unsupported/missing extension and empty filename → `DocumentError`, corrupt bytes → `DocumentError`, content-independence from filename, exact `SUPPORTED_EXTENSIONS`, no Telegram imports (AST-checked).
+- Retrieval: RRF fusion and tie-breaking, vec0 store (one-transaction documents+chunks+FTS+vec0 writes, L2 normalization on write, zero-vector/multi-query min-distance merge, ties by chunk_id, lazy `vec_chunks` creation, page column persisted, legacy-schema DB → `KBModelError`), per-page chunking (page numbers pass through, chunks never span pages), HybridRetriever fallbacks/concurrency/metrics + rerank stage (reorders fused hits, fallback keeps RRF order), expansion ok/fallback parsing, kb ingest→search roundtrips, fact sheet with/without page, KB_ENABLED=0 regression, bot composition roots.
+- User isolation: same-text ingest by two users never leaks chunks across owners, per-user scoping of search/list, delete by a non-owner returns False.
+- Rerank: one LLM call scores all hits (JSON/float/bare-array/plain-number parsing, think-tag and code-fence tolerance), ties keep RRF order, scores clamped to 0–10, malformed/empty replies and LLM/unexpected errors fall back without raising, top-k truncation on success and fallback, RRF scores untouched.
 - Retrieval benchmark: recall/precision@K scoring math (dedup, k-truncation, empty cases) and dataset coherence — offline.
