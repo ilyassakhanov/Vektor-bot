@@ -1,17 +1,29 @@
-"""Tests for HybridRetriever — fakes only, no network, no Ollama, no SQLite."""
+"""Tests for HybridRetriever — fakes only, no network, no Ollama, no SQLite.
+
+All searches run for an explicit ``user_id`` (SQL-level owner scoping below
+this layer); the fakes record it with the rest of the call.
+"""
 
 from __future__ import annotations
 
 import time
 
 import pytest
+from prometheus_client import REGISTRY
 
 from llm.base import LLMError
 from retrieval.embeddings import Embedder, EmbeddingError
 from retrieval.expansion import QueryExpander
 from retrieval.hybrid import FtsSearch, HybridResult, HybridRetriever, VectorSearch
+from retrieval.rerank import Reranker
 from retrieval.rrf import ChunkHit
 from tests.fakes import FakeLLM
+
+_USER = "user-1"
+
+
+def _counter(name: str, labels: dict[str, str] | None = None) -> float:
+    return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
 def _hit(chunk_id: str, score: float = 1.0) -> ChunkHit:
@@ -52,15 +64,15 @@ class FakeFts(FtsSearch):
         error: Exception | None = None,
         delay: float = 0.0,
     ) -> None:
-        self.calls: list[tuple[list[str], int]] = []
+        self.calls: list[tuple[list[str], int, str]] = []
         self.entered = False
         self._hits = hits or []
         self._error = error
         self._delay = delay
 
-    def search(self, terms: list[str], limit: int) -> list[ChunkHit]:
+    def search(self, terms: list[str], limit: int, user_id: str) -> list[ChunkHit]:
         self.entered = True
-        self.calls.append((list(terms), limit))
+        self.calls.append((list(terms), limit, user_id))
         if self._delay:
             time.sleep(self._delay)
         if self._error is not None:
@@ -77,15 +89,17 @@ class FakeVector(VectorSearch):
         error: Exception | None = None,
         delay: float = 0.0,
     ) -> None:
-        self.calls: list[tuple[list[list[float]], int]] = []
+        self.calls: list[tuple[list[list[float]], int, str]] = []
         self.entered = False
         self._hits = hits or []
         self._error = error
         self._delay = delay
 
-    def search(self, queries: list[list[float]], limit: int) -> list[ChunkHit]:
+    def search(
+        self, queries: list[list[float]], limit: int, user_id: str
+    ) -> list[ChunkHit]:
         self.entered = True
-        self.calls.append(([list(query) for query in queries], limit))
+        self.calls.append(([list(query) for query in queries], limit, user_id))
         if self._delay:
             time.sleep(self._delay)
         if self._error is not None:
@@ -98,6 +112,7 @@ def _retriever(
     vector: VectorSearch,
     fts: FtsSearch | None,
     expander: QueryExpander | None = None,
+    reranker: Reranker | None = None,
     **limits: int,
 ) -> HybridRetriever:
     return HybridRetriever(
@@ -105,6 +120,7 @@ def _retriever(
         vector=vector,
         fts=fts,
         expander=expander,
+        reranker=reranker,
         **limits,
     )
 
@@ -114,7 +130,7 @@ def test_happy_path_fuses_both_sources_with_exact_rrf_scores():
     fts = FakeFts(hits=[_hit("b"), _hit("a"), _hit("d")])
 
     result = _retriever(FakeEmbedder(), vector, fts, rrf_k=60, top_k=5).search(
-        "hybrid search"
+        "hybrid search", _USER
     )
 
     assert isinstance(result, HybridResult)
@@ -136,11 +152,21 @@ def test_limits_forwarded_to_sources():
     fts = FakeFts(hits=[_hit("a")])
 
     _retriever(FakeEmbedder(), vector, fts, vector_limit=7, fts_limit=9).search(
-        "hybrid search"
+        "hybrid search", _USER
     )
 
     assert vector.calls[0][1] == 7
     assert fts.calls[0][1] == 9
+
+
+def test_user_id_forwarded_to_both_sources():
+    vector = FakeVector(hits=[_hit("a")])
+    fts = FakeFts(hits=[_hit("a")])
+
+    _retriever(FakeEmbedder(), vector, fts).search("hybrid search", _USER)
+
+    assert vector.calls[0][2] == _USER
+    assert fts.calls[0][2] == _USER
 
 
 def test_sources_run_concurrently():
@@ -148,7 +174,7 @@ def test_sources_run_concurrently():
     fts = FakeFts(hits=[_hit("b")], delay=0.15)
 
     start = time.monotonic()
-    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search")
+    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search", _USER)
     elapsed = time.monotonic() - start
 
     assert vector.entered and fts.entered
@@ -166,7 +192,7 @@ def test_expanded_terms_reach_both_sources():
     fts = FakeFts(hits=[_hit("a")])
 
     result = _retriever(embedder, vector, fts, expander=QueryExpander(llm)).search(
-        "hybrid search"
+        "hybrid search", _USER
     )
 
     assert result.used_expansion is True
@@ -193,7 +219,7 @@ def test_embed_batch_dedupes_and_drops_whitespace_and_skips_keywords():
     fts = FakeFts(hits=[_hit("a")])
 
     _retriever(embedder, vector, fts, expander=QueryExpander(llm)).search(
-        "hybrid search"
+        "hybrid search", _USER
     )
 
     assert embedder.calls == [["hybrid search", "how does rrf work"]]
@@ -208,7 +234,7 @@ def test_duplicate_expanded_terms_are_deduped():
     fts = FakeFts(hits=[_hit("a")])
 
     _retriever(FakeEmbedder(), FakeVector(), fts, expander=QueryExpander(llm)).search(
-        "hybrid search"
+        "hybrid search", _USER
     )
 
     assert fts.calls[0][0] == ["hybrid search", "vector search"]
@@ -221,7 +247,7 @@ def test_vector_failure_fts_still_answers():
 
     result = _retriever(
         FakeEmbedder(), vector, fts, expander=QueryExpander(llm)
-    ).search("hybrid search")
+    ).search("hybrid search", _USER)
 
     assert [hit.chunk_id for hit in result.hits] == ["b", "a"]
     assert result.hits[0].sources == ("fts",)
@@ -235,7 +261,7 @@ def test_fts_failure_vector_still_answers():
     vector = FakeVector(hits=[_hit("a"), _hit("b")])
     fts = FakeFts(error=ValueError("fts boom"))
 
-    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search")
+    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search", _USER)
 
     assert [hit.chunk_id for hit in result.hits] == ["a", "b"]
     assert result.sources_used == ("vector",)
@@ -247,7 +273,7 @@ def test_fts_empty_result_is_not_a_failure():
     vector = FakeVector(hits=[_hit("a")])
     fts = FakeFts(hits=[])
 
-    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search")
+    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search", _USER)
 
     assert [hit.chunk_id for hit in result.hits] == ["a"]
     assert result.sources_used == ("vector",)
@@ -260,7 +286,7 @@ def test_embedding_error_degrades_to_fts_only():
     vector = FakeVector(hits=[_hit("a")])
     fts = FakeFts(hits=[_hit("b")])
 
-    result = _retriever(embedder, vector, fts).search("hybrid search")
+    result = _retriever(embedder, vector, fts).search("hybrid search", _USER)
 
     assert embedder.calls == [["hybrid search"]]
     assert vector.entered is False
@@ -275,7 +301,7 @@ def test_both_sources_fail_returns_empty_result_with_note():
     vector = FakeVector(error=RuntimeError("index gone"))
     fts = FakeFts(error=ValueError("fts boom"))
 
-    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search")
+    result = _retriever(FakeEmbedder(), vector, fts).search("hybrid search", _USER)
 
     assert result.hits == []
     assert result.sources_used == ()
@@ -289,7 +315,7 @@ def test_embedding_error_and_fts_failure_returns_empty_result_with_note():
     vector = FakeVector(hits=[_hit("a")])
     fts = FakeFts(error=LLMError("unrelated but fatal"))
 
-    result = _retriever(embedder, vector, fts).search("hybrid search")
+    result = _retriever(embedder, vector, fts).search("hybrid search", _USER)
 
     assert result.hits == []
     assert result.sources_used == ()
@@ -303,7 +329,9 @@ def test_no_expander_means_no_llm_call_and_original_query_everywhere():
     fts = FakeFts(hits=[_hit("a")])
     QueryExpander(llm)
 
-    result = _retriever(embedder, vector, fts, expander=None).search("hybrid search")
+    result = _retriever(embedder, vector, fts, expander=None).search(
+        "hybrid search", _USER
+    )
 
     assert llm.calls == []
     assert result.used_expansion is False
@@ -315,7 +343,7 @@ def test_no_expander_means_no_llm_call_and_original_query_everywhere():
 def test_fts_none_is_vector_only_mode_without_degradation():
     vector = FakeVector(hits=[_hit("a"), _hit("b")])
 
-    result = _retriever(FakeEmbedder(), vector, fts=None).search("hybrid search")
+    result = _retriever(FakeEmbedder(), vector, fts=None).search("hybrid search", _USER)
 
     assert [hit.chunk_id for hit in result.hits] == ["a", "b"]
     assert result.sources_used == ("vector",)
@@ -328,10 +356,98 @@ def test_top_k_smaller_than_available_hits_truncates():
     fts = FakeFts(hits=[_hit(cid) for cid in "fg"])
 
     result = _retriever(FakeEmbedder(), vector, fts, top_k=3, rrf_k=60).search(
-        "hybrid search"
+        "hybrid search", _USER
     )
 
     assert [hit.chunk_id for hit in result.hits] == ["a", "f", "b"]
     assert result.hits[0].score == pytest.approx(1 / 61)
     assert result.hits[1].score == pytest.approx(1 / 61)
     assert result.hits[2].score == pytest.approx(1 / 62)
+
+
+def test_reranker_reorders_fused_hits_and_records_ok():
+    rerank_llm = FakeLLM(reply='{"scores": [1, 9, 5]}')
+    vector = FakeVector(hits=[_hit("a"), _hit("b"), _hit("c")])
+    ok_before = _counter("vektor_retrieval_rerank_total", {"status": "ok"})
+    fallback_before = _counter("vektor_retrieval_rerank_total", {"status": "fallback"})
+    latency_before = _counter(
+        "vektor_retrieval_latency_seconds_count", {"stage": "rerank"}
+    )
+
+    result = _retriever(
+        FakeEmbedder(), vector, fts=None, reranker=Reranker(rerank_llm)
+    ).search("hybrid search", _USER)
+
+    assert [hit.chunk_id for hit in result.hits] == ["b", "c", "a"]
+    assert len(rerank_llm.calls) == 1
+    assert _counter("vektor_retrieval_rerank_total", {"status": "ok"}) == ok_before + 1
+    assert _counter("vektor_retrieval_rerank_total", {"status": "fallback"}) == (
+        fallback_before
+    )
+    assert (
+        _counter("vektor_retrieval_latency_seconds_count", {"stage": "rerank"})
+        == latency_before + 1
+    )
+
+
+def test_rerank_failure_keeps_rrf_order_and_records_fallback():
+    rerank_llm = FakeLLM(error=LLMError("timeout"))
+    vector = FakeVector(hits=[_hit("a"), _hit("b")])
+    ok_before = _counter("vektor_retrieval_rerank_total", {"status": "ok"})
+    fallback_before = _counter("vektor_retrieval_rerank_total", {"status": "fallback"})
+    latency_before = _counter(
+        "vektor_retrieval_latency_seconds_count", {"stage": "rerank"}
+    )
+
+    result = _retriever(
+        FakeEmbedder(), vector, fts=None, reranker=Reranker(rerank_llm)
+    ).search("hybrid search", _USER)
+
+    assert [hit.chunk_id for hit in result.hits] == ["a", "b"]
+    assert _counter("vektor_retrieval_rerank_total", {"status": "ok"}) == ok_before
+    assert _counter("vektor_retrieval_rerank_total", {"status": "fallback"}) == (
+        fallback_before + 1
+    )
+    assert (
+        _counter("vektor_retrieval_latency_seconds_count", {"stage": "rerank"})
+        == latency_before + 1
+    )
+
+
+def test_no_reranker_skips_rerank_stage():
+    vector = FakeVector(hits=[_hit("a"), _hit("b")])
+    ok_before = _counter("vektor_retrieval_rerank_total", {"status": "ok"})
+    fallback_before = _counter("vektor_retrieval_rerank_total", {"status": "fallback"})
+    latency_before = _counter(
+        "vektor_retrieval_latency_seconds_count", {"stage": "rerank"}
+    )
+
+    result = _retriever(FakeEmbedder(), vector, fts=None).search("hybrid search", _USER)
+
+    assert [hit.chunk_id for hit in result.hits] == ["a", "b"]
+    assert _counter("vektor_retrieval_rerank_total", {"status": "ok"}) == ok_before
+    assert _counter("vektor_retrieval_rerank_total", {"status": "fallback"}) == (
+        fallback_before
+    )
+    assert (
+        _counter("vektor_retrieval_latency_seconds_count", {"stage": "rerank"})
+        == latency_before
+    )
+
+
+def test_empty_fused_hits_skip_rerank_stage():
+    rerank_llm = FakeLLM(reply='{"scores": [1]}')
+    vector = FakeVector(hits=[])
+    ok_before = _counter("vektor_retrieval_rerank_total", {"status": "ok"})
+    fallback_before = _counter("vektor_retrieval_rerank_total", {"status": "fallback"})
+
+    result = _retriever(
+        FakeEmbedder(), vector, fts=None, reranker=Reranker(rerank_llm)
+    ).search("hybrid search", _USER)
+
+    assert result.hits == []
+    assert rerank_llm.calls == []
+    assert _counter("vektor_retrieval_rerank_total", {"status": "ok"}) == ok_before
+    assert _counter("vektor_retrieval_rerank_total", {"status": "fallback"}) == (
+        fallback_before
+    )

@@ -24,7 +24,7 @@ from itertools import pairwise
 
 import pytest
 
-from retrieval.chunking import chunk_text
+from retrieval.chunking import PageChunk, chunk_pages, chunk_text
 
 
 def _numbered_words(count: int) -> list[str]:
@@ -174,3 +174,58 @@ class TestWordIntegrity:
     def test_oversized_word_gets_own_chunk(self) -> None:
         chunks = chunk_text("abcdefghij short words", size=5, overlap=2)
         assert chunks == ["abcdefghij", "short", "words"]
+
+
+class TestChunkPages:
+    """Page-aware entry point: pages are chunked independently."""
+
+    def test_empty_page_list_returns_empty_list(self) -> None:
+        assert chunk_pages([]) == []
+
+    def test_page_numbers_pass_through(self) -> None:
+        chunks = chunk_pages([(1, "aa bb"), (2, "cc dd")], size=10, overlap=0)
+        assert chunks == [
+            PageChunk(page=1, text="aa bb"),
+            PageChunk(page=2, text="cc dd"),
+        ]
+
+    def test_long_page_yields_multiple_chunks_with_same_page(self) -> None:
+        text = " ".join(_numbered_words(40))
+        chunks = chunk_pages([(7, text)], size=20, overlap=8)
+        assert len(chunks) > 1
+        assert all(chunk.page == 7 for chunk in chunks)
+        assert all(len(chunk.text) <= 20 for chunk in chunks)
+
+    def test_chunk_never_spans_two_pages(self) -> None:
+        page_one_words = _numbered_words(40)
+        page_two_words = [f"q{word[1:]}" for word in _numbered_words(40)]
+        chunks = chunk_pages(
+            [
+                (1, " ".join(page_one_words)),
+                (2, " ".join(page_two_words)),
+            ],
+            size=20,
+            overlap=8,
+        )
+        assert len(chunks) > 2
+        for chunk in chunks:
+            words = set(chunk.text.split())
+            if chunk.page == 1:
+                assert words <= set(page_one_words)
+            else:
+                assert words <= set(page_two_words)
+
+    def test_empty_pages_contribute_no_chunks(self) -> None:
+        chunks = chunk_pages(
+            [(1, ""), (2, "   "), (3, "only here")], size=10, overlap=0
+        )
+        assert chunks == [PageChunk(page=3, text="only here")]
+
+    def test_default_params_match_chunk_text_defaults(self) -> None:
+        text = " ".join(_numbered_words(120))
+        expected = [PageChunk(page=4, text=chunk) for chunk in chunk_text(text)]
+        assert chunk_pages([(4, text)]) == expected
+
+    def test_invalid_args_raise_value_error(self) -> None:
+        with pytest.raises(ValueError):
+            chunk_pages([(1, "some text")], size=0, overlap=0)

@@ -1,16 +1,8 @@
 """Retrieval benchmark — vector-only vs hybrid vs hybrid+expansion.
 
-Runs a small inline labeled corpus + query set through the real retrieval
-stack (OllamaEmbedder, VectorIndex, ChunkStore FTS5, optional QueryExpander)
-and prints per-mode numbers: relevant hits, Recall@K, Precision@K, and
-average latency. Numbers only — the output makes NO quality claims; it
-requires a live Ollama instance (embeddings always, expansion for the
-hybrid-expansion mode).
-
-The stack is built locally (ChunkStore in a temp directory) — bot.py is
-deliberately NOT imported so no TeleBot is dragged in. Never runs during
-normal pytest (``pytest.ini`` sets ``testpaths = tests``); invoke manually
-with ``python -m benchmarks.retrieval_bench``.
+Labeled corpus + queries through the real retrieval stack (live Ollama
+required); prints Recall@K, Precision@K, and average latency per mode.
+Manual: ``python -m benchmarks.retrieval_bench`` (never runs under pytest).
 """
 
 from __future__ import annotations
@@ -22,6 +14,7 @@ import tempfile
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from benchmarks.run import ollama_reachable
@@ -30,10 +23,15 @@ from retrieval.chunking import chunk_text
 from retrieval.config import RetrievalConfig
 from retrieval.embeddings import EmbeddingError, OllamaEmbedder
 from retrieval.expansion import ExpandedQuery, QueryExpander
-from retrieval.hybrid import HybridRetriever, VectorSearch
-from retrieval.store import ChunkRecord, ChunkStore, chunk_id_for
-from retrieval.vector_index import VectorIndex, to_blob
-from tools.kb import StoreFtsAdapter, VectorIndexAdapter
+from retrieval.hybrid import HybridRetriever
+from retrieval.store import (
+    ChunkRecord,
+    ChunkStore,
+    DocumentRecord,
+    chunk_id_for,
+    to_blob,
+)
+from tools.kb import StoreFtsAdapter, StoreVecAdapter
 
 log = logging.getLogger("vektor.benchmarks.retrieval")
 
@@ -207,7 +205,7 @@ def ingest_corpus(
 ) -> dict[str, str]:
     """Chunk + embed + store the corpus in ONE batch; return chunk_id -> doc_id.
 
-    Mirrors the KbIngestTool internals without the Tool shell. Raises
+    Mirrors the KbIngestTool internals without the Tool shell; raises
     EmbeddingError (caller decides how to fail).
     """
     doc_chunks = [
@@ -216,24 +214,32 @@ def ingest_corpus(
     ]
     flat_chunks = [chunk for _doc, chunks in doc_chunks for chunk in chunks]
     vectors = embedder.embed(flat_chunks)
-    records: list[ChunkRecord] = []
     chunk_to_doc: dict[str, str] = {}
     pos = 0
     for doc_id, chunks in doc_chunks:
+        records = []
         for idx, chunk in enumerate(chunks):
             records.append(
                 ChunkRecord(
-                    doc_id=doc_id,
-                    title=doc_id,
-                    idx=idx,
-                    content=chunk,
+                    document_id=doc_id,
+                    chunk_index=idx,
+                    text=chunk,
                     embedding=to_blob(vectors[pos]),
                 )
             )
             chunk_to_doc[chunk_id_for(doc_id, idx)] = doc_id
             pos += 1
-    store.add_chunks(records)
-    log.info("ingested %d chunks across %d docs", len(records), len(doc_chunks))
+        store.add_document(
+            DocumentRecord(
+                id=doc_id,
+                user_id="bench",
+                filename=doc_id,
+                file_type="txt",
+                created_at=datetime.now(UTC).isoformat(),
+                chunks=records,
+            )
+        )
+    log.info("ingested %d chunks across %d docs", pos, len(doc_chunks))
     return chunk_to_doc
 
 
@@ -241,16 +247,14 @@ def build_retriever(
     mode: str,
     embedder: OllamaEmbedder,
     store: ChunkStore,
-    index: VectorIndex,
     expander: QueryExpander | None,
     cfg: RetrievalConfig,
 ) -> HybridRetriever:
-    """Wire one HybridRetriever for ``mode`` over the shared index."""
-    vector: VectorSearch = VectorIndexAdapter(index, {})
+    """Wire one HybridRetriever for ``mode`` over the shared store."""
     fts = StoreFtsAdapter(store) if mode != "vector" else None
     return HybridRetriever(
         embedder=embedder,
-        vector=vector,
+        vector=StoreVecAdapter(store),
         fts=fts,
         expander=expander if mode == "hybrid-expansion" else None,
         vector_limit=cfg.kb_vector_limit,
@@ -274,7 +278,7 @@ def run_mode(
     retrieval_seconds = 0.0
     for query, relevant in QUERIES:
         began = time.perf_counter()
-        result = retriever.search(query)
+        result = retriever.search(query, "bench")
         retrieval_seconds += time.perf_counter() - began
         retrieved_docs = [
             chunk_to_doc.get(hit.chunk_id, hit.chunk_id) for hit in result.hits
@@ -364,7 +368,6 @@ def main(argv: list[str] | None = None) -> int:
                     f"Embedding failed — is the model '{cfg.ollama_embed_model}' pulled?"
                 )
                 return 1
-            index = VectorIndex(dict(store.all_vectors()))
             expander: TimedExpander | None = None
             if needs_expansion:
                 expander = TimedExpander(
@@ -376,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             for mode in modes:
-                retriever = build_retriever(mode, embedder, store, index, expander, cfg)
+                retriever = build_retriever(mode, embedder, store, expander, cfg)
                 result = run_mode(mode, retriever, expander, chunk_to_doc, cfg.kb_top_k)
                 results.append(result)
         finally:

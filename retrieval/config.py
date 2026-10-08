@@ -44,6 +44,8 @@ class RetrievalConfig:
     ollama_expansion_model: str = "qwen3:0.6b"
     kb_expansion_timeout: float = 10.0
     kb_expansion_temperature: float = 0.0
+    kb_rerank_enabled: bool = True
+    kb_rerank_timeout: float = 10.0
     ollama_embed_model: str = "qwen3-embedding:0.6b"
 
     @classmethod
@@ -94,6 +96,12 @@ class RetrievalConfig:
                 defaults.kb_expansion_temperature,
                 0.0,
                 False,
+            ),
+            kb_rerank_enabled=_env_bool(
+                "KB_RERANK_ENABLED", defaults.kb_rerank_enabled
+            ),
+            kb_rerank_timeout=_env_float(
+                "KB_RERANK_TIMEOUT", defaults.kb_rerank_timeout, 0.0, True
             ),
             ollama_embed_model=_env_str(
                 "OLLAMA_EMBED_MODEL", defaults.ollama_embed_model

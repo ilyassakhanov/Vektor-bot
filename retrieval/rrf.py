@@ -30,6 +30,7 @@ class ChunkHit:
     idx: int
     content: str
     score: float
+    page: int | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class FusedHit:
     content: str
     score: float
     sources: tuple[str, ...]
+    page: int | None = None
 
 
 def rrf_fuse(
@@ -75,6 +77,7 @@ def rrf_fuse(
             content=hit.content,
             score=scores[chunk_id],
             sources=tuple(sorted(sources[chunk_id])),
+            page=hit.page,
         )
         for chunk_id, hit in first_seen.items()
     ]

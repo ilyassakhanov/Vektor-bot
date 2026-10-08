@@ -20,6 +20,31 @@ shared tail), so chunks reassemble the original text in order.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class PageChunk:
+    """One chunk plus the page it came from (``None`` when pages are unknown)."""
+
+    page: int | None
+    text: str
+
+
+def chunk_pages(
+    pages: list[tuple[int, str]], size: int = 800, overlap: int = 100
+) -> list[PageChunk]:
+    """Chunk each page independently; a chunk never spans two pages.
+
+    Same window params (and validation) as :func:`chunk_text`; empty pages
+    contribute no chunks; page numbers pass through unchanged.
+    """
+    return [
+        PageChunk(page=page, text=chunk)
+        for page, text in pages
+        for chunk in chunk_text(text, size, overlap)
+    ]
+
 
 def chunk_text(text: str, size: int = 800, overlap: int = 100) -> list[str]:
     """Split ``text`` into fixed-size, word-aligned, overlapping chunks.

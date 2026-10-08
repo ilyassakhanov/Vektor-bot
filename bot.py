@@ -10,7 +10,9 @@ import os
 import re
 import sys
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import telebot
 from telebot.apihelper import ApiTelegramException
@@ -28,9 +30,9 @@ from retrieval.config import RetrievalConfig
 from retrieval.embeddings import OllamaEmbedder
 from retrieval.expansion import QueryExpander
 from retrieval.hybrid import FtsSearch, HybridRetriever, VectorSearch
-from retrieval.rrf import ChunkHit
+from retrieval.principal import reset_user, set_user
+from retrieval.rerank import Reranker
 from retrieval.store import META_EMBED_MODEL, ChunkStore, KBModelError
-from retrieval.vector_index import VectorIndex
 from skills.loader import SkillLoader
 from tools.base import ToolError
 from tools.exec import ExecTool
@@ -40,7 +42,7 @@ from tools.kb import (
     KbSearchTool,
     KbStack,
     StoreFtsAdapter,
-    VectorIndexAdapter,
+    StoreVecAdapter,
 )
 from tools.mcp import McpClient, McpStdioClient, McpTool, build_server_env
 from tools.registry import ToolRegistry
@@ -61,47 +63,19 @@ _DEFAULT_MCP_COMMAND: list[str] = [
 _DOCUMENT_ERROR_REPLY = "Sorry, I couldn't process that document."
 _LLM_ERROR_REPLY = "Sorry, I couldn't generate a response."
 _DOCUMENT_FALLBACK_NAME = "document"
-
-
-class KBMultiUserError(Exception):
-    """The knowledge base is enabled for more than one allowed user.
-
-    The KB has no per-user namespace: chunks carry no owner, and
-    ``kb_search``/``kb_ingest`` are invoked by the shared agent without
-    any principal context, so every allowed user can retrieve every
-    stored document. The composition root therefore refuses to start a
-    multi-user KB — the safe resolutions are listing exactly one allowed
-    username or setting ``KB_ENABLED=0``.
-    """
-
-
-def ensure_kb_single_user(
-    kb: KbStack | None,
-    allowed_usernames: set[str] | frozenset[str] | None,
-) -> None:
-    """Refuse a KB-enabled bot that serves more than one allowed user.
-
-    ``ALLOWED_USERNAMES`` supports several tags, but the knowledge base is
-    a single shared store with no owner predicate on search — user A's
-    uploads would be searchable by user B. Until the KB grows per-user
-    namespacing, a KB-enabled bot must serve at most one user. ``kb=None``
-    (KB disabled) is never a violation; an empty allow-list is safe (the
-    bot denies everyone).
-
-    Raises:
-        KBMultiUserError: when ``kb`` is built and more than one username
-            is allowed.
-    """
-    if kb is None or allowed_usernames is None:
-        return
-    if len(allowed_usernames) > 1:
-        raise KBMultiUserError(
-            "KB_ENABLED=1 supports a single allowed user, but"
-            f" ALLOWED_USERNAMES lists {len(allowed_usernames)}."
-            " The knowledge base has no per-user namespace — any allowed"
-            " user can search every stored document. Keep one allowed"
-            " username or set KB_ENABLED=0."
-        )
+_AUTH_DENIED_REPLY = "Sorry, you are not allowed to use this bot."
+_DOCUMENT_RECEIVED_REPLY = "📄 Document received"
+_EXTRACTING_REPLY = "⏳ Extracting text…"
+_EMBEDDING_REPLY = "⏳ Generating embeddings…"
+_INGESTED_OK_PREFIX = "✅ "
+_DOCUMENT_READY_REPLY = "✅ Document ready. Now you can ask questions."
+_KB_DISABLED_REPLY = "The knowledge base is not enabled."
+_DOCUMENTS_HEADER = "📚 Your documents:"
+_DOCUMENTS_EMPTY_REPLY = (
+    "📚 Your library is empty — upload a document (.txt, .md, .pdf, .docx)"
+    " and it becomes searchable."
+)
+_DELETE_USAGE_REPLY = "Usage: /delete <filename>"
 
 
 def build_llm() -> LLM:
@@ -117,20 +91,8 @@ def build_llm() -> LLM:
 def build_kb_stack(cfg: RetrievalConfig | None = None) -> KbStack | None:
     """Compose the knowledge-base stack; None when KB_ENABLED=0.
 
-    Ensures the DB parent directory exists (the store does not), builds the
-    ChunkStore, OllamaEmbedder (model from ``OLLAMA_EMBED_MODEL``), a
-    VectorIndex seeded from the store's vectors, the FTS adapter (only when
-    FTS5 is available AND ``KB_FTS_ENABLED`` — unavailable-but-enabled logs
-    a warning and degrades to vector-only), the expansion LLM (only when
-    ``KB_EXPANSION_ENABLED`` — a second OllamaLLM with
-    ``OLLAMA_EXPANSION_MODEL``, temperature, and short timeout), and the
-    HybridRetriever wired with every config limit.
-
-    The configured embedding model is persisted in the store's meta table
-    on first run and validated on every start: a conflict between the
-    stored model and ``OLLAMA_EMBED_MODEL`` raises :class:`KBModelError`
-    with an actionable message instead of mixing vectors from incompatible
-    models.
+    Wires store + embedder + FTS + expansion/rerank LLMs + retriever; the
+    embedding model is validated on every start (conflict → KBModelError).
     """
     cfg = cfg or RetrievalConfig.from_env()
     if not cfg.kb_enabled:
@@ -153,14 +115,12 @@ def build_kb_stack(cfg: RetrievalConfig | None = None) -> KbStack | None:
         base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
         model=cfg.ollama_embed_model,
     )
-    vector_index = VectorIndex(dict(store.all_vectors()))
-    metadata: dict[str, ChunkHit] = {}
     fts: FtsSearch | None = None
     if store.fts_available and cfg.kb_fts_enabled:
         fts = StoreFtsAdapter(store)
     elif cfg.kb_fts_enabled:
         log.warning("KB_FTS_ENABLED=1 but FTS5 is unavailable; running vector-only")
-    vector: VectorSearch = VectorIndexAdapter(vector_index, metadata)
+    vector: VectorSearch = StoreVecAdapter(store)
     expander: QueryExpander | None = None
     if cfg.kb_expansion_enabled:
         expander = QueryExpander(
@@ -171,11 +131,21 @@ def build_kb_stack(cfg: RetrievalConfig | None = None) -> KbStack | None:
                 temperature=cfg.kb_expansion_temperature,
             )
         )
+    reranker: Reranker | None = None
+    if cfg.kb_rerank_enabled:
+        reranker = Reranker(
+            OllamaLLM(
+                base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+                model=cfg.ollama_expansion_model,
+                timeout=cfg.kb_rerank_timeout,
+            )
+        )
     retriever = HybridRetriever(
         embedder=embedder,
         vector=vector,
         fts=fts,
         expander=expander,
+        reranker=reranker,
         vector_limit=cfg.kb_vector_limit,
         fts_limit=cfg.kb_fts_limit,
         top_k=cfg.kb_top_k,
@@ -185,22 +155,19 @@ def build_kb_stack(cfg: RetrievalConfig | None = None) -> KbStack | None:
         cfg=cfg,
         store=store,
         embedder=embedder,
-        vector_index=vector_index,
         vector=vector,
         retriever=retriever,
-        metadata=metadata,
         fts=fts,
         expander=expander,
+        reranker=reranker,
     )
 
 
 def build_retriever(cfg: RetrievalConfig | None = None) -> HybridRetriever | None:
     """Build only the HybridRetriever; None when the knowledge base is off.
 
-    Convenience wrapper over :func:`build_kb_stack` for callers that need
-    just the retriever. The stack's resources (store, embedder) are not
-    closed automatically — long-lived processes should use
-    ``build_kb_stack`` + ``KbStack.close()`` instead.
+    Convenience wrapper over :func:`build_kb_stack`; the stack's resources
+    are not closed automatically — prefer ``build_kb_stack`` + ``close()``.
     """
     stack = build_kb_stack(cfg)
     return None if stack is None else stack.retriever
@@ -213,17 +180,8 @@ def build_tool_registry(
 ) -> ToolRegistry:
     """Build the tool registry with all available tools.
 
-    When ``kb`` is None AND ``auto_build_kb`` is true the knowledge-base
-    stack is auto-built from the environment (``KB_ENABLED``, default on),
-    so ``python bot.py`` works unchanged; an auto-build failure degrades to
-    a kb-less registry with a warning, mirroring the MCP fallback — except
-    a persisted-embedding-model conflict (:class:`KBModelError`), which is
-    a configuration error and propagates. Pass an explicit stack to inject
-    test doubles. ``main`` passes ``auto_build_kb=False``: it builds the
-    stack itself, so a ``None`` there means "degraded/disabled at startup"
-    and must NOT be retried — a retry would register kb tools backed by an
-    untracked, unclosed stack while document uploads stay disabled.
-    ``KB_ENABLED=0`` yields the exact pre-kb tool set.
+    ``kb=None`` + ``auto_build_kb`` auto-builds the stack (failure → kb-less
+    registry; KBModelError propagates; False = degraded, never retried).
     """
     reg = InstrumentedToolRegistry()
     timeout = float(os.environ.get("EXEC_TIMEOUT", "30"))
@@ -247,20 +205,11 @@ def build_tool_registry(
             KbIngestTool(
                 store=kb.store,
                 embedder=kb.embedder,
-                vector_index=kb.vector_index,
-                metadata=kb.metadata,
                 chunk_size=kb.cfg.kb_chunk_size,
                 chunk_overlap=kb.cfg.kb_chunk_overlap,
-                ingest_lock=kb.ingest_lock,
             )
         )
-        reg.register(
-            KbSearchTool(
-                retriever=kb.retriever,
-                store=kb.store,
-                ingest_lock=kb.ingest_lock,
-            )
-        )
+        reg.register(KbSearchTool(retriever=kb.retriever))
     return reg
 
 
@@ -334,94 +283,185 @@ def _mcp_command_from_env() -> list[str]:
     return raw.split()
 
 
+def _is_authorized(
+    message: telebot.types.Message,
+    allowed_usernames: set[str] | frozenset[str] | None,
+) -> bool:
+    """Auth gate — True when the sender may use the bot (None = auth off)."""
+    if allowed_usernames is None:
+        return True
+    user = getattr(message, "from_user", None)
+    username: str | None = getattr(user, "username", None) if user is not None else None
+    if not username:
+        return False
+    return username.lower() in allowed_usernames
+
+
+def _principal_id(message: telebot.types.Message) -> str:
+    """KB owner id — the sender's numeric Telegram id (``"0"`` when absent)."""
+    user = getattr(message, "from_user", None)
+    return str(user.id) if user is not None else "0"
+
+
+def _format_date(created_at: str) -> str:
+    """Render an ISO-8601 timestamp as ``YYYY-MM-DD`` (raw string fallback)."""
+    try:
+        return datetime.fromisoformat(created_at).strftime("%Y-%m-%d")
+    except ValueError:
+        return created_at
+
+
+def handle_documents_command(
+    message: telebot.types.Message,
+    reply_to: Callable[..., Any],
+    allowed_usernames: set[str] | frozenset[str] | None,
+    store: ChunkStore | None,
+) -> None:
+    """``/documents`` — numbered list of the caller's documents.
+
+    Auth gate runs FIRST; without a store (KB disabled) a friendly
+    not-enabled reply is sent instead of touching storage.
+    """
+    if not _is_authorized(message, allowed_usernames):
+        log.warning("unauthorized user=%s denied /documents", _principal_id(message))
+        reply_to(message, _AUTH_DENIED_REPLY)
+        return
+    if store is None:
+        reply_to(message, _KB_DISABLED_REPLY)
+        return
+    rows = store.list_documents(_principal_id(message))
+    if not rows:
+        reply_to(message, _DOCUMENTS_EMPTY_REPLY)
+        return
+    lines = [_DOCUMENTS_HEADER]
+    for position, row in enumerate(rows, start=1):
+        lines.append(
+            f"{position}. {row.filename} — {_format_date(row.created_at)},"
+            f" {row.chunk_count} chunks"
+        )
+    reply_to(message, "\n".join(lines))
+
+
+def handle_delete_command(
+    message: telebot.types.Message,
+    reply_to: Callable[..., Any],
+    allowed_usernames: set[str] | frozenset[str] | None,
+    store: ChunkStore | None,
+) -> None:
+    """``/delete <filename>`` — remove the caller's document (auth gate first).
+
+    Missing filename gets a usage hint; ``delete_document`` returning False
+    gets a not-found reply — never a distinction an attacker could probe.
+    """
+    if not _is_authorized(message, allowed_usernames):
+        log.warning("unauthorized user=%s denied /delete", _principal_id(message))
+        reply_to(message, _AUTH_DENIED_REPLY)
+        return
+    if store is None:
+        reply_to(message, _KB_DISABLED_REPLY)
+        return
+    parts = (getattr(message, "text", None) or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        reply_to(message, _DELETE_USAGE_REPLY)
+        return
+    filename = parts[1].strip()
+    if store.delete_document(_principal_id(message), filename):
+        reply_to(message, f'🗑 Deleted "{filename}" — chunks and embeddings are gone.')
+    else:
+        reply_to(message, f'❌ No document named "{filename}" in your library.')
+
+
 def build_document_handler(
     bot: telebot.TeleBot,
     kb: KbStack,
     conv: ConversationManager,
 ) -> Callable[..., None]:
-    """Build the document-message handler: download → extract → ingest → 2 replies.
+    """Build the document-message handler: staged progress → ingest → agent.
 
-    The document is ingested via a fresh :class:`KbIngestTool` (same wiring
-    as ``build_tool_registry``) BEFORE any agent run — extraction output
-    must never cross the LLM tool boundary as an argument. After a
-    successful ingest the first reply is the ingest confirmation; the agent
-    then ALWAYS runs with a synthetic upload notice (file name + chunk
-    count + ``kb_search`` hint), so the upload lands in conversation
-    context. A non-empty caption is appended to the notice and answered in
-    the same turn. Download, extraction, and ingest failures each produce
-    exactly one user-friendly reply (no agent run) and are never re-raised
-    into the polling loop — including unexpected errors (SQLite, I/O,
-    vector-index failures): the whole download/extract/ingest boundary is
-    failure-proof. Logs carry file name and outcome only — never file
-    content or captions.
+    Downloads/extracts/ingests BEFORE any agent run via ``ingest_document``
+    (pages only for PDFs); failures end with exactly one friendly reply.
     """
 
     def handle_document(
         message: telebot.types.Message,
         reply_to: Callable[..., None],
     ) -> None:
-        doc = message.document
-        if doc is None:
-            log.warning("document message without a document payload")
-            reply_to(message, _DOCUMENT_ERROR_REPLY)
-            return
-        file_id = doc.file_id
-        file_name = doc.file_name or _DOCUMENT_FALLBACK_NAME
+        sender = getattr(message, "from_user", None)
+        principal_token = set_user(str(sender.id) if sender is not None else "0")
         try:
-            file_info = bot.get_file(file_id)
-            file_path = file_info.file_path
-            if not file_path:
-                raise DocumentError("Telegram returned no file path")
-            content = bot.download_file(file_path)
-            text = documents.extract_text(content, file_name)
-            ingest = KbIngestTool(
-                store=kb.store,
-                embedder=kb.embedder,
-                vector_index=kb.vector_index,
-                metadata=kb.metadata,
-                chunk_size=kb.cfg.kb_chunk_size,
-                chunk_overlap=kb.cfg.kb_chunk_overlap,
-                ingest_lock=kb.ingest_lock,
-            )
-            ingest_result = ingest.execute(text=text, title=file_name)
-        except (ApiTelegramException, DocumentError, ToolError) as exc:
-            log.warning(
-                "document ingest failed for %r: %s", file_name, type(exc).__name__
-            )
-            reply_to(message, _DOCUMENT_ERROR_REPLY)
-            return
-        except Exception:
-            log.warning(
-                "document ingest failed for %r: unexpected error",
+            doc = message.document
+            if doc is None:
+                log.warning("document message without a document payload")
+                reply_to(message, _DOCUMENT_ERROR_REPLY)
+                return
+            file_id = doc.file_id
+            file_name = doc.file_name or _DOCUMENT_FALLBACK_NAME
+            reply_to(message, _DOCUMENT_RECEIVED_REPLY)
+            reply_to(message, _EXTRACTING_REPLY)
+            try:
+                file_info = bot.get_file(file_id)
+                file_path = file_info.file_path
+                if not file_path:
+                    raise DocumentError("Telegram returned no file path")
+                content = bot.download_file(file_path)
+                file_type = Path(file_name).suffix.lstrip(".").lower()
+                pages = documents.extract_pages(content, file_name)
+                text = "\n".join(page_text for _, page_text in pages if page_text)
+                reply_to(message, _EMBEDDING_REPLY)
+                ingest = KbIngestTool(
+                    store=kb.store,
+                    embedder=kb.embedder,
+                    chunk_size=kb.cfg.kb_chunk_size,
+                    chunk_overlap=kb.cfg.kb_chunk_overlap,
+                )
+                ingest_result = ingest.ingest_document(
+                    text=text,
+                    title=file_name,
+                    filename=file_name,
+                    file_type=file_type,
+                    pages=pages if file_type == "pdf" else None,
+                )
+            except (ApiTelegramException, DocumentError, ToolError) as exc:
+                log.warning(
+                    "document ingest failed for %r: %s", file_name, type(exc).__name__
+                )
+                reply_to(message, _DOCUMENT_ERROR_REPLY)
+                return
+            except Exception:
+                log.warning(
+                    "document ingest failed for %r: unexpected error",
+                    file_name,
+                    exc_info=True,
+                )
+                reply_to(message, _DOCUMENT_ERROR_REPLY)
+                return
+            log.info(
+                "document %r ingested: %s chunks",
                 file_name,
-                exc_info=True,
+                _chunk_count(ingest_result),
             )
-            reply_to(message, _DOCUMENT_ERROR_REPLY)
-            return
-        log.info(
-            "document %r ingested: %s chunks",
-            file_name,
-            _chunk_count(ingest_result),
-        )
-        reply_to(message, ingest_result)
-        notice = (
-            f'[document uploaded: "{file_name}", '
-            f"{_chunk_count(ingest_result)} chunks ingested; "
-            "content is now searchable via kb_search]"
-        )
-        caption = (getattr(message, "caption", None) or "").strip()
-        prompt = f"{notice}\n\n{caption}" if caption else notice
-        try:
-            response = conv.handle(message.chat.id, prompt)
-        except LLMError as exc:
-            log.warning("LLM error on document upload: %s", exc)
-            reply_to(message, _LLM_ERROR_REPLY)
-            return
-        except Exception:
-            log.warning("agent error on document upload", exc_info=True)
-            reply_to(message, _LLM_ERROR_REPLY)
-            return
-        reply_to(message, response)
+            reply_to(message, f"{_INGESTED_OK_PREFIX}{ingest_result}")
+            reply_to(message, _DOCUMENT_READY_REPLY)
+            notice = (
+                f'[document uploaded: "{file_name}", '
+                f"{_chunk_count(ingest_result)} chunks ingested; "
+                "content is now searchable via kb_search]"
+            )
+            caption = (getattr(message, "caption", None) or "").strip()
+            prompt = f"{notice}\n\n{caption}" if caption else notice
+            try:
+                response = conv.handle(message.chat.id, prompt)
+            except LLMError as exc:
+                log.warning("LLM error on document upload: %s", exc)
+                reply_to(message, _LLM_ERROR_REPLY)
+                return
+            except Exception:
+                log.warning("agent error on document upload", exc_info=True)
+                reply_to(message, _LLM_ERROR_REPLY)
+                return
+            reply_to(message, response)
+        finally:
+            reset_user(principal_token)
 
     return handle_document
 
@@ -441,17 +481,8 @@ def handle_message(
 ) -> None:
     """Process a single message: route through the Agent and reply via ``reply_to``.
 
-    ``reply_to`` is the callable used to send a reply (typically
-    ``bot.reply_to``); tests inject a fake.
-
-    When ``allowed_usernames`` is provided, only users whose Telegram username
-    is in that set may use the bot; others get a denial reply.
-
-    Document messages are delegated to ``document_handler`` (before the text
-    path) — a document never reaches the agent as message text. When
-    ``document_handler`` is None (knowledge base disabled), documents get a
-    "not enabled" reply. The auth check runs FIRST, so unauthorized users'
-    documents are never downloaded.
+    Auth gate FIRST; the KB principal is set from ``from_user.id`` after it and
+    reset in ``finally``; documents go to ``document_handler`` (None = disabled).
     """
     user = message.from_user
     log.info(
@@ -461,28 +492,28 @@ def handle_message(
         user.id if user else "?",
         f" @{user.username}" if user and user.username else "",
     )
-    if allowed_usernames is not None and (
-        user is None
-        or not user.username
-        or user.username.lower() not in allowed_usernames
-    ):
+    if not _is_authorized(message, allowed_usernames):
         log.warning("unauthorized user=%s denied", user.id if user else "?")
-        reply_to(message, "Sorry, you are not allowed to use this bot.")
+        reply_to(message, _AUTH_DENIED_REPLY)
         return
-    doc = getattr(message, "document", None)
-    if doc is not None:
-        if document_handler is None:
-            reply_to(message, "Document uploads are not enabled.")
-            return
-        document_handler(message, reply_to)
-        return
+    principal_token = set_user(str(user.id) if user is not None else "0")
     try:
-        response = conv.handle(message.chat.id, message.text or "")
-    except LLMError as exc:
-        log.warning("LLM error: %s", exc)
-        reply_to(message, _LLM_ERROR_REPLY)
-        return
-    reply_to(message, response)
+        doc = getattr(message, "document", None)
+        if doc is not None:
+            if document_handler is None:
+                reply_to(message, "Document uploads are not enabled.")
+                return
+            document_handler(message, reply_to)
+            return
+        try:
+            response = conv.handle(message.chat.id, message.text or "")
+        except LLMError as exc:
+            log.warning("LLM error: %s", exc)
+            reply_to(message, _LLM_ERROR_REPLY)
+            return
+        reply_to(message, response)
+    finally:
+        reset_user(principal_token)
 
 
 def create_bot(
@@ -492,12 +523,20 @@ def create_bot(
 ) -> telebot.TeleBot:
     """Wire up a TeleBot with the injected ConversationManager.
 
-    When ``kb`` is provided, document uploads are enabled: the wired
-    handler downloads → extracts → ingests documents into the knowledge
-    base before the agent runs (see :func:`build_document_handler`).
+    Command handlers (``/documents``, ``/delete``) register BEFORE the catch-all
+    handler (TeleBot tests in registration order); with ``kb``, uploads enabled.
     """
     bot = telebot.TeleBot(BOT_TOKEN)
+    store = kb.store if kb is not None else None
     document_handler = build_document_handler(bot, kb, conv) if kb is not None else None
+
+    @bot.message_handler(commands=["documents"])
+    def on_documents(message: telebot.types.Message) -> None:
+        handle_documents_command(message, bot.reply_to, allowed_usernames, store)
+
+    @bot.message_handler(commands=["delete"])
+    def on_delete(message: telebot.types.Message) -> None:
+        handle_delete_command(message, bot.reply_to, allowed_usernames, store)
 
     @bot.message_handler(func=lambda m: True, content_types=["text", "document"])
     def on_message(message: telebot.types.Message) -> None:
@@ -548,11 +587,6 @@ def main() -> None:
             log.info("Allowed users: %d", len(allowed))
         else:
             log.warning("No ALLOWED_USERNAMES set — all users denied.")
-        try:
-            ensure_kb_single_user(kb, allowed)
-        except KBMultiUserError as exc:
-            log.error("%s", exc)
-            raise SystemExit(1) from exc
         bot = create_bot(conv, allowed, kb=kb)
         log.info("Starting bot (polling)...")
         try:
