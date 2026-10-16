@@ -1,11 +1,13 @@
-"""Fail when an OpenSpec change has all tasks complete but was not archived.
+"""Fail when an OpenSpec change is finished or uncheckable but not archived.
 
 Reads ``openspec list --json`` output from stdin. Fails when a change in
-``openspec/changes/`` has every task checked: such a change was forgotten in
-the archive step, so its deltas never reached ``openspec/specs/``. A change
-with an open task — work in progress or waiting for post-merge acceptance —
-passes the check, but is listed in the step summary so lingering changes
-stay visible.
+``openspec/changes/`` either has every task checked — such a change was
+forgotten in the archive step, so its deltas never reached
+``openspec/specs/`` — or has no tasks at all: without a single checkbox
+there is no verifiable completion criterion, so the change can never
+satisfy this check and would linger open forever. A change with an open
+task — work in progress or waiting for post-merge acceptance — passes the
+check, but is listed in the step summary so lingering changes stay visible.
 
     npx --yes @fission-ai/openspec@1.14.1 list --json \
         | python3 scripts/check_openspec_archived.py
@@ -26,7 +28,12 @@ def main() -> int:
         for c in changes
         if c["totalTasks"] > 0 and c["completedTasks"] == c["totalTasks"]
     ]
-    open_ = [c for c in changes if c not in done]
+    no_tasks = [c for c in changes if c["totalTasks"] == 0]
+    open_ = [
+        c
+        for c in changes
+        if c["totalTasks"] > 0 and c["completedTasks"] < c["totalTasks"]
+    ]
 
     lines = ["## Open OpenSpec changes", ""]
     if open_:
@@ -49,7 +56,12 @@ def main() -> int:
             f"::error::change {c['name']}: all tasks complete but the change "
             f"is not archived — run `openspec archive {c['name']}` in this PR"
         )
-    return 1 if done else 0
+    for c in no_tasks:
+        print(
+            f"::error::change {c['name']}: has no tasks — add tasks naming "
+            f"files or commands, or archive it in this PR"
+        )
+    return 1 if done or no_tasks else 0
 
 
 if __name__ == "__main__":
