@@ -28,4 +28,4 @@
 - [x] 4.1 `npx --yes @fission-ai/openspec@1.14.1 validate --all --strict` passes
 - [x] 4.2 `npx --yes @fission-ai/openspec@1.14.1 list --json | python3 scripts/check_openspec_archived.py` passes
 - [x] 4.3 Local quality gates pass: `ruff check .`, `ruff format --check .`, `mypy .`, `python -m pytest`
-- [ ] 4.4 Archive this change so the deltas land in `openspec/specs/`
+- [x] 4.4 Archive this change so the deltas land in `openspec/specs/`
