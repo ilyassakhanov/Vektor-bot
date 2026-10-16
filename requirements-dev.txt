@@ -1,0 +1,7 @@
+# Dev tools for quality gates and tests. CI installs these too.
+# Versions are pinned exactly, like the openspec CLI in ci.yml: newer ruff
+# releases have expanded the default rule set, and "green locally" must
+# equal "green in CI". Upgrades are deliberate commits, not surprises.
+pytest==9.1.1
+ruff==0.16.6
+mypy==2.3.1
