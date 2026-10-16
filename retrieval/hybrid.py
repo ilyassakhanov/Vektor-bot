@@ -1,28 +1,8 @@
 """Hybrid retrieval — orchestrates expansion, parallel search, and RRF fusion.
 
-HybridRetriever is the composition point of the retrieval pipeline:
-
-    query → expansion (optional, never fails)
-          → embed original + alt queries in one batch
-          → ThreadPoolExecutor[max_workers=2]( vector ‖ FTS )
-          → rrf_fuse → top-k
-
-The two searchable backends are hidden behind the thin :class:`VectorSearch`
-and :class:`FtsSearch` ABCs so neither numpy nor SQLite leaks into this
-module; concrete implementations (VectorIndex, ChunkStore adapters) are
-wired by callers. Every stage degrades instead of failing: a source that
-raises (or an embedder that cannot produce query vectors) simply
-contributes no ranking, the other source still answers, and the degradation
-is recorded in :attr:`HybridResult.note`. Only when no source produces any
-ranking does the result come back empty — still with an explanatory note.
-
-The FTS terms are built from the original query plus expansion keywords and
-alternative queries (deduplicated, order-preserving). The vector source
-searches with embeddings of the original query plus the alternative queries
-(one batch embed call, same dedup) — VectorIndex scores each chunk by max
-cosine across them. Expansion KEYWORDS stay FTS-side only: they are BM25
-terms, not sentences, so they are never embedded. Sensitive text (query,
-terms, hit content) never reaches logs.
+Pipeline: expand → one batch embed → vector ‖ FTS in a 2-worker executor
+cycle → rrf_fuse → top-k → optional rerank; mandatory explicit ``user_id``.
+Every stage degrades instead of failing (recorded in ``HybridResult.note``).
 """
 
 from __future__ import annotations
@@ -37,10 +17,12 @@ from dataclasses import dataclass
 from metrics import (
     retrieval_expansion_total,
     retrieval_latency_seconds,
+    retrieval_rerank_total,
     retrieval_results,
 )
 from retrieval.embeddings import Embedder, EmbeddingError
 from retrieval.expansion import ExpandedQuery, QueryExpander
+from retrieval.rerank import Reranker
 from retrieval.rrf import ChunkHit, FusedHit, rrf_fuse
 
 log = logging.getLogger("vektor.retrieval.hybrid")
@@ -50,7 +32,7 @@ class FtsSearch(ABC):
     """Thin full-text search interface — one term-based ranking method."""
 
     @abstractmethod
-    def search(self, terms: list[str], limit: int) -> list[ChunkHit]:
+    def search(self, terms: list[str], limit: int, user_id: str) -> list[ChunkHit]:
         """Return up to ``limit`` best-first hits matching ``terms``."""
 
 
@@ -58,7 +40,9 @@ class VectorSearch(ABC):
     """Thin vector search interface — one embedding-based ranking method."""
 
     @abstractmethod
-    def search(self, queries: list[list[float]], limit: int) -> list[ChunkHit]:
+    def search(
+        self, queries: list[list[float]], limit: int, user_id: str
+    ) -> list[ChunkHit]:
         """Return up to ``limit`` best-first hits similar to any of ``queries``."""
 
 
@@ -81,22 +65,8 @@ class HybridResult:
 class HybridRetriever:
     """Hybrid search facade: expand → embed → vector ‖ FTS → RRF → top-k.
 
-    Args:
-        embedder: Produces the query vectors (original + alt queries, one batch).
-        vector: Vector similarity backend.
-        fts: Full-text backend; None disables FTS entirely (vector-only
-            mode, not a degradation).
-        expander: Optional LLM-backed query expansion; None disables
-            expansion (the original query is used as-is).
-        vector_limit: Per-source result limit forwarded to vector search.
-        fts_limit: Per-source result limit forwarded to FTS search.
-        top_k: Number of fused hits to return.
-        rrf_k: RRF k constant (smaller emphasizes top ranks).
-
-    The two searches are submitted as separate futures of one
-    ``ThreadPoolExecutor(max_workers=2)`` cycle, so they genuinely overlap;
-    neither is a sequential fallback. Failures of individual sources are
-    contained per future.
+    ``fts=None`` disables FTS (vector-only mode, not degradation); absent
+    ``expander``/``reranker`` disable those stages; failures contained.
     """
 
     def __init__(
@@ -105,6 +75,7 @@ class HybridRetriever:
         vector: VectorSearch,
         fts: FtsSearch | None = None,
         expander: QueryExpander | None = None,
+        reranker: Reranker | None = None,
         vector_limit: int = 20,
         fts_limit: int = 20,
         top_k: int = 5,
@@ -114,21 +85,17 @@ class HybridRetriever:
         self._vector = vector
         self._fts = fts
         self._expander = expander
+        self._reranker = reranker
         self._vector_limit = vector_limit
         self._fts_limit = fts_limit
         self._top_k = top_k
         self._rrf_k = rrf_k
 
-    def search(self, query: str) -> HybridResult:
+    def search(self, query: str, user_id: str) -> HybridResult:
         """Run the full hybrid pipeline over ``query``; never raises.
 
-        Expansion and per-source failures degrade the result (recorded in
-        ``note``) instead of propagating; only a fully failed pipeline
-        yields an empty ``hits`` list.
-
-        Records ``vektor_retrieval_*`` metrics (enum labels only — never
-        query text or hit content): expansion outcome, per-stage latency,
-        and per-source/final hit counts.
+        ``user_id`` scopes every source; failures degrade into ``note``
+        instead of propagating. Records ``vektor_retrieval_*`` metrics.
         """
         started = time.perf_counter()
         expanded = self._expand(query)
@@ -148,12 +115,13 @@ class HybridRetriever:
                         self._vector.search,
                         query_vecs,
                         self._vector_limit,
+                        user_id,
                     )
                 )
             fts_future: Future[list[ChunkHit]] | None = None
             if self._fts is not None:
                 fts_future = pool.submit(
-                    _timed("fts", self._fts.search, terms, self._fts_limit)
+                    _timed("fts", self._fts.search, terms, self._fts_limit, user_id)
                 )
             if vector_future is not None:
                 self._collect("vector", vector_future, rankings, failures)
@@ -165,6 +133,7 @@ class HybridRetriever:
             k=self._rrf_k,
             top_k=self._top_k,
         )
+        fused = self._rerank(query, fused)
         retrieval_results.labels(source="final").observe(len(fused))
         retrieval_latency_seconds.labels(stage="total").observe(
             time.perf_counter() - started
@@ -198,6 +167,22 @@ class HybridRetriever:
             time.perf_counter() - began
         )
         return expanded
+
+    def _rerank(self, query: str, fused: list[FusedHit]) -> list[FusedHit]:
+        """Pointwise rerank of the fused top-k when a reranker is configured.
+
+        Metered only on an actual run (``stage=rerank`` latency,
+        ``vektor_retrieval_rerank_total`` ok/fallback).
+        """
+        if self._reranker is None or not fused:
+            return fused
+        began = time.perf_counter()
+        outcome = self._reranker.rerank(query, fused, top_k=self._top_k)
+        retrieval_latency_seconds.labels(stage="rerank").observe(
+            time.perf_counter() - began
+        )
+        retrieval_rerank_total.labels(status="ok" if outcome.ok else "fallback").inc()
+        return outcome.hits
 
     def _embed_queries(self, expanded: ExpandedQuery) -> list[list[float]] | None:
         """Embed original + alt queries in ONE batch; None = vector source out.

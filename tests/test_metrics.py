@@ -151,7 +151,7 @@ def test_expansion_ok_recorded_with_expansion_latency():
         FakeVector(hits=[_hit("a")]),
         FakeFts(hits=[_hit("a")]),
         expander=QueryExpander(llm),
-    ).search("metrics query")
+    ).search("metrics query", "user-1")
 
     assert result.used_expansion is True
     assert _value(_EXPANSION_TOTAL, {"status": "ok"}) == ok_before + 1
@@ -170,7 +170,7 @@ def test_expansion_fallback_recorded_with_expansion_latency():
         FakeVector(hits=[_hit("a")]),
         FakeFts(hits=[_hit("a")]),
         expander=QueryExpander(llm),
-    ).search("metrics query")
+    ).search("metrics query", "user-1")
 
     assert result.used_expansion is False
     assert _value(_EXPANSION_TOTAL, {"status": "ok"}) == ok_before
@@ -185,7 +185,7 @@ def test_no_expander_records_no_expansion_metrics():
 
     _retriever(
         FakeEmbedder(), FakeVector(hits=[_hit("a")]), FakeFts(hits=[_hit("a")])
-    ).search("metrics query")
+    ).search("metrics query", "user-1")
 
     assert _value(_EXPANSION_TOTAL, {"status": "ok"}) == ok_before
     assert _value(_EXPANSION_TOTAL, {"status": "fallback"}) == fallback_before
@@ -199,7 +199,7 @@ def test_source_and_total_stage_latencies_recorded():
 
     _retriever(
         FakeEmbedder(), FakeVector(hits=[_hit("a")]), FakeFts(hits=[_hit("a")])
-    ).search("metrics query")
+    ).search("metrics query", "user-1")
 
     assert _value(_LATENCY_COUNT, {"stage": "vector"}) == vector_before + 1
     assert _value(_LATENCY_COUNT, {"stage": "fts"}) == fts_before + 1
@@ -215,7 +215,7 @@ def test_stage_latency_measures_search_execution_not_queue_wait():
     vector_sum_before = _value(_LATENCY_SUM, {"stage": "vector"})
 
     start = time.perf_counter()
-    _retriever(FakeEmbedder(), vector, fts).search("metrics query")
+    _retriever(FakeEmbedder(), vector, fts).search("metrics query", "user-1")
     elapsed = time.perf_counter() - start
 
     assert _value(_LATENCY_SUM, {"stage": "vector"}) >= vector_sum_before + 0.05
@@ -232,7 +232,7 @@ def test_failed_source_records_stage_latency_but_no_results_metric():
         FakeEmbedder(),
         FakeVector(error=RuntimeError("index gone")),
         FakeFts(hits=[_hit("b"), _hit("a")]),
-    ).search("metrics query")
+    ).search("metrics query", "user-1")
 
     assert result.sources_used == ("fts",)
     assert _value(_LATENCY_COUNT, {"stage": "vector"}) == vector_latency_before + 1
@@ -249,7 +249,7 @@ def test_results_counts_include_zero_hits_and_fused_final():
     final_count_before = _value(_RESULTS_COUNT, {"source": "final"})
     final_sum_before = _value(_RESULTS_SUM, {"source": "final"})
 
-    result = _retriever(FakeEmbedder(), vector, fts).search("metrics query")
+    result = _retriever(FakeEmbedder(), vector, fts).search("metrics query", "user-1")
 
     assert _value(_RESULTS_COUNT, {"source": "vector"}) == vector_count_before + 1
     assert _value(_RESULTS_SUM, {"source": "vector"}) == vector_sum_before
@@ -266,7 +266,7 @@ def test_vector_only_mode_records_no_fts_metrics():
     total_before = _value(_LATENCY_COUNT, {"stage": "total"})
 
     result = _retriever(FakeEmbedder(), FakeVector(hits=[_hit("a")]), fts=None).search(
-        "metrics query"
+        "metrics query", "user-1"
     )
 
     assert result.sources_used == ("vector",)
@@ -284,7 +284,7 @@ def test_no_query_or_expansion_text_in_metric_output():
         FakeVector(hits=[_hit("a")]),
         FakeFts(hits=[_hit("a")]),
         expander=QueryExpander(llm),
-    ).search("topsecret-query")
+    ).search("topsecret-query", "user-1")
 
     output = generate_latest(REGISTRY).decode()
     assert "topsecret-query" not in output

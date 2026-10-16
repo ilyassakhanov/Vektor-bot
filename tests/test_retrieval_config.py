@@ -26,6 +26,7 @@ BOOL_FIELDS: list[tuple[str, str]] = [
     ("KB_ENABLED", "kb_enabled"),
     ("KB_FTS_ENABLED", "kb_fts_enabled"),
     ("KB_EXPANSION_ENABLED", "kb_expansion_enabled"),
+    ("KB_RERANK_ENABLED", "kb_rerank_enabled"),
 ]
 
 
@@ -55,6 +56,8 @@ def test_defaults_when_all_unset() -> None:
     assert cfg.ollama_expansion_model == "qwen3:0.6b"
     assert cfg.kb_expansion_timeout == 10.0
     assert cfg.kb_expansion_temperature == 0.0
+    assert cfg.kb_rerank_enabled is True
+    assert cfg.kb_rerank_timeout == 10.0
     assert cfg.ollama_embed_model == "qwen3-embedding:0.6b"
 
 
@@ -251,9 +254,11 @@ def test_empty_model_name_falls_back_with_warning(
 def test_valid_float_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KB_EXPANSION_TIMEOUT", "2.5")
     monkeypatch.setenv("KB_EXPANSION_TEMPERATURE", "0.7")
+    monkeypatch.setenv("KB_RERANK_TIMEOUT", "3.5")
     cfg = RetrievalConfig.from_env()
     assert cfg.kb_expansion_timeout == 2.5
     assert cfg.kb_expansion_temperature == 0.7
+    assert cfg.kb_rerank_timeout == 3.5
 
 
 def test_zero_temperature_is_valid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -272,6 +277,20 @@ def test_invalid_timeout_falls_back_with_warning(
     cfg = RetrievalConfig.from_env()
     assert cfg.kb_expansion_timeout == 10.0
     assert "KB_EXPANSION_TIMEOUT" in caplog.text
+    assert value in caplog.text
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-3", "nan", "inf", "-inf"])
+def test_invalid_rerank_timeout_falls_back_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    value: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    monkeypatch.setenv("KB_RERANK_TIMEOUT", value)
+    cfg = RetrievalConfig.from_env()
+    assert cfg.kb_rerank_timeout == 10.0
+    assert "KB_RERANK_TIMEOUT" in caplog.text
     assert value in caplog.text
 
 

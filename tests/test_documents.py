@@ -18,43 +18,69 @@ import docx
 import pytest
 
 import documents
-from documents import SUPPORTED_EXTENSIONS, DocumentError, extract_text
+from documents import (
+    SUPPORTED_EXTENSIONS,
+    DocumentError,
+    extract_pages,
+    extract_text,
+)
 
 # --- Fixture builders (generated in-test, nothing committed) --------------------
 
 
-def _build_minimal_pdf(text: str) -> bytes:
-    """Build a one-page PDF whose page stream shows ``text`` via ``Tj``."""
-    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("latin-1")
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        (
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+def _build_multipage_pdf(texts: list[str]) -> bytes:
+    """Build an N-page PDF whose page i shows ``texts[i]`` via ``Tj``."""
+    font_number = 3 + 2 * len(texts)
+    page_numbers = [3 + 2 * i for i in range(len(texts))]
+    stream_numbers = [4 + 2 * i for i in range(len(texts))]
+    objects: dict[int, bytes] = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: (
+            b"<< /Type /Pages /Kids ["
+            + b" ".join(f"{number} 0 R".encode("ascii") for number in page_numbers)
+            + b"] /Count "
+            + str(len(texts)).encode("ascii")
+            + b" >>"
         ),
-        b"<< /Length "
-        + str(len(stream)).encode("ascii")
-        + b" >>\nstream\n"
-        + stream
-        + b"\nendstream",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-    ]
+        font_number: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    for i, text in enumerate(texts):
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("latin-1")
+        objects[page_numbers[i]] = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 "
+            + str(font_number).encode("ascii")
+            + b" 0 R >> >> /Contents "
+            + str(stream_numbers[i]).encode("ascii")
+            + b" 0 R >>"
+        )
+        objects[stream_numbers[i]] = (
+            b"<< /Length "
+            + str(len(stream)).encode("ascii")
+            + b" >>\nstream\n"
+            + stream
+            + b"\nendstream"
+        )
     out = bytearray(b"%PDF-1.4\n")
     offsets: list[int] = []
-    for number, body in enumerate(objects, start=1):
+    for number in range(1, font_number + 1):
         offsets.append(len(out))
-        out += f"{number} 0 obj\n".encode("ascii") + body + b"\nendobj\n"
+        out += f"{number} 0 obj\n".encode("ascii") + objects[number] + b"\nendobj\n"
     xref_offset = len(out)
-    out += f"xref\n0 {len(objects) + 1}\n".encode("ascii")
+    out += f"xref\n0 {font_number + 1}\n".encode("ascii")
     out += b"0000000000 65535 f \n"
     for offset in offsets:
         out += f"{offset:010d} 00000 n \n".encode("ascii")
     out += (
-        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"trailer\n<< /Size {font_number + 1} /Root 1 0 R >>\n"
         f"startxref\n{xref_offset}\n%%EOF\n"
     ).encode("ascii")
     return bytes(out)
+
+
+def _build_minimal_pdf(text: str) -> bytes:
+    """Build a one-page PDF whose page stream shows ``text`` via ``Tj``."""
+    return _build_multipage_pdf([text])
 
 
 def _build_docx(*paragraphs: str) -> bytes:
@@ -82,6 +108,22 @@ def test_txt_invalid_bytes_use_replacement_never_raise() -> None:
 
 def test_txt_empty_bytes_yield_empty_string() -> None:
     assert extract_text(b"", "empty.txt") == ""
+
+
+# --- .md ------------------------------------------------------------------------
+
+
+def test_md_extracts_raw_text_like_txt() -> None:
+    content = b"# Title\n\nSome **body** text."
+    assert extract_text(content, "readme.md") == "# Title\n\nSome **body** text."
+
+
+def test_md_extension_case_insensitive() -> None:
+    assert extract_text(b"body", "README.MD") == "body"
+
+
+def test_md_empty_bytes_yield_empty_string() -> None:
+    assert extract_text(b"", "empty.md") == ""
 
 
 # --- .pdf -----------------------------------------------------------------------
@@ -164,7 +206,54 @@ def test_filename_used_only_for_dispatch() -> None:
 
 def test_supported_extensions_is_exact_set() -> None:
     assert isinstance(SUPPORTED_EXTENSIONS, frozenset)
-    assert SUPPORTED_EXTENSIONS == frozenset({".txt", ".pdf", ".docx"})
+    assert SUPPORTED_EXTENSIONS == frozenset({".txt", ".md", ".pdf", ".docx"})
+
+
+# --- extract_pages ----------------------------------------------------------------
+
+
+def test_extract_pages_txt_md_docx_are_single_first_page() -> None:
+    assert extract_pages(b"hello", "note.txt") == [(1, "hello")]
+    assert extract_pages(b"# heading", "note.md") == [(1, "# heading")]
+    assert extract_pages(_build_docx("Para"), "notes.docx") == [(1, "Para")]
+
+
+def test_extract_pages_pdf_one_entry_per_page() -> None:
+    pages = extract_pages(_build_multipage_pdf(["Alpha page", "Beta page"]), "book.pdf")
+    assert [number for number, _text in pages] == [1, 2]
+    assert "Alpha page" in pages[0][1]
+    assert "Beta page" in pages[1][1]
+
+
+def test_extract_pages_pdf_keeps_empty_pages_with_empty_text() -> None:
+    """Page numbers stay stable: a text-less page stays as an empty entry."""
+    pages = extract_pages(_build_multipage_pdf(["Alpha", "", "Gamma"]), "book.pdf")
+    assert [number for number, _text in pages] == [1, 2, 3]
+    assert pages[1][1] == ""
+    assert "Alpha" in pages[0][1]
+    assert "Gamma" in pages[2][1]
+
+
+def test_extract_text_joins_page_texts_dropping_empty_pages() -> None:
+    text = extract_text(_build_multipage_pdf(["Alpha", "", "Gamma"]), "book.pdf")
+    assert "Alpha" in text
+    assert "Gamma" in text
+    assert text.index("Alpha") < text.index("Gamma")
+
+
+def test_extract_pages_unsupported_extension_raises() -> None:
+    with pytest.raises(DocumentError, match=r"\.exe"):
+        extract_pages(b"MZ fake binary", "virus.exe")
+
+
+def test_extract_pages_missing_extension_raises() -> None:
+    with pytest.raises(DocumentError):
+        extract_pages(b"some text", "README")
+
+
+def test_extract_pages_corrupt_pdf_raises_document_error() -> None:
+    with pytest.raises(DocumentError):
+        extract_pages(b"this is definitely not a pdf", "broken.pdf")
 
 
 def test_module_has_no_telegram_imports() -> None:

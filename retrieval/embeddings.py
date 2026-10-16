@@ -27,8 +27,8 @@ _DEFAULT_TIMEOUT = 120.0
 
 # float() proves a component is a finite binary64 — not that it survives
 # the float32 conversion the retrieval pipeline performs at every boundary
-# (to_blob serialization, VectorIndex query decoding). 1e39 is finite as a
-# Python float but overflows to inf in float32, poisoning cosine norms and
+# (to_blob serialization, vec0 query encoding). 1e39 is finite as a
+# Python float but overflows to inf in float32, poisoning norms and
 # rankings. Components must fit the float32 finite range.
 _F32_MAX = float(np.finfo(np.float32).max)
 
