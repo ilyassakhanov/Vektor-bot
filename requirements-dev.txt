@@ -1,0 +1,5 @@
+# Dev tools for quality gates and tests (CI installs these too).
+# Floors match the versions the project is currently green on.
+pytest>=9.1
+ruff>=0.16
+mypy>=2.3
