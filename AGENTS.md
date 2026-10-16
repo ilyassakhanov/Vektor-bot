@@ -6,7 +6,7 @@
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt  # dev tools: pytest, ruff, mypy
 cp .env.example .env  # then edit TELEGRAM_BOT_TOKEN
 ollama pull llama3.2 qwen3:0.6b qwen3-embedding:0.6b
 ```
@@ -103,6 +103,8 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `tools/kb.py` | `KbIngestTool`/`KbSearchTool` (`kb_ingest`/`kb_search`), `KbStack`, `StoreVecAdapter`/`StoreFtsAdapter` adapters |
 | `benchmarks/` | LLM benchmark (`prompts.json` + `run.py`) and retrieval benchmark (`retrieval_bench.py`) — require Ollama |
 | `tasks/` | Plan + checklist for the hybrid-search feature (`plan.md`, `todo.md`) |
+| `openspec/` | OpenSpec workspace: `specs/` — behavior source of truth; `changes/` — in-flight changes and the archive |
+| `scripts/` | Repo maintenance scripts (`check_openspec_archived.py` — CI archive-discipline check) |
 | `mypy.ini` | mypy configuration |
 
 ## Architecture
@@ -190,6 +192,10 @@ Messages with a document (.txt/.md/.pdf/.docx) are ingested by the bot before th
 
 `build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `HybridRetriever` additionally records `vektor_retrieval_expansion_total{status=ok|fallback}`, `vektor_retrieval_latency_seconds{stage=expansion|vector|fts|rerank|total}`, `vektor_retrieval_results{source=vector|fts|final}`, and `vektor_retrieval_rerank_total{status=ok|fallback}` — enum labels only. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
 
+## Spec-driven workflow
+
+Service behavior changes **only through an OpenSpec change**. `openspec/specs/` is the source of truth for behavior and is never edited by hand: first a change in `openspec/changes/<id>/` (proposal, tasks, spec deltas), then the implementation against its task list, then `openspec archive <id>` — the archive lands the deltas in `openspec/specs/` in the same PR that completes the tasks. CI fails a change whose tasks are all complete but which was not archived. Docs-only edits that do not change behavior (README, comments) do not need a change.
+
 ## Code conventions
 
 - `from __future__ import annotations` in every module
@@ -204,6 +210,7 @@ Messages with a document (.txt/.md/.pdf/.docx) are ingested by the bot before th
 ruff check .       # lint
 ruff format --check .  # format check
 mypy .             # type checking
+openspec validate --all --strict  # specs — same version as CI: npx --yes @fission-ai/openspec@1.14.1 validate --all --strict
 ```
 
 ## Testing
