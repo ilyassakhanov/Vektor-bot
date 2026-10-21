@@ -1,0 +1,54 @@
+schema: spec-driven
+
+context: |
+  Project: Vektor — Telegram long-polling bot with an autonomous AI agent.
+  The bot keeps one continuous conversation per chat, runs a bounded agent
+  loop over a local Ollama LLM, and gives it tools through a registry:
+  shell exec, an MCP CVE server (stdio JSON-RPC), and a knowledge base
+  (kb_ingest / kb_search) over a hybrid retrieval stack.
+
+  Stack: Python 3.14, pyTelegramBotAPI, httpx (no vendor SDKs for LLM or
+  Ollama), pypdf + python-docx (document extraction), Prometheus client,
+  ruff + mypy + pytest.
+
+  LLM layer: the Agent depends only on the LLM interface (llm/base.py);
+  OllamaLLM is selected in the bot.py composition root. Default models:
+  llama3.2 (agent), qwen3:0.6b (query expansion + rerank),
+  qwen3-embedding:0.6b (embeddings).
+
+  Retrieval: one SQLite file (documents + chunks + FTS5 + sqlite-vec vec0).
+  Pipeline: optional LLM query expansion -> batch embed -> vector and FTS
+  search in parallel -> RRF fusion (k=60) -> top-k -> optional pointwise
+  LLM rerank. Every stage degrades gracefully instead of failing.
+
+  Conventions: configuration is environment variables with warn-and-fallback
+  defaults (config.py setdefault — real env always wins); tool output is
+  capped with head+tail truncation; tests run offline via fakes and
+  httpx.MockTransport; user isolation is enforced at the SQL level with a
+  mandatory owner filter on every knowledge-base read.
+
+  Language: OpenSpec artifacts are written in English. Structural headings
+  and SHALL/MUST keywords stay in English by definition.
+
+rules:
+  design:
+    - "Prefer the boring construct; justify any abstraction that has no second caller today."
+    - "Keep decision logic out of adapters: selection, fusion and rendering rules live in pure functions that take data and return data."
+  tasks:
+    - "Each task names the files it touches or the command that proves it done, so a checkbox is verifiable without reading the diff twice."
+  proposal:
+    - "State what the code already does today, not what it should someday do; a proposal that smuggles in new behavior is a defect."
+
+operations:
+  apply:
+    guidance:
+      - "Follow DRY, KISS and YAGNI. Do not add a tool, layer, table or abstraction until a caller exists."
+      - "Configuration comes from environment variables with warn-and-fallback defaults; bad values never crash the bot at startup."
+      - "Retrieval degrades, never fails: expansion falls back to the original query, a failing source is skipped while the other still answers, rerank failure keeps RRF order."
+      - "Tool output that can be large is capped with head+tail truncation; the exit-code line of exec output is always preserved."
+      - "Tests run offline: fakes for the LLM, httpx.MockTransport for HTTP, tmp SQLite files for storage. A test that needs a network is an integration test and skips when the network is unreachable."
+      - "Never log or metric message text, prompts, responses, tool arguments or outputs, file contents or captions; documents are logged by file name and outcome only."
+      - "Quality gates before commit: ruff check ., ruff format --check ., mypy ., pytest, openspec validate --all --strict."
+  archive:
+    guidance:
+      - "Archive the change in the same pull request that closes its last task; otherwise its deltas never reach openspec/specs/ and CI fails on the archive check."

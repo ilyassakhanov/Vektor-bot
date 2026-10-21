@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The run token gets read-only permissions: CI never writes to the repo.
+permissions:
+  contents: read
+
+# A new push to a PR branch cancels the run for the stale commit; pushes to
+# main always run to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      # Separate steps: one combined step would report two unrelated
+      # problems as a single failure.
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy .
+      - run: python -m pytest
+
+  # A spec error otherwise surfaces only at archive time: a requirement
+  # without a scenario, a MODIFIED delta losing scenarios, an ADDED
+  # duplicate. --strict also catches overly long requirements. The CLI
+  # version is pinned: new checks arrive with an upgrade, not silently.
+  openspec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - run: npx --yes @fission-ai/openspec@1.14.1 validate --all --strict
+      # A change with all tasks complete is archived in the same PR —
+      # otherwise its deltas never reach openspec/specs/. Open changes are
+      # listed in the step summary.
+      # `shell: bash` opts into `-eo pipefail`: the default `bash -e`
+      # without pipefail would mask an npx failure whenever python3
+      # succeeds on its stdout.
+      - shell: bash
+        run: npx --yes @fission-ai/openspec@1.14.1 list --json | python3 scripts/check_openspec_archived.py
