@@ -23,6 +23,7 @@ import logging_config
 import metrics
 from agent.agent import Agent
 from agent.conversation import ConversationManager
+from agent.system_prompt import build_system_prompt
 from documents import DocumentError
 from llm import LLM, LLMError, OllamaLLM
 from llm.instrumented import InstrumentedLLM
@@ -218,10 +219,10 @@ def build_agent(
     tools: ToolRegistry,
     max_iterations: int | None = None,
 ) -> Agent:
-    """Build the agent with skills loaded from the skills/ directory."""
+    """Build the agent — base system prompt + skills from the skills/ directory."""
     skills_dir = _PROJECT_ROOT / "skills"
     loader = SkillLoader(skills_dir)
-    system_prompt = loader.system_prompt()
+    system_prompt = build_system_prompt(loader.system_prompt())
     if max_iterations is None:
         max_iterations = int(
             os.environ.get("AGENT_MAX_ITERATIONS", str(_DEFAULT_MAX_ITERATIONS))
