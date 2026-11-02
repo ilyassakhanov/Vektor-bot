@@ -1,8 +1,10 @@
-"""LLM-as-judge suite — live Ollama, gated (skip only when unreachable).
+"""LLM-as-judge suite — live Ollama, opt-in (``live`` marker,
+``VEKTOR_LIVE_TESTS=1``); skips when Ollama is down or the agent or judge
+model is missing.
 
 Env knobs (test-only by decision — deliberately NOT in .env.example or
-AGENTS.md service config; see openspec/changes/2026-10-22-agent-system-prompt/
-design.md "Decisions"):
+AGENTS.md service config; see
+openspec/changes/archive/2026-10-22-agent-system-prompt/design.md "Decisions"):
 
 - ``JUDGE_MODEL`` — judge model name (default ``qwen3.5:9b``); point it at
   another local model if the default judge proves too noisy.
@@ -43,7 +45,14 @@ import pytest
 import bot
 from llm.base import LLMError
 from llm.ollama import OllamaLLM
-from tests.ollama_probe import ollama_base_url, ollama_model, ollama_reachable
+from tests.ollama_probe import (
+    ollama_base_url,
+    ollama_has_model,
+    ollama_model,
+    ollama_reachable,
+)
+
+pytestmark = pytest.mark.live
 
 log = logging.getLogger("vektor.tests.llm_judge")
 
@@ -70,6 +79,10 @@ _DEFAULT_THRESHOLD = "0.8"
 def _require_ollama() -> None:
     if not ollama_reachable():
         pytest.skip("Ollama is not reachable")
+    judge_model = os.environ.get("JUDGE_MODEL", _DEFAULT_JUDGE_MODEL)
+    for model in (ollama_model(), judge_model):
+        if not ollama_has_model(model):
+            pytest.skip(f"Ollama model {model!r} is not pulled")
 
 
 def _strip_think(text: str) -> str:

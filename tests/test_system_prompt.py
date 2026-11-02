@@ -4,7 +4,7 @@ Covers ``agent/system_prompt.py`` (``BASE_PROMPT`` + ``build_system_prompt``)
 and the ``bot.build_agent`` wiring — base leads, skills appended with an
 exact ``"\\n\\n"`` separator, base alone when skills are empty. All
 deterministic, no Ollama/network. See
-openspec/changes/2026-10-22-agent-system-prompt/.
+openspec/changes/archive/2026-10-22-agent-system-prompt/.
 """
 
 from __future__ import annotations
@@ -15,10 +15,10 @@ import bot
 from agent.system_prompt import BASE_PROMPT, build_system_prompt
 from skills.loader import SkillLoader
 from tests.fakes import FakeLLM
-from tests.test_red_team import (
-    _LEAK_FRAGMENTS_BASE,
-    _LEAK_FRAGMENTS_SKILLS,
-    _normalize,
+from tests.redteam_fragments import (
+    LEAK_FRAGMENTS_BASE,
+    LEAK_FRAGMENTS_SKILLS,
+    normalize,
 )
 from tools.registry import ToolRegistry
 
@@ -47,10 +47,19 @@ def test_base_prompt_pins_reply_language_and_hides_tool_names() -> None:
     internal tool/function names are kept out of user-facing replies (the
     judge penalized Russian replies to English questions and treated named
     internal tools as hallucinations)."""
-    normalized = _normalize(BASE_PROMPT)
+    normalized = normalize(BASE_PROMPT)
     assert "same language as the user's latest message" in normalized
     assert "an english message gets an english reply" in normalized
     assert "internal tool or function names" in normalized
+
+
+def test_honesty_opener_follows_the_user_language() -> None:
+    """The "I don't know" opener may be said in the user's language, so it
+    does not contradict the reply-language rule; skill labels stay verbatim."""
+    normalized = normalize(BASE_PROMPT)
+    assert "or their equivalent in the user's language" in normalized
+    assert "не знаю" in normalized
+    assert "fixed labels that a skill requires" in normalized
 
 
 def test_build_system_prompt_appends_skills() -> None:
@@ -96,23 +105,21 @@ def test_build_agent_composes_base_then_skills() -> None:
 def test_red_team_leak_fragments_exist_in_their_sources() -> None:
     """Every red-team leak fragment really occurs in its source prompt.
 
-    Importing ``tests.test_red_team`` is offline-safe (its import-time canary
-    asserts compare environment values only — no probe, no network). This is
+    The fragments live in ``tests/redteam_fragments.py`` (shared with the
+    live red-team suite, so this offline test never imports it). This is
     the guard that stops future BASE_PROMPT or skill rewording from making
     leak cases pass vacuously: a fragment that no longer occurs in its source
     can never match a verbatim dump of that source. Fragments are matched
     against the SAME normalization the red-team suite applies to replies
     (lowercase, straight apostrophes, collapsed whitespace).
     """
-    base_normalized = _normalize(BASE_PROMPT)
-    for fragment in _LEAK_FRAGMENTS_BASE:
+    base_normalized = normalize(BASE_PROMPT)
+    for fragment in LEAK_FRAGMENTS_BASE:
         assert fragment in base_normalized, (
             f"base leak fragment no longer in BASE_PROMPT: {fragment!r}"
         )
-    skills_normalized = _normalize(
-        SkillLoader(_PROJECT_ROOT / "skills").system_prompt()
-    )
-    for fragment in _LEAK_FRAGMENTS_SKILLS:
+    skills_normalized = normalize(SkillLoader(_PROJECT_ROOT / "skills").system_prompt())
+    for fragment in LEAK_FRAGMENTS_SKILLS:
         assert fragment in skills_normalized, (
             f"skills leak fragment no longer in the skills prompt: {fragment!r}"
         )

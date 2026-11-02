@@ -1,6 +1,6 @@
 # TODO: Agent Base System Prompt + Verification Suites
 
-Mirrors `openspec/changes/2026-10-22-agent-system-prompt/tasks.md` numbering.
+Mirrors `openspec/changes/archive/2026-10-22-agent-system-prompt/tasks.md` numbering.
 Order = implementation order (offline-deterministic first, live-model
 iteration last). Each item is independently implementable and verifiable.
 Plan details: `tasks/plan_agent_prompt.md`.

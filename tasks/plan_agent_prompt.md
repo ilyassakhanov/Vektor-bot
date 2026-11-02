@@ -1,6 +1,6 @@
 # Implementation Plan: Agent Base System Prompt + Verification Suites
 
-OpenSpec change: `openspec/changes/2026-10-22-agent-system-prompt/`
+OpenSpec change: `openspec/changes/archive/2026-10-22-agent-system-prompt/`
 (proposal.md, design.md, tasks.md, `specs/agent-loop/spec.md` delta)
 
 ## Overview
