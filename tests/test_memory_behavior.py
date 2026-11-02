@@ -28,6 +28,9 @@ pytestmark = pytest.mark.live
 
 log = logging.getLogger("vektor.tests.memory_behavior")
 
+# Invented entities (Zorvath/Quelmaris) replace the assignment's «Алексей /
+# Амстердам»: real names could be guessed from the model's prior knowledge,
+# so a correct answer would not prove recall from conversation memory.
 _ENTITY_STATEMENT = "My name is Zorvath and I live in the city of Quelmaris."
 _RECALL_QUESTION = "What is my name and which city do I live in?"
 _NAME_QUESTION = "What is my name?"
