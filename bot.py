@@ -24,6 +24,7 @@ import metrics
 from agent.agent import Agent
 from agent.conversation import ConversationManager
 from agent.system_prompt import build_system_prompt
+from agent.validation import TELEGRAM_MESSAGE_LIMIT, split_reply, validate_input
 from documents import DocumentError
 from llm import LLM, LLMError, OllamaLLM
 from llm.instrumented import InstrumentedLLM
@@ -65,6 +66,15 @@ _DOCUMENT_ERROR_REPLY = "Sorry, I couldn't process that document."
 _LLM_ERROR_REPLY = "Sorry, I couldn't generate a response."
 _DOCUMENT_FALLBACK_NAME = "document"
 _AUTH_DENIED_REPLY = "Sorry, you are not allowed to use this bot."
+_EMPTY_MESSAGE_REPLY = "Your message is empty. Please send some text."
+_TOO_LONG_MESSAGE_REPLY = (
+    f"Your message is too long (over {TELEGRAM_MESSAGE_LIMIT} characters). "
+    "Please shorten it and try again."
+)
+_VALIDATION_REPLIES = {
+    "empty": _EMPTY_MESSAGE_REPLY,
+    "too_long": _TOO_LONG_MESSAGE_REPLY,
+}
 _DOCUMENT_RECEIVED_REPLY = "📄 Document received"
 _EXTRACTING_REPLY = "⏳ Extracting text…"
 _EMBEDDING_REPLY = "⏳ Generating embeddings…"
@@ -372,6 +382,22 @@ def handle_delete_command(
         reply_to(message, f'❌ No document named "{filename}" in your library.')
 
 
+def _send_reply(
+    reply_to: Callable[..., Any],
+    message: telebot.types.Message,
+    response: str,
+) -> None:
+    """Send an agent reply as ``split_reply`` chunks, in order, as plain text.
+
+    Blank (whitespace-only) chunks are skipped — Telegram rejects them with
+    "message text is empty". If nothing was sent (the whole reply is blank),
+    one ``_LLM_ERROR_REPLY`` is sent instead. Never passes ``parse_mode``.
+    """
+    chunks = [chunk for chunk in split_reply(response) if chunk.strip()]
+    for chunk in chunks or [_LLM_ERROR_REPLY]:
+        reply_to(message, chunk)
+
+
 def build_document_handler(
     bot: telebot.TeleBot,
     kb: KbStack,
@@ -460,7 +486,7 @@ def build_document_handler(
                 log.warning("agent error on document upload", exc_info=True)
                 reply_to(message, _LLM_ERROR_REPLY)
                 return
-            reply_to(message, response)
+            _send_reply(reply_to, message, response)
         finally:
             reset_user(principal_token)
 
@@ -484,6 +510,8 @@ def handle_message(
 
     Auth gate FIRST; the KB principal is set from ``from_user.id`` after it and
     reset in ``finally``; documents go to ``document_handler`` (None = disabled).
+    Text is then validated: an empty/oversized message gets one friendly reply
+    and never reaches the agent; accepted text is passed on scrubbed.
     """
     user = message.from_user
     log.info(
@@ -506,13 +534,18 @@ def handle_message(
                 return
             document_handler(message, reply_to)
             return
+        verdict = validate_input(message.text or "")
+        if not verdict.ok:
+            log.info("message rejected reason=%s", verdict.reason)
+            reply_to(message, _VALIDATION_REPLIES[verdict.reason])
+            return
         try:
-            response = conv.handle(message.chat.id, message.text or "")
+            response = conv.handle(message.chat.id, verdict.text)
         except LLMError as exc:
             log.warning("LLM error: %s", exc)
             reply_to(message, _LLM_ERROR_REPLY)
             return
-        reply_to(message, response)
+        _send_reply(reply_to, message, response)
     finally:
         reset_user(principal_token)
 
