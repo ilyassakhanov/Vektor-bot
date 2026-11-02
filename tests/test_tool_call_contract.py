@@ -8,7 +8,7 @@ is fed back to the LLM as the tool-role message of the next request.
 
 These tests pin existing behavior — a failure means the parse contract
 regressed (or was misunderstood), not a license to change ``llm/ollama.py``.
-See openspec/changes/2026-10-22-agent-system-prompt/.
+See openspec/changes/archive/2026-10-22-agent-system-prompt/.
 """
 
 from __future__ import annotations

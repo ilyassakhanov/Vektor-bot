@@ -1,4 +1,5 @@
-"""Memory behavior suite — live Ollama, gated (skip only when unreachable).
+"""Memory behavior suite — live Ollama, opt-in (``live`` marker,
+``VEKTOR_LIVE_TESTS=1``); skips when Ollama is down or the model is missing.
 
 Exercises the real memory path end-to-end: a real ``OllamaLLM``, the real
 composed system prompt via ``bot.build_agent``, and a real
@@ -16,7 +17,14 @@ import pytest
 import bot
 from agent.conversation import ConversationManager
 from llm.ollama import OllamaLLM
-from tests.ollama_probe import ollama_base_url, ollama_model, ollama_reachable
+from tests.ollama_probe import (
+    ollama_base_url,
+    ollama_has_model,
+    ollama_model,
+    ollama_reachable,
+)
+
+pytestmark = pytest.mark.live
 
 log = logging.getLogger("vektor.tests.memory_behavior")
 
@@ -46,6 +54,8 @@ def _mentions_any(normalized: str, forms: tuple[str, ...]) -> bool:
 def _require_ollama() -> None:
     if not ollama_reachable():
         pytest.skip("Ollama is not reachable")
+    if not ollama_has_model(ollama_model()):
+        pytest.skip(f"Ollama model {ollama_model()!r} is not pulled")
 
 
 def test_two_turn_entity_recall() -> None:

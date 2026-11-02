@@ -1,4 +1,5 @@
-"""Latency SLA suite — live Ollama, gated (skip only when unreachable).
+"""Latency SLA suite — live Ollama, opt-in (``live`` marker,
+``VEKTOR_LIVE_TESTS=1``); skips when Ollama is down or the model is missing.
 
 Two SLAs: time-to-first-token < 1.5 s and a full agent answer < 4 s.
 TTFT is measured by a test-local streaming POST to ``/api/chat``
@@ -8,9 +9,10 @@ decision: no dead production code for a metric only tests need), so
 warm-up precedes the timed call so a cold model load cannot masquerade as
 TTFT — steady-state responsiveness is what the SLA means.
 
-Both timed calls carry the PRODUCTION payload shape: the composed system
-prompt (BASE_PROMPT + skills, as a leading system message — the same shape
-``OllamaLLM.chat`` sends) and the real tool schemas from
+Both timed calls carry the PRODUCTION payload, built by
+``OllamaLLM.chat_payload`` (the same body ``OllamaLLM.chat`` sends, including
+``options.num_ctx``/``keep_alive`` when configured): the composed system
+prompt (BASE_PROMPT + skills) and the real tool schemas from
 ``bot.build_tool_registry(None)``. Measuring a bare prompt would time the
 model, not the bot (decision 2026-11-01).
 """
@@ -27,9 +29,17 @@ import pytest
 
 import bot
 from agent.system_prompt import build_system_prompt
-from llm.ollama import OllamaLLM, _tool_spec_to_ollama
+from llm.base import Message
+from llm.ollama import OllamaLLM
 from skills.loader import SkillLoader
-from tests.ollama_probe import ollama_base_url, ollama_model, ollama_reachable
+from tests.ollama_probe import (
+    ollama_base_url,
+    ollama_has_model,
+    ollama_model,
+    ollama_reachable,
+)
+
+pytestmark = pytest.mark.live
 
 log = logging.getLogger("vektor.tests.latency_sla")
 
@@ -40,24 +50,28 @@ _SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 
 def _production_chat_payload(model: str, *, stream: bool) -> dict[str, Any]:
-    """``/api/chat`` payload shaped like the bot's: system prompt + tools."""
+    """``/api/chat`` payload exactly as the bot builds it: system prompt +
+    tools + configured options, via ``OllamaLLM.chat_payload``."""
     system = build_system_prompt(SkillLoader(_SKILLS_DIR).system_prompt())
-    tools = [_tool_spec_to_ollama(s) for s in bot.build_tool_registry(None).specs()]
-    return {
-        "model": model,
-        "stream": stream,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": _TINY_PROMPT},
-        ],
-        "tools": tools,
-    }
+    specs = bot.build_tool_registry(None).specs()
+    llm = OllamaLLM(base_url=ollama_base_url(), model=model)
+    try:
+        return llm.chat_payload(
+            [Message(role="user", content=_TINY_PROMPT)],
+            specs,
+            system,
+            stream=stream,
+        )
+    finally:
+        llm.close()
 
 
 @pytest.fixture(autouse=True)
 def _require_ollama() -> None:
     if not ollama_reachable():
         pytest.skip("Ollama is not reachable")
+    if not ollama_has_model(ollama_model()):
+        pytest.skip(f"Ollama model {ollama_model()!r} is not pulled")
 
 
 def test_ttft_under_1_5s() -> None:

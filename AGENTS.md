@@ -101,6 +101,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `retrieval/rerank.py` | `Reranker` — pointwise LLM rerank of fused hits (ONE call, 0–10 scores, stable re-sort, truncate top-k); never raises, falls back to RRF order |
 | `retrieval/hybrid.py` | `HybridRetriever` — expand → batch embed → vector ‖ FTS → RRF → top-k → rerank; per-source degradation; `vektor_retrieval_*` instrumentation |
 | `tools/kb.py` | `KbIngestTool`/`KbSearchTool` (`kb_ingest`/`kb_search`), `KbStack`, `StoreVecAdapter`/`StoreFtsAdapter` adapters |
+| `agent/system_prompt.py` | `BASE_PROMPT` + `build_system_prompt()` — code-defined base prompt (persona, honesty, confidentiality, role integrity) that always leads the skills |
 | `benchmarks/` | LLM benchmark (`prompts.json` + `run.py`) and retrieval benchmark (`retrieval_bench.py`) — require Ollama |
 | `tasks/` | Plan + checklist for the hybrid-search feature (`plan.md`, `todo.md`) |
 | `openspec/` | OpenSpec workspace: `specs/` — behavior source of truth; `changes/` — in-flight changes and the archive |
@@ -229,6 +230,7 @@ python -m pytest
 - Document tests (`tests/test_documents.py`) build fixtures in-test — a handcrafted minimal PDF (known `Tj` text operator), a python-docx-generated DOCX, plain bytes — fully offline, no binary fixtures committed.
 - Document bot-flow tests (`tests/test_bot_documents.py`) use a fake TeleBot (records get_file/download_file, canned bytes or raises), a real kb stack over tmp SQLite with a deterministic fake embedder, and `ScriptedLLM`/`FakeLLM` — no network, no Ollama.
 - Retrieval-benchmark tests cover only the scoring math and labeled dataset — offline.
+- Live-model suites (`test_red_team.py`, `test_llm_judge.py`, `test_memory_behavior.py`, `test_latency_sla.py`) carry the `live` marker and are opt-in: `VEKTOR_LIVE_TESTS=1 python -m pytest -m live`. They skip when Ollama is down or a required model is not pulled (`tests/ollama_probe.py`). The red-team suite scrubs the environment to an allowlist (`tests/redteam_fragments.py`) before running model-chosen shell commands.
 - Benchmarks run via `python -m benchmarks.run` (agent, requires a running Ollama) and `python -m benchmarks.retrieval_bench` (retrieval modes; Recall@K/Precision@K/latency, requires a running Ollama); both are excluded from pytest.
 
 ### Test coverage

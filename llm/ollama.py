@@ -168,6 +168,33 @@ class OllamaLLM(LLM):
 
     # --- multi-turn chat with tools ----------------------------------------
 
+    def chat_payload(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system: str = "",
+        *,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        """The ``/api/chat`` request body :meth:`chat` sends.
+
+        Public so callers that need the exact production shape (e.g. the
+        streaming latency test) do not rebuild it by hand. ``chat`` always
+        uses ``stream=False``.
+        """
+        ollama_messages = [_message_to_ollama(m) for m in messages]
+        if system:
+            ollama_messages.insert(0, {"role": "system", "content": system})
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "stream": stream,
+            "messages": ollama_messages,
+        }
+        if tools:
+            payload["tools"] = [_tool_spec_to_ollama(t) for t in tools]
+        self._apply_options(payload)
+        return payload
+
     def chat(
         self,
         messages: list[Message],
@@ -191,17 +218,7 @@ class OllamaLLM(LLM):
         log.debug(
             "chat model=%s msgs=%d tools=%d", self._model, len(messages), len(tools)
         )
-        ollama_messages = [_message_to_ollama(m) for m in messages]
-        if system:
-            ollama_messages.insert(0, {"role": "system", "content": system})
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "stream": False,
-            "messages": ollama_messages,
-        }
-        if tools:
-            payload["tools"] = [_tool_spec_to_ollama(t) for t in tools]
-        self._apply_options(payload)
+        payload = self.chat_payload(messages, tools, system)
 
         try:
             resp = self._client.post(
