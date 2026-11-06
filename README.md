@@ -5,7 +5,7 @@ A Telegram bot that bridges chats to a local LLM (via [Ollama](https://ollama.co
 ## Features
 
 - Telegram long-polling via [pyTelegramBotAPI](https://github.com/eternnoir/pyTelegramBotAPI)
-- Bounded agentic loop with tool calling (`exec`, MCP CVE tool, knowledge-base tools)
+- Bounded agentic loop with tool calling (allowlisted `exec`, MCP CVE tool, knowledge-base tools), a wall-clock budget and per-user rate limiting
 - RAG knowledge base: upload `.txt/.md/.pdf/.docx` → chunking → embeddings → hybrid retrieval (sqlite-vec ‖ FTS5 → RRF fusion → LLM rerank)
 - Per-user isolation: every knowledge-base read and write is SQL-scoped by the Telegram user id
 - `/documents` and `/delete` commands to manage your uploaded documents
@@ -153,7 +153,9 @@ One SQLite file (`KB_DB_PATH`, default `data/vektor.db`), four tables plus metad
 
 - The `ALLOWED_USERNAMES` allowlist is the auth gate and runs FIRST — unauthorized users' messages and documents are never processed or downloaded. It is an access gate only; multiple users are fine because KB data is scoped per numeric id.
 - Everything runs locally: Ollama + one SQLite file. No third-party API calls.
-- Secrets live in `.env` (gitignored); the MCP CVE server subprocess runs with a scrubbed environment; the `exec` tool is bounded by a timeout and an output cap.
+- Secrets live in `.env` (gitignored); the MCP CVE server subprocess runs with a scrubbed environment.
+- The `exec` tool never uses a shell: it runs only allowlisted, network read-only commands (`curl` over https to public hosts, `dig`, `nslookup`, `whois`, `host`) with per-command argument rules, a scrubbed environment, a temporary working directory, resource limits, a byte-capped output and a process-group kill on timeout. Process, file and host commands (`ps`, `kill`, `rm`, …) are rejected in code, whatever the model is told.
+- Each user gets one in-flight message and a sliding-window message limit; each agent run has a wall-clock budget and a per-reply tool-call cap.
 - Logs are JSON with redaction; message text, prompts, tool arguments/outputs and file contents are never logged.
 
 ### Bonus features
@@ -205,7 +207,7 @@ Secrets and settings live in `.env` (gitignored). Real environment variables alw
 | `documents.py` | Text extraction — `extract_pages()` / `extract_text()` for .txt/.md/.pdf/.docx (pypdf + python-docx, Telegram-free) |
 | `llm/` | Provider-agnostic `LLM` interface (`base.py`), `OllamaLLM` (`ollama.py`), metrics wrapper (`instrumented.py`) |
 | `agent/` | Bounded agentic loop, per-chat `ConversationManager`, CVE selector |
-| `tools/` | `Tool` interface, registry, `ExecTool`, MCP client + CVE tool adapter, `kb_ingest`/`kb_search` |
+| `tools/` | `Tool` interface, registry, `ExecTool` (allowlisted, shell-free, sandboxed), MCP client + CVE tool adapter, `kb_ingest`/`kb_search` |
 | `skills/` | `.md` instruction files discovered dynamically and injected into the system prompt |
 | `retrieval/` | Chunking, embeddings, query expansion, sqlite-vec + FTS5 store, RRF fusion, reranker, hybrid retriever, per-user principal |
 | `mcp_servers/cve_server.py` | CVE MCP tool served over stdio JSON-RPC |
