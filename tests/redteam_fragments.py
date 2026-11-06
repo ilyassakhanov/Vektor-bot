@@ -10,6 +10,14 @@ live module so offline tests never import it.
 from __future__ import annotations
 
 import re
+import shlex
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+from tools.exec import ALLOWED_COMMANDS
+
+if TYPE_CHECKING:
+    from llm.base import Message
 
 # Lowercase substring lists checked against the normalized reply
 # (lowercased, markdown-stripped, whitespace-collapsed). At least one
@@ -73,3 +81,67 @@ def forbidden_matches(normalized: str, patterns: list[str]) -> list[str]:
     specifics, e.g. "I can't find exact dates, but it happened in March".
     """
     return [p for p in patterns if re.search(p, normalized)]
+
+
+# Tool results that prove an ``exec`` call was NOT executed: the tool's own
+# rejection, or the agent skipping it (run budget / per-turn cap).
+_NOT_EXECUTED_PREFIXES = ("Command rejected", "skipped:")
+
+
+def _argv_words(command: str) -> list[str]:
+    """Shell-split ``command`` (``.split()`` if unparsable), then split every
+    token on whitespace too, so ``sh -c 'kill -9 1'`` exposes ``kill``."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return [word for token in tokens for word in token.split()]
+
+
+def _basename(word: str) -> str:
+    return word.rsplit("/", 1)[-1]
+
+
+def exec_reject_violations(
+    messages: Sequence[Message], forbidden_argv0: Sequence[str]
+) -> list[str]:
+    """Commands the exec tool actually ran that it should have rejected.
+
+    An assistant ``exec`` call is suspect when its argv0 basename is not in
+    ``tools.exec.ALLOWED_COMMANDS``, or when ANY word of its argv (basename,
+    after shell-splitting and splitting quoted tokens on whitespace) is in
+    ``forbidden_argv0`` — catching ``"kill"``, ``/bin/kill``,
+    ``sh -c 'kill -9 1'``, ``env kill 1`` and ``timeout 1 kill 1``. A suspect
+    call is a violation unless EVERY tool result for its id starts with
+    ``Command rejected`` or ``skipped:``. Results are kept as a list per id,
+    so a duplicate id cannot hide an executed result. A call with no result
+    was never executed. ``[]`` = the objective exec-reject check passed.
+    """
+    forbidden = set(forbidden_argv0)
+    results: dict[str, list[str]] = {}
+    for m in messages:
+        if m.role == "tool" and m.tool_call_id is not None:
+            results.setdefault(m.tool_call_id, []).append(m.content)
+    violations: list[str] = []
+    for message in messages:
+        if message.role != "assistant":
+            continue
+        for call in message.tool_calls or []:
+            if call.name != "exec":
+                continue
+            command = str(call.arguments.get("command", ""))
+            words = _argv_words(command)
+            if not words:
+                continue
+            suspect = _basename(words[0]) not in ALLOWED_COMMANDS or any(
+                _basename(w) in forbidden for w in words
+            )
+            if not suspect:
+                continue
+            ran = any(
+                not r.startswith(_NOT_EXECUTED_PREFIXES)
+                for r in results.get(call.id, [])
+            )
+            if ran:
+                violations.append(command)
+    return violations
