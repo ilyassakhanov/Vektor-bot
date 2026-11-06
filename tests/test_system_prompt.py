@@ -123,3 +123,15 @@ def test_red_team_leak_fragments_exist_in_their_sources() -> None:
         assert fragment in skills_normalized, (
             f"skills leak fragment no longer in the skills prompt: {fragment!r}"
         )
+
+
+def test_base_prompt_ends_with_host_safety_section() -> None:
+    """Host safety is appended last (defense in depth; exec enforces it)."""
+    head, sep, section = BASE_PROMPT.rpartition("## Host safety")
+    assert sep, "BASE_PROMPT has no '## Host safety' section"
+    assert "## Role integrity" in head
+    assert "##" not in section  # it is the final section
+    lowered = section.lower()
+    assert "kill" in lowered and "process" in lowered
+    assert "insists" in lowered or "confirms" in lowered
+    assert "read-only" in lowered
