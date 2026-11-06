@@ -6,6 +6,7 @@ Run with: python bot.py
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -21,8 +22,15 @@ import config
 import documents
 import logging_config
 import metrics
-from agent.agent import Agent
+from agent.agent import DEFAULT_MAX_TOOL_CALLS_PER_TURN, Agent
 from agent.conversation import ConversationManager
+from agent.rate_limit import (
+    DEFAULT_MAX_PER_WINDOW,
+    DEFAULT_WINDOW_S,
+    RateLimiter,
+)
+from agent.system_prompt import build_system_prompt
+from agent.validation import TELEGRAM_MESSAGE_LIMIT, split_reply, validate_input
 from documents import DocumentError
 from llm import LLM, LLMError, OllamaLLM
 from llm.instrumented import InstrumentedLLM
@@ -56,6 +64,9 @@ log = logging.getLogger("vektor.bot")
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _DEFAULT_MAX_ITERATIONS = 8
 _DEFAULT_METRICS_PORT = 9100
+_DEFAULT_WORKER_THREADS = 4
+_MAX_WORKER_THREADS = 64
+_DEFAULT_MAX_RUN_SECONDS = 120.0
 _DEFAULT_MCP_COMMAND: list[str] = [
     sys.executable,
     str(_PROJECT_ROOT / "mcp_servers" / "cve_server.py"),
@@ -64,6 +75,22 @@ _DOCUMENT_ERROR_REPLY = "Sorry, I couldn't process that document."
 _LLM_ERROR_REPLY = "Sorry, I couldn't generate a response."
 _DOCUMENT_FALLBACK_NAME = "document"
 _AUTH_DENIED_REPLY = "Sorry, you are not allowed to use this bot."
+_EMPTY_MESSAGE_REPLY = "Your message is empty. Please send some text."
+_TOO_LONG_MESSAGE_REPLY = (
+    f"Your message is too long (over {TELEGRAM_MESSAGE_LIMIT} characters). "
+    "Please shorten it and try again."
+)
+_VALIDATION_REPLIES = {
+    "empty": _EMPTY_MESSAGE_REPLY,
+    "too_long": _TOO_LONG_MESSAGE_REPLY,
+}
+_BUSY_REPLY = (
+    "I'm still working on your previous message — please wait for it to finish."
+)
+_RATE_LIMITED_REPLY = (
+    "You're sending messages too fast. Please wait a minute and try again."
+)
+_RATE_LIMIT_REPLIES = {"in_flight": _BUSY_REPLY, "window": _RATE_LIMITED_REPLY}
 _DOCUMENT_RECEIVED_REPLY = "📄 Document received"
 _EXTRACTING_REPLY = "⏳ Extracting text…"
 _EMBEDDING_REPLY = "⏳ Generating embeddings…"
@@ -218,10 +245,10 @@ def build_agent(
     tools: ToolRegistry,
     max_iterations: int | None = None,
 ) -> Agent:
-    """Build the agent with skills loaded from the skills/ directory."""
+    """Build the agent — base system prompt + skills from the skills/ directory."""
     skills_dir = _PROJECT_ROOT / "skills"
     loader = SkillLoader(skills_dir)
-    system_prompt = loader.system_prompt()
+    system_prompt = build_system_prompt(loader.system_prompt())
     if max_iterations is None:
         max_iterations = int(
             os.environ.get("AGENT_MAX_ITERATIONS", str(_DEFAULT_MAX_ITERATIONS))
@@ -231,7 +258,50 @@ def build_agent(
         tools=tools,
         system_prompt=system_prompt,
         max_iterations=max_iterations,
+        max_run_seconds=_max_run_seconds_from_env(),
+        max_tool_calls_per_turn=_max_tool_calls_per_turn_from_env(),
     )
+
+
+def _max_tool_calls_per_turn_from_env() -> int:
+    """Read ``AGENT_MAX_TOOL_CALLS_PER_TURN`` (default 4; invalid or < 1 warns)."""
+    raw = os.environ.get("AGENT_MAX_TOOL_CALLS_PER_TURN")
+    if raw is None:
+        return DEFAULT_MAX_TOOL_CALLS_PER_TURN
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        log.warning(
+            "Invalid AGENT_MAX_TOOL_CALLS_PER_TURN %r, using default %d",
+            raw,
+            DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+        )
+        return DEFAULT_MAX_TOOL_CALLS_PER_TURN
+    return value
+
+
+def _max_run_seconds_from_env() -> float:
+    """Read ``AGENT_MAX_RUN_SECONDS`` (default 120; ``<= 0`` disables the budget).
+
+    A non-numeric value warns and falls back to the default.
+    """
+    raw = os.environ.get("AGENT_MAX_RUN_SECONDS")
+    if raw is None:
+        return _DEFAULT_MAX_RUN_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if math.isfinite(value):
+        return value
+    log.warning(
+        "Invalid AGENT_MAX_RUN_SECONDS %r, using default %g",
+        raw,
+        _DEFAULT_MAX_RUN_SECONDS,
+    )
+    return _DEFAULT_MAX_RUN_SECONDS
 
 
 def build_conversation_manager(
@@ -268,6 +338,59 @@ def _metrics_port_from_env() -> int:
             "Invalid METRICS_PORT %r, using default %d", raw, _DEFAULT_METRICS_PORT
         )
         return _DEFAULT_METRICS_PORT
+
+
+def _worker_threads_from_env() -> int:
+    """Read ``BOT_WORKER_THREADS`` — default 4; invalid or < 1 warns and uses 4.
+
+    Values above 64 warn and are clamped to 64.
+    """
+    raw = os.environ.get("BOT_WORKER_THREADS")
+    if raw is None:
+        return _DEFAULT_WORKER_THREADS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        log.warning(
+            "Invalid BOT_WORKER_THREADS %r, using default %d",
+            raw,
+            _DEFAULT_WORKER_THREADS,
+        )
+        return _DEFAULT_WORKER_THREADS
+    if value > _MAX_WORKER_THREADS:
+        log.warning(
+            "BOT_WORKER_THREADS %d is above the maximum, using %d",
+            value,
+            _MAX_WORKER_THREADS,
+        )
+        return _MAX_WORKER_THREADS
+    return value
+
+
+def _positive_env(name: str, default: float, parse: Callable[[str], float]) -> float:
+    """Read a positive number from ``name``; warn and fall back on bad values."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = parse(raw)
+    except ValueError:
+        value = math.nan
+    if not (math.isfinite(value) and value > 0):
+        log.warning("Invalid %s %r, using default %s", name, raw, default)
+        return default
+    return value
+
+
+def build_rate_limiter() -> RateLimiter:
+    """Build the per-user limiter from ``RATE_LIMIT_MAX_MESSAGES``/``RATE_LIMIT_WINDOW_S``."""
+    max_messages = int(
+        _positive_env("RATE_LIMIT_MAX_MESSAGES", DEFAULT_MAX_PER_WINDOW, int)
+    )
+    window_s = _positive_env("RATE_LIMIT_WINDOW_S", DEFAULT_WINDOW_S, float)
+    return RateLimiter(max_per_window=max_messages, window_s=window_s)
 
 
 def _mcp_command_from_env() -> list[str]:
@@ -371,6 +494,22 @@ def handle_delete_command(
         reply_to(message, f'❌ No document named "{filename}" in your library.')
 
 
+def _send_reply(
+    reply_to: Callable[..., Any],
+    message: telebot.types.Message,
+    response: str,
+) -> None:
+    """Send an agent reply as ``split_reply`` chunks, in order, as plain text.
+
+    Blank (whitespace-only) chunks are skipped — Telegram rejects them with
+    "message text is empty". If nothing was sent (the whole reply is blank),
+    one ``_LLM_ERROR_REPLY`` is sent instead. Never passes ``parse_mode``.
+    """
+    chunks = [chunk for chunk in split_reply(response) if chunk.strip()]
+    for chunk in chunks or [_LLM_ERROR_REPLY]:
+        reply_to(message, chunk)
+
+
 def build_document_handler(
     bot: telebot.TeleBot,
     kb: KbStack,
@@ -459,7 +598,7 @@ def build_document_handler(
                 log.warning("agent error on document upload", exc_info=True)
                 reply_to(message, _LLM_ERROR_REPLY)
                 return
-            reply_to(message, response)
+            _send_reply(reply_to, message, response)
         finally:
             reset_user(principal_token)
 
@@ -478,11 +617,17 @@ def handle_message(
     reply_to,
     allowed_usernames: set[str] | frozenset[str] | None = None,
     document_handler: Callable[..., None] | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> None:
     """Process a single message: route through the Agent and reply via ``reply_to``.
 
     Auth gate FIRST; the KB principal is set from ``from_user.id`` after it and
     reset in ``finally``; documents go to ``document_handler`` (None = disabled).
+    Text is then validated: an empty/oversized message gets one friendly reply
+    and never reaches the agent; accepted text is passed on scrubbed.
+    With ``rate_limiter``, every authorized message (uploads and ``/new``
+    included) must acquire a slot first; a rejection sends one reply and
+    nothing else, and an acquired slot is released in ``finally``.
     """
     user = message.from_user
     log.info(
@@ -498,35 +643,67 @@ def handle_message(
         return
     principal_token = set_user(str(user.id) if user is not None else "0")
     try:
-        doc = getattr(message, "document", None)
-        if doc is not None:
-            if document_handler is None:
-                reply_to(message, "Document uploads are not enabled.")
-                return
-            document_handler(message, reply_to)
+        if rate_limiter is None:
+            _route_message(message, conv, reply_to, document_handler)
+            return
+        principal = _principal_id(message)
+        decision = rate_limiter.try_acquire(principal)
+        if not decision.ok:
+            reason = decision.reason or "window"
+            log.info("rate limited user=%s reason=%s", principal, reason)
+            metrics.rate_limited_total.labels(reason=reason).inc()
+            reply_to(message, _RATE_LIMIT_REPLIES[reason])
             return
         try:
-            response = conv.handle(message.chat.id, message.text or "")
-        except LLMError as exc:
-            log.warning("LLM error: %s", exc)
-            reply_to(message, _LLM_ERROR_REPLY)
-            return
-        reply_to(message, response)
+            _route_message(message, conv, reply_to, document_handler)
+        finally:
+            rate_limiter.release(principal)
     finally:
         reset_user(principal_token)
+
+
+def _route_message(
+    message: telebot.types.Message,
+    conv: ConversationManager,
+    reply_to,
+    document_handler: Callable[..., None] | None,
+) -> None:
+    """Document branch, then validation, then the agent (principal already set)."""
+    doc = getattr(message, "document", None)
+    if doc is not None:
+        if document_handler is None:
+            reply_to(message, "Document uploads are not enabled.")
+            return
+        document_handler(message, reply_to)
+        return
+    verdict = validate_input(message.text or "")
+    if not verdict.ok:
+        log.info("message rejected reason=%s", verdict.reason)
+        reply_to(message, _VALIDATION_REPLIES[verdict.reason])
+        return
+    try:
+        response = conv.handle(message.chat.id, verdict.text)
+    except LLMError as exc:
+        log.warning("LLM error: %s", exc)
+        reply_to(message, _LLM_ERROR_REPLY)
+        return
+    _send_reply(reply_to, message, response)
 
 
 def create_bot(
     conv: ConversationManager,
     allowed_usernames: frozenset[str] | None = None,
     kb: KbStack | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> telebot.TeleBot:
     """Wire up a TeleBot with the injected ConversationManager.
 
     Command handlers (``/documents``, ``/delete``) register BEFORE the catch-all
     handler (TeleBot tests in registration order); with ``kb``, uploads enabled.
+    ``rate_limiter`` (None = off) gates the catch-all handler; the worker
+    thread count comes from ``BOT_WORKER_THREADS``.
     """
-    bot = telebot.TeleBot(BOT_TOKEN)
+    bot = telebot.TeleBot(BOT_TOKEN, num_threads=_worker_threads_from_env())
     store = kb.store if kb is not None else None
     document_handler = build_document_handler(bot, kb, conv) if kb is not None else None
 
@@ -540,7 +717,14 @@ def create_bot(
 
     @bot.message_handler(func=lambda m: True, content_types=["text", "document"])
     def on_message(message: telebot.types.Message) -> None:
-        handle_message(message, conv, bot.reply_to, allowed_usernames, document_handler)
+        handle_message(
+            message,
+            conv,
+            bot.reply_to,
+            allowed_usernames,
+            document_handler,
+            rate_limiter=rate_limiter,
+        )
 
     return bot
 
@@ -587,7 +771,7 @@ def main() -> None:
             log.info("Allowed users: %d", len(allowed))
         else:
             log.warning("No ALLOWED_USERNAMES set — all users denied.")
-        bot = create_bot(conv, allowed, kb=kb)
+        bot = create_bot(conv, allowed, kb=kb, rate_limiter=build_rate_limiter())
         log.info("Starting bot (polling)...")
         try:
             bot.infinity_polling()

@@ -49,6 +49,24 @@ tool_duration_seconds = Histogram(
     ["tool_name"],
 )
 
+exec_rejected_total = Counter(
+    "vektor_exec_rejected_total",
+    "exec tool commands rejected before spawning, by reason "
+    "(metachar, not_allowed, bad_arg, parse)",
+    ["reason"],
+)
+
+rate_limited_total = Counter(
+    "vektor_rate_limited_total",
+    "Messages rejected by the per-user rate limiter, by reason (in_flight, window)",
+    ["reason"],
+)
+
+agent_budget_exceeded_total = Counter(
+    "vektor_agent_budget_exceeded_total",
+    "Agent runs stopped by the wall-clock budget (AGENT_MAX_RUN_SECONDS)",
+)
+
 mcp_server_up = Gauge(
     "vektor_mcp_server_up",
     "MCP server subprocess state (1=up, 0=down)",
