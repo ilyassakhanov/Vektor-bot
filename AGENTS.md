@@ -21,6 +21,33 @@ python bot.py
 
 Long-polling — no webhook or server needed. Ctrl-C to stop.
 
+### Docker (alternative)
+
+```bash
+docker compose up -d --build   # hardened single container; Ollama stays on the host
+docker compose logs -f vektor
+```
+
+Same `.env`. The image is non-root (10001), with a read-only root filesystem, all capabilities dropped, no-new-privileges, pids/mem/cpu caps, tini and `restart: unless-stopped`. The process-control binaries (`ps`, `kill`, …) are removed from the image. The KB lives in the `vektor-data` volume at `/data`. README "Run in Docker" covers migration, monitoring, the hardening table and the manual checklist. Don't build images locally on a resource-limited machine; CI builds them.
+
+Compose `environment:` overrides these `.env` keys inside the container:
+
+| Key | Container value |
+|---|---|
+| `OLLAMA_BASE_URL` | `${VEKTOR_OLLAMA_BASE_URL:-http://host.docker.internal:11434}` |
+| `KB_DB_PATH` | `/data/vektor.db` |
+| `METRICS_PORT` | `9101` (published on `127.0.0.1:9101` only) |
+| `LOKI_PUSH_URL` | `${VEKTOR_LOKI_PUSH_URL:-}` (empty = stderr only) |
+
+Compose-only knobs (shell variables read by `compose.yaml`, not `.env` keys):
+
+| Key | Default | Purpose |
+|---|---|---|
+| `VEKTOR_ENV_FILE` | `.env` | Env file passed to the container (CI uses a dummy file) |
+| `VEKTOR_IMAGE` | `vektor:local` | Image tag to build/run (CI reuses `vektor:ci`) |
+| `VEKTOR_OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Ollama URL seen from the container |
+| `VEKTOR_LOKI_PUSH_URL` | empty | Loki push URL, e.g. `http://loki.192.168.5.15.nip.io/loki/api/v1/push` (routed through `extra_hosts` → `host-gateway`) |
+
 ## Environment
 
 Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and sets `os.environ` — real environment variables always take precedence (uses `setdefault`, never overwrites).
@@ -115,6 +142,9 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `openspec/` | OpenSpec workspace: `specs/` — behavior source of truth; `changes/` — in-flight changes and the archive |
 | `scripts/` | Repo maintenance scripts (`check_openspec_archived.py` — CI archive-discipline check) |
 | `mypy.ini` | mypy configuration |
+| `Dockerfile` | Hardened runtime image — `python:3.14-slim-trixie`, venv builder stage, exec binaries (`curl dig nslookup whois host`) present, process-control binaries removed (build fails otherwise), non-root 10001, `/metrics` `HEALTHCHECK` |
+| `compose.yaml` | `vektor` service — read-only rootfs, `cap_drop: ALL`, no-new-privileges, pids/mem/cpu limits, tini, `restart: unless-stopped`, loopback-only port, `vektor-data` volume on `/data` |
+| `.dockerignore` | Keeps `.env`, `data/`, `tests/`, `.git/`, `.venv/`, tooling dirs out of the build context (`!.env.example` is the only re-include) |
 
 ## Architecture
 
@@ -253,6 +283,7 @@ python -m pytest
 - Document tests (`tests/test_documents.py`) build fixtures in-test — a handcrafted minimal PDF (known `Tj` text operator), a python-docx-generated DOCX, plain bytes — fully offline, no binary fixtures committed.
 - Document bot-flow tests (`tests/test_bot_documents.py`) use a fake TeleBot (records get_file/download_file, canned bytes or raises), a real kb stack over tmp SQLite with a deterministic fake embedder, and `ScriptedLLM`/`FakeLLM` — no network, no Ollama.
 - Retrieval-benchmark tests cover only the scoring math and labeled dataset — offline.
+- Docker config tests (`tests/test_docker_config.py`) check the hardening invariants of `Dockerfile` (runtime stage only), `compose.yaml` (the `vektor` service block), `.dockerignore` and the CI `docker` job with plain text/regex parsing — no pyyaml, no docker daemon, offline. The CI `docker` job builds the image and asserts the same invariants inside it.
 - Live-model suites (`test_red_team.py`, `test_llm_judge.py`, `test_memory_behavior.py`, `test_latency_sla.py`) carry the `live` marker and are opt-in: `VEKTOR_LIVE_TESTS=1 python -m pytest -m live`. They skip when Ollama is down or a required model is not pulled (`tests/ollama_probe.py`). The red-team suite scrubs the environment to an allowlist (`tests/redteam_fragments.py`) before running model-chosen commands. Its dataset (`tests/datasets/redteam_dataset.json`) has 16 cases, 2 of them in Russian and 2 `exec-reject` cases (`exec-abuse-kill`, `exec-abuse-ps`) that assert via `exec_reject_violations` that no forbidden binary actually ran.
 - Benchmarks run via `python -m benchmarks.run` (agent, requires a running Ollama) and `python -m benchmarks.retrieval_bench` (retrieval modes; Recall@K/Precision@K/latency, requires a running Ollama); both are excluded from pytest.
 
