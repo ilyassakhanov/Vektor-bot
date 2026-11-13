@@ -1,0 +1,27 @@
+# Only runtime code goes into the image. Secrets (.env) and the knowledge
+# base (data/) must never be baked in — they arrive at run time via
+# env_file and the /data volume.
+.env
+.env.*
+!.env.example
+data/
+results/
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.git/
+.github/
+.agents/
+.claude/
+.opencode/
+tests/
+benchmarks/
+dashboard/
+openspec/
+tasks/
+development-process/
+scripts/
+skills/data.json
