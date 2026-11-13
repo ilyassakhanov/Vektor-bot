@@ -36,6 +36,82 @@ python bot.py
 
 The bot polls Telegram for updates until you stop it with `Ctrl-C`.
 
+## Run in Docker
+
+The bot can also run in one hardened container. The bot, its MCP CVE subprocess and every `exec` child run inside it. Ollama and the monitoring stack stay on the host.
+
+```bash
+cp .env.example .env            # then edit TELEGRAM_BOT_TOKEN (same file as bare metal)
+docker compose up -d --build
+docker compose ps               # STATUS should become "healthy"
+docker compose logs -f vektor
+docker compose down             # stop; the KB volume is kept
+```
+
+- **Ollama** runs on the host. The container reaches it at `http://host.docker.internal:11434` (mapped to `host-gateway` in `compose.yaml`). Set `VEKTOR_OLLAMA_BASE_URL` in your shell to use another address.
+- **Overrides** — `compose.yaml` sets `OLLAMA_BASE_URL`, `KB_DB_PATH=/data/vektor.db`, `METRICS_PORT=9101` and `LOKI_PUSH_URL` itself. These win over the same keys in `.env`. Everything else comes from `.env`.
+- **Compose-only knobs** (shell variables, not `.env` keys): `VEKTOR_ENV_FILE` (env file path, default `.env`), `VEKTOR_IMAGE` (image tag, default `vektor:local`), `VEKTOR_OLLAMA_BASE_URL`, `VEKTOR_LOKI_PUSH_URL`.
+
+### One-time KB migration
+
+The knowledge base lives in the named volume `vektor-data`, mounted at `/data`. To bring over an existing `data/vektor.db`:
+
+```bash
+# 1. Stop the bare-metal bot first. Two pollers on one token make Telegram
+#    answer 409 Conflict, and a stopped bot leaves a consistent SQLite file.
+# 2. Create the container without starting it, then copy the file in.
+docker compose create
+docker compose cp data/vektor.db vektor:/data/vektor.db
+# 3. docker compose cp creates the file as root; hand it to 10001:
+docker compose run --rm --no-deps --user 0:0 --cap-add CHOWN --cap-add DAC_OVERRIDE \
+  vektor chown 10001:10001 /data/vektor.db
+docker compose up -d
+```
+
+### Monitoring
+
+- `/metrics` is published only on the host loopback, `127.0.0.1:9101`. The k3s Prometheus target `192.168.5.2:9101` (the Mac loopback through the Lima gateway) doesn't change.
+- Loki: set `VEKTOR_LOKI_PUSH_URL=http://loki.192.168.5.15.nip.io/loki/api/v1/push` in your shell. `compose.yaml` maps that host name to `host-gateway` (`extra_hosts`), so the push goes through the host's Traefik. Unset = logs go to stderr only.
+- `docker compose logs vektor` always works as a fallback (json-file driver, 3 × 10 MB rotation).
+
+### Engine choice
+
+Rancher Desktop with the **dockerd (moby)** engine is the tested setup: `docker compose` works as is, and the monitoring addresses above assume Rancher's network. Docker Desktop also runs the container, but the Prometheus target and the Loki route are Rancher-specific, and two engines on one machine waste resources. Pick one.
+
+### Hardening
+
+| Control | What it stops |
+|---|---|
+| Non-root user `10001:10001`, nologin shell | Root inside the container; writing to the code in `/app` (owned by root) |
+| `read_only: true` root filesystem, `/tmp` tmpfs capped at 64 MB | Changing binaries or code at run time; filling the disk |
+| `cap_drop: ALL` | Raw sockets, chown and every other capability |
+| `no-new-privileges:true` | Gaining privileges through setuid/setgid binaries |
+| `pids_limit: 128`, `mem_limit: 1g`, `cpus: 1.5`, `nofile` 1024 | Fork bombs and resource exhaustion of the host |
+| Process-control binaries removed from the image; the build fails if `ps`, `kill`, `pkill`, `pgrep`, `killall` or `top` is still there (`skill`/`snice` are removed too, unchecked) | Replaying the `ps \| grep python; kill -9` incident, even with a widened exec allowlist |
+| `init: true` (tini as PID 1) | Zombie exec/MCP children; lost SIGTERM on stop |
+| `restart: unless-stopped` + `HEALTHCHECK` on `/metrics` | A crash, OOM or self-kill keeping the bot down |
+| Port published on `127.0.0.1` only | Exposing `/metrics` to the network |
+| `.dockerignore` + explicit `COPY` list | Baking `.env`, `data/` or `tests/` into the image |
+| `vektor-data` named volume on `/data` | Losing the KB on rebuild or restart |
+
+### Residual risks
+
+- Exec children share the UID and PID namespace with the bot. The guards are the exec allowlist and the missing process-control binaries. The blast radius is one container that restarts on its own.
+- `curl` can resolve `host.docker.internal`, but the exec tool forces HTTPS and the host's services are plain HTTP.
+- `sh`, `rm` and `python` stay in the image. They are reachable only if `EXEC_ALLOWED_COMMANDS` is widened.
+
+### Manual verification
+
+- [ ] `docker compose up -d --build`, then `docker compose ps` shows `healthy`.
+- [ ] A Telegram message gets an answer, a CVE query works, a PDF upload ingests and can be searched.
+- [ ] The KB survives `docker compose restart`: `/documents` still lists the upload.
+- [ ] The Prometheus target `192.168.5.2:9101` is UP; Loki has `vektor` logs (when `VEKTOR_LOKI_PUSH_URL` is set).
+- [ ] `docker compose exec vektor id -u` prints `10001`; `docker compose exec vektor touch /app/x` fails (read-only).
+- [ ] Incident replay: ask the bot to run `ps -ax | grep python`, then `kill -9 <pid>`. Both are rejected by the exec tool (shell metacharacter, command not allowlisted).
+- [ ] Even with a widened allowlist the binaries are gone: `docker compose exec vektor ps` fails with "executable file not found".
+- [ ] Self-restart: kill the bot process from inside, then watch `docker compose ps` bring it back:
+  `docker compose exec vektor python -c "import os; me=os.getpid(); [os.kill(int(p), 9) for p in os.listdir('/proc') if p.isdigit() and int(p) != me and open(f'/proc/{p}/cmdline','rb').read() == b'python\x00bot.py\x00']"`
+
 ## Usage
 
 ```
@@ -212,6 +288,7 @@ Secrets and settings live in `.env` (gitignored). Real environment variables alw
 | `retrieval/` | Chunking, embeddings, query expansion, sqlite-vec + FTS5 store, RRF fusion, reranker, hybrid retriever, per-user principal |
 | `mcp_servers/cve_server.py` | CVE MCP tool served over stdio JSON-RPC |
 | `metrics.py`, `logging_config.py`, `loki_handler.py` | Prometheus metrics, JSON logging with redaction, optional Loki push |
+| `Dockerfile`, `compose.yaml`, `.dockerignore` | Hardened single-container runtime (see Run in Docker) |
 
 ## Testing
 

@@ -1,0 +1,62 @@
+# Vektor in a hardened container. Usage:
+#   docker compose up -d --build
+#   docker compose logs -f vektor
+#
+# Ollama stays on the host (host.docker.internal). Metrics are published on
+# the host loopback at 127.0.0.1:9101, the target the k3s Prometheus already
+# scrapes (192.168.5.2:9101 = Mac loopback via the Lima gateway).
+
+services:
+  vektor:
+    build: .
+    # Override to reuse a prebuilt image (e.g. CI: VEKTOR_IMAGE=vektor:ci).
+    image: ${VEKTOR_IMAGE:-vektor:local}
+    # Secrets and tuning come from the host .env and are never baked into
+    # the image. `environment:` below wins over env_file. VEKTOR_ENV_FILE
+    # points CI and the security tests at a dummy file.
+    env_file:
+      - path: ${VEKTOR_ENV_FILE:-.env}
+        required: true
+    environment:
+      OLLAMA_BASE_URL: ${VEKTOR_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      KB_DB_PATH: /data/vektor.db
+      METRICS_PORT: "9101"
+      # Loki in Rancher Desktop k3s via Traefik on the host (see extra_hosts).
+      # Empty = logs go to stderr only (docker compose logs).
+      LOKI_PUSH_URL: ${VEKTOR_LOKI_PUSH_URL:-}
+    # tini as PID 1: reaps exec/MCP children and forwards SIGTERM.
+    init: true
+    # A self-kill, crash or OOM brings the bot straight back.
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      # exec tool temp cwd and HOME; size-capped.
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - vektor-data:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 1.5
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+    ports:
+      - "127.0.0.1:9101:9101"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+      - loki.192.168.5.15.nip.io:host-gateway
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  vektor-data:
