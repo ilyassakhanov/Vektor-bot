@@ -14,7 +14,13 @@ import itertools
 import pytest
 from prometheus_client import REGISTRY
 
-from agent.agent import MAX_ITERATIONS_REPLY, Agent
+from agent.agent import (
+    BUDGET_EXCEEDED_REPLY,
+    MAX_ITERATIONS_REPLY,
+    SKIPPED_BUDGET_RESULT,
+    SKIPPED_TOO_MANY_RESULT,
+    Agent,
+)
 from llm.base import ChatResponse, LLMError, Message, ToolCall
 from tests.fakes import ScriptedLLM
 from tools.base import Tool, ToolError
@@ -526,3 +532,213 @@ def test_agent_message_prefix_stable_across_iterations():
     assert len(calls) == 3
     for prev, cur in itertools.pairwise(calls):
         assert cur[: len(prev)] == prev
+
+
+# --- Wall-clock budget ---------------------------------------------------------
+
+
+def _looping_llm(n: int = 100) -> ScriptedLLM:
+    return ScriptedLLM(
+        [
+            ChatResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id=f"tc{i}", name="echo", arguments={"message": "x"})
+                ],
+            )
+            for i in range(n)
+        ]
+    )
+
+
+def _stepping_clock(step: float, start: float = 0.0):
+    counter = itertools.count()
+    return lambda: start + step * next(counter)
+
+
+def test_budget_stops_before_the_call_that_would_exceed_it():
+    llm = _looping_llm()
+    agent = Agent(
+        llm,
+        _make_registry(EchoTool()),
+        max_iterations=8,
+        max_run_seconds=120,
+        clock=_stepping_clock(50.0),
+    )
+    messages: list[Message] = []
+    result = agent.run("loop", messages)
+    # start=0; tool check 50, iteration check 100 pass; the tool check at
+    # 150 trips (its call is skipped) before a third LLM call.
+    assert len(llm.chat_calls) == 2
+    assert messages[-2].content == SKIPPED_BUDGET_RESULT
+    assert result == BUDGET_EXCEEDED_REPLY.format(max_run_seconds=120)
+    assert messages[-1] == Message(role="assistant", content=result)
+
+
+def test_budget_none_keeps_max_iterations_behavior():
+    llm = _looping_llm()
+    agent = Agent(
+        llm,
+        _make_registry(EchoTool()),
+        max_iterations=3,
+        max_run_seconds=None,
+        clock=_stepping_clock(1000.0),
+    )
+    assert agent.run("loop") == MAX_ITERATIONS_REPLY.format(max_iterations=3)
+    assert len(llm.chat_calls) == 3
+
+
+@pytest.mark.parametrize("budget", [0, -5])
+def test_non_positive_budget_disables_the_check(budget: float):
+    llm = _looping_llm()
+    agent = Agent(
+        llm,
+        _make_registry(EchoTool()),
+        max_iterations=2,
+        max_run_seconds=budget,
+        clock=_stepping_clock(1000.0),
+    )
+    agent.run("loop")
+    assert len(llm.chat_calls) == 2
+
+
+def test_first_iteration_always_runs_even_with_a_late_clock():
+    llm = ScriptedLLM([ChatResponse(content="answer")])
+    agent = Agent(
+        llm,
+        _make_registry(),
+        max_run_seconds=1,
+        clock=_stepping_clock(10_000.0),
+    )
+    assert agent.run("hi") == "answer"
+    assert len(llm.chat_calls) == 1
+
+
+def test_budget_metric_incremented_once():
+    before = _sample("vektor_agent_budget_exceeded_total")
+    agent = Agent(
+        _looping_llm(),
+        _make_registry(EchoTool()),
+        max_run_seconds=120,
+        clock=_stepping_clock(50.0),
+    )
+    agent.run("loop")
+    assert _sample("vektor_agent_budget_exceeded_total") - before == 1.0
+
+
+def test_budget_reply_formats_whole_seconds():
+    assert "120s" in BUDGET_EXCEEDED_REPLY.format(max_run_seconds=120)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 120.0),
+        ("30", 30.0),
+        ("2.5", 2.5),
+        ("0", 0.0),
+        ("abc", 120.0),
+        ("nan", 120.0),
+        ("inf", 120.0),
+    ],
+)
+def test_build_agent_reads_max_run_seconds(monkeypatch, value, expected):
+    import bot
+
+    if value is None:
+        monkeypatch.delenv("AGENT_MAX_RUN_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_MAX_RUN_SECONDS", value)
+    agent = bot.build_agent(ScriptedLLM([]), _make_registry())
+    assert agent._max_run_seconds == expected
+
+
+# --- Per-tool-call budget and tool-call cap ------------------------------------
+
+
+class CountingTool(EchoTool):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def execute(self, **kwargs: object) -> str:
+        self.calls += 1
+        return super().execute(**kwargs)
+
+
+def _many_calls(n: int, prefix: str = "tc") -> ChatResponse:
+    return ChatResponse(
+        content="",
+        tool_calls=[
+            ToolCall(id=f"{prefix}{i}", name="echo", arguments={"message": str(i)})
+            for i in range(n)
+        ],
+    )
+
+
+def test_budget_checked_before_each_tool_call_in_one_reply():
+    llm = ScriptedLLM([_many_calls(5), ChatResponse(content="never")])
+    tool = CountingTool()
+    agent = Agent(
+        llm,
+        _make_registry(tool),
+        max_run_seconds=120,
+        max_tool_calls_per_turn=None,
+        clock=_stepping_clock(50.0),
+    )
+    messages: list[Message] = []
+    result = agent.run("loop", messages)
+    # start=0; tool checks at 50, 100 pass; the check at 150 trips.
+    assert tool.calls == 2
+    assert len(llm.chat_calls) == 1
+    assert result == BUDGET_EXCEEDED_REPLY.format(max_run_seconds=120)
+    tool_msgs = [m for m in messages if m.role == "tool"]
+    assert [m.tool_call_id for m in tool_msgs] == [f"tc{i}" for i in range(5)]
+    assert [m.content for m in tool_msgs[2:]] == [SKIPPED_BUDGET_RESULT] * 3
+    assert messages[-1] == Message(role="assistant", content=result)
+
+
+def test_budget_trip_inside_a_turn_increments_metric_once():
+    before = _sample("vektor_agent_budget_exceeded_total")
+    agent = Agent(
+        ScriptedLLM([_many_calls(5)]),
+        _make_registry(CountingTool()),
+        max_run_seconds=120,
+        max_tool_calls_per_turn=None,
+        clock=_stepping_clock(50.0),
+    )
+    agent.run("loop")
+    assert _sample("vektor_agent_budget_exceeded_total") - before == 1.0
+
+
+def test_tool_calls_per_turn_are_capped():
+    llm = ScriptedLLM([_many_calls(6), ChatResponse(content="done")])
+    tool = CountingTool()
+    agent = Agent(llm, _make_registry(tool), max_tool_calls_per_turn=2)
+    assert agent.run("go") == "done"
+    assert tool.calls == 2
+    second = llm.chat_calls[1][0]
+    tool_msgs = [m for m in second if m.role == "tool"]
+    assert [m.tool_call_id for m in tool_msgs] == [f"tc{i}" for i in range(6)]
+    skipped = SKIPPED_TOO_MANY_RESULT.format(max_calls=2)
+    assert [m.content for m in tool_msgs[2:]] == [skipped] * 4
+
+
+def test_default_tool_call_cap_is_four():
+    llm = ScriptedLLM([_many_calls(10), ChatResponse(content="done")])
+    tool = CountingTool()
+    Agent(llm, _make_registry(tool)).run("go")
+    assert tool.calls == 4
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(None, 4), ("2", 2), ("0", 4), ("-1", 4), ("x", 4)]
+)
+def test_build_agent_reads_max_tool_calls_per_turn(monkeypatch, value, expected):
+    import bot
+
+    if value is None:
+        monkeypatch.delenv("AGENT_MAX_TOOL_CALLS_PER_TURN", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_MAX_TOOL_CALLS_PER_TURN", value)
+    agent = bot.build_agent(ScriptedLLM([]), _make_registry())
+    assert agent._max_tool_calls_per_turn == expected
