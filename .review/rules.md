@@ -14,7 +14,7 @@ last ones may not fit. Format reference: dmc-268 `docs/RULES_GUIDE.md`.
 1. No Telegram token, API key or password is hard-coded: secrets are read from the environment (`os.environ` after `config.load_env()`)
 2. A secret or token is never written to a log record, an exception message or a reply sent to the user
 3. SQL receives values as `?` parameters, never via string concatenation, `%` or f-strings
-4. A subprocess is started with an argument list and without `shell=True`; text from a Telegram message never reaches a shell
+4. Outside `ExecTool` (`tools/exec.py`, which runs agent shell commands by design), a subprocess is started with an argument list and without `shell=True`, and text from a Telegram message is never interpolated into a command
 5. Untrusted data is not deserialized unsafely: no `pickle`, no `yaml.load` without `SafeLoader`, no `eval`/`exec` of model or user text
 6. TLS verification is not disabled (`verify=False`)
 
