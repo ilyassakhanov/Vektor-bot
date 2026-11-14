@@ -21,7 +21,7 @@ last ones may not fit. Format reference: dmc-268 `docs/RULES_GUIDE.md`.
 ## Per-User Isolation
 
 - pattern: `retrieval/`
-- pattern: `documents.py`
+- pattern: `tools/kb.py`
 - pattern: `bot.py`
 
 1. Every knowledge-base read and write is scoped by the Telegram numeric user id, not by username or chat title
@@ -31,6 +31,7 @@ last ones may not fit. Format reference: dmc-268 `docs/RULES_GUIDE.md`.
 
 - pattern: `*.py`
 - exclude: `tests/`
+- exclude: `benchmarks/`
 
 1. Every `httpx` client or call has an explicit timeout
 2. Code that talks to the network accepts an injectable `httpx.Client` so tests can pass `httpx.MockTransport`
