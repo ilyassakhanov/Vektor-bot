@@ -1,7 +1,7 @@
 """CVE core — fetches recent CVE records and selects the most critical one.
 
 This module does all the heavy lifting programmatically so the LLM doesn't have
-to: it discovers recently published CVE IDs from the official CVE Program
+to. It discovers recently published CVE IDs from the official CVE Program
 GitHub repository, retrieves each CVE record from the official CVE Services
 API, and runs the deterministic :func:`select_cve` selector to pick the
 single most critical CVE (highest CVSS in the latest publication window).
