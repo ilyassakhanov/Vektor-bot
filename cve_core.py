@@ -4,7 +4,7 @@ This module does all the heavy lifting programmatically so the LLM doesn't have
 to. It discovers recently published CVE IDs from the official CVE Program
 GitHub repository, retrieves each CVE record from the official CVE Services
 API, and runs the deterministic :func:`select_cve` selector to pick the
-single most critical CVE (highest CVSS in the latest publication window).
+single most critical CVE (the highest CVSS in the latest publication window).
 
 The LLM receives a compact, pre-formatted fact sheet and only needs to
 write the final natural-language summary — no JSON parsing, score
