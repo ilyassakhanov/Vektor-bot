@@ -18,7 +18,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any
 
 import httpx
@@ -38,9 +39,14 @@ _DEFAULT_TIMEOUT = 30.0
 # commits are one large unscored CNA batch.
 _DEFAULT_COMMIT_COUNT = 5
 _DEFAULT_MAX_RECORDS = 50
-# Records are fetched concurrently so 50 fetches fit inside the EXEC_TIMEOUT
-# MCP round-trip (sequential fetches could take longer than 30 s).
+# Records are fetched concurrently; sequential fetches could take longer
+# than the EXEC_TIMEOUT MCP round-trip even on a healthy API.
 _FETCH_WORKERS = 8
+# The whole run (discovery + fetches) must finish before the MCP round-trip
+# (EXEC_TIMEOUT) is killed, so it stops at this fraction of the timeout and
+# selects from the records fetched so far. A slow API otherwise needs several
+# pool waves of per-request timeouts.
+_DEADLINE_FRACTION = 0.8
 
 
 def _exec_timeout_from_env() -> float:
@@ -88,6 +94,7 @@ def get_latest_cve_fact_sheet(
     """
     own_client = client is None
     resolved_timeout = _exec_timeout_from_env() if timeout is None else timeout
+    deadline = time.monotonic() + resolved_timeout * _DEADLINE_FRACTION
     http_client = client or httpx.Client(
         timeout=resolved_timeout,
         headers={"User-Agent": "vektor-bot"},
@@ -105,7 +112,7 @@ def get_latest_cve_fact_sheet(
         cve_ids = cve_ids[:max_records]
         log.info("cve_core: retrieving %d CVE records", len(cve_ids))
 
-        records = _fetch_records(http_client, cve_ids)
+        records = _fetch_records(http_client, cve_ids, deadline)
         if not records:
             return "Failed to retrieve any CVE records from cveawg.mitre.org."
 
@@ -158,31 +165,63 @@ def _discover_cve_ids(client: httpx.Client, commit_count: int) -> list[str]:
     return ids
 
 
-def _fetch_records(client: httpx.Client, cve_ids: list[str]) -> list[dict[str, Any]]:
+def _fetch_records(
+    client: httpx.Client, cve_ids: list[str], deadline: float
+) -> list[dict[str, Any]]:
     """Fetch CVE records for the given IDs from the CVE Services API.
 
     Fetches run on a bounded thread pool (the ``httpx.Client`` is
     thread-safe); results keep discovery order and failed fetches are
-    skipped.
+    skipped. The phase stops at ``deadline`` (a ``time.monotonic()`` value):
+    fetches not yet started are cancelled, fetches still in flight are
+    abandoned, and only the records that arrived in time are returned.
     """
 
     def fetch(cve_id: str) -> dict[str, Any] | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
         url = _CVE_RECORD_URL.format(cve_id=cve_id)
         try:
-            resp = client.get(url)
+            # Cap the request so an abandoned fetch ends near the deadline.
+            resp = client.get(
+                url, timeout=min(client.timeout.read or remaining, remaining)
+            )
             resp.raise_for_status()
             data: dict[str, Any] = resp.json()
             return data
         except (httpx.HTTPError, ValueError) as exc:
             log.warning("Failed to fetch CVE record %s: %s", cve_id, exc)
             return None
+        except Exception as exc:  # noqa: BLE001 — e.g. client closed after the deadline
+            log.debug("Abandoned CVE record fetch %s: %s", cve_id, type(exc).__name__)
+            return None
 
     if not cve_ids:
         return []
     workers = min(_FETCH_WORKERS, len(cve_ids))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(fetch, cve_ids))
-    return [r for r in results if r is not None]
+    # No ``with``: its exit would wait for fetches still in flight.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures: list[Future[dict[str, Any] | None]] = [
+        pool.submit(fetch, cve_id) for cve_id in cve_ids
+    ]
+    try:
+        _, not_done = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if not_done:
+        log.warning(
+            "cve_core: fetch deadline hit, %d/%d records pending",
+            len(not_done),
+            len(cve_ids),
+        )
+    records: list[dict[str, Any]] = []
+    for future in futures:
+        if future.done() and not future.cancelled():
+            record = future.result()
+            if record is not None:
+                records.append(record)
+    return records
 
 
 def _format_cve(selection: CVESelection, total_retrieved: int) -> str:

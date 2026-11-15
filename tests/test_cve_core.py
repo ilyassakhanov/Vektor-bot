@@ -5,6 +5,8 @@ All tests use httpx.MockTransport — no network access needed.
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 import httpx
@@ -572,3 +574,64 @@ def test_fallback_note_survives_truncation_of_huge_description():
     assert (
         "FALLBACK_NOTE: the newest 1 CVE(s) (published 2026-11-15T21:10:00Z)" in result
     )
+
+
+# --- Aggregate fetch deadline -------------------------------------------------
+
+
+def _blocking_handler(
+    records: list[dict[str, Any]],
+    commits: list[dict[str, Any]],
+    slow_ids: set[str],
+    release: threading.Event,
+):
+    serve = _serve(records, commits)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cve_id = str(req.url).rsplit("/", 1)[-1]
+        if cve_id in slow_ids:
+            release.wait(10.0)
+        return serve(req)
+
+    return handler
+
+
+def test_fetch_phase_stops_at_deadline():
+    """Slow fetches are abandoned at the deadline (80 % of the timeout) and the
+    selection uses the records that arrived in time."""
+    records = [
+        _make_cve(f"CVE-2026-{i:04d}", "2026-08-28T15:23:00Z", score=float(i))
+        for i in range(1, 11)
+    ]
+    commits = _commits_response([c["cveMetadata"]["cveId"] for c in records])
+    slow = {f"CVE-2026-{i:04d}" for i in range(6, 11)}  # the high scores
+    release = threading.Event()
+    client = _make_client(_blocking_handler(records, commits, slow, release))
+    try:
+        start = time.monotonic()
+        result = get_latest_cve_fact_sheet(client=client, timeout=1.0)
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+
+    assert elapsed < 1.5
+    assert result.startswith("CVE_ID: CVE-2026-0005")
+    assert "RECORDS_RETRIEVED: 5" in result
+
+
+def test_deadline_with_no_records_returns_failure_message():
+    records = [_make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=9.0)]
+    commits = _commits_response(["CVE-2026-0001"])
+    release = threading.Event()
+    client = _make_client(
+        _blocking_handler(records, commits, {"CVE-2026-0001"}, release)
+    )
+    try:
+        start = time.monotonic()
+        result = get_latest_cve_fact_sheet(client=client, timeout=0.5)
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+
+    assert elapsed < 1.0
+    assert result == "Failed to retrieve any CVE records from cveawg.mitre.org."
