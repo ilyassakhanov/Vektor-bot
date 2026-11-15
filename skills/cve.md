@@ -7,4 +7,5 @@ Rules:
 
 - Use ONLY fields from the fact sheet — never fabricate CVE facts.
 - All facts come from CVE.org; never fetch CVE data via exec or curl.
+- If the fact sheet has a `FALLBACK_NOTE:` line, tell the user that the newest CVEs have no CVSS score yet and that this CVE comes from the latest scored window.
 - If the tool errors or reports no CVSS, relay that message to the user.

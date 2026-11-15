@@ -5,6 +5,8 @@ All tests use httpx.MockTransport — no network access needed.
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 import httpx
@@ -451,3 +453,185 @@ def test_cve_fact_sheet_short_unchanged():
     assert "CVE_ID: CVE-2026-0001" in result
     assert "Buffer overflow in product X" in result
     assert "DATA_SOURCE: CVE.org" in result
+
+
+# --- Unscored-window fallback -----------------------------------------------
+
+
+def _serve(records: list[dict[str, Any]], commits: list[dict[str, Any]]):
+    by_id = {c["cveMetadata"]["cveId"]: c for c in records}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            return httpx.Response(200, json=commits)
+        cve_id = str(req.url).rsplit("/", 1)[-1]
+        return httpx.Response(200, json=by_id[cve_id])
+
+    return handler
+
+
+def test_unscored_latest_window_falls_back_with_note():
+    batch = [
+        _make_cve(f"CVE-2026-1{i:03d}", f"2026-11-15T21:1{i % 5}:00Z", score=None)
+        for i in range(5)
+    ]
+    scored = _make_cve("CVE-2026-0001", "2026-11-15T20:40:00Z", score=8.8)
+    records = [*batch, scored]
+    commits = _commits_response([c["cveMetadata"]["cveId"] for c in records])
+
+    result = get_latest_cve_fact_sheet(client=_make_client(_serve(records, commits)))
+
+    assert result.startswith("CVE_ID: CVE-2026-0001")
+    assert "CVSS_SCORE: 8.8" in result
+    note = [line for line in result.splitlines() if line.startswith("FALLBACK_NOTE:")]
+    assert len(note) == 1
+    assert "newest 5 CVE(s)" in note[0]
+    assert "2026-11-15T21:10:00Z" in note[0]
+    assert "2026-11-15T21:14:00Z" in note[0]
+    assert "no CVSS score yet" in note[0]
+
+
+def test_scored_latest_window_has_no_fallback_note():
+    cve = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=7.0)
+    older = _make_cve("CVE-2026-0002", "2026-08-28T07:00:00Z", score=9.9)
+    commits = _commits_response(["CVE-2026-0001", "CVE-2026-0002"])
+
+    result = get_latest_cve_fact_sheet(
+        client=_make_client(_serve([cve, older], commits))
+    )
+
+    assert result.startswith("CVE_ID: CVE-2026-0001")
+    assert "FALLBACK_NOTE" not in result
+
+
+def test_no_cvss_anywhere_returns_message():
+    records = [
+        _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=None),
+        _make_cve("CVE-2026-0002", "2026-08-28T07:00:00Z", score=None),
+    ]
+    commits = _commits_response(["CVE-2026-0001", "CVE-2026-0002"])
+
+    result = get_latest_cve_fact_sheet(client=_make_client(_serve(records, commits)))
+
+    assert "Retrieved 2 recent CVE records" in result
+    assert "none had CVSS score data" in result
+
+
+def test_default_discovery_reads_five_commits_and_fetches_up_to_fifty():
+    cve_ids = [f"CVE-2026-{i:04d}" for i in range(1, 61)]
+    commits = _commits_response(cve_ids)
+    cve = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=7.0)
+    seen: dict[str, Any] = {"commits_url": None, "cve_api": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            seen["commits_url"] = str(req.url)
+            return httpx.Response(200, json=commits)
+        seen["cve_api"] += 1
+        return httpx.Response(200, json=cve)
+
+    get_latest_cve_fact_sheet(client=_make_client(handler))
+
+    assert "per_page=5" in seen["commits_url"]
+    assert seen["cve_api"] == 50
+
+
+def test_records_reported_in_discovery_order_despite_concurrency():
+    """Concurrent fetching must not change which CVE wins: selection is a
+    pure function of the records, and failed fetches are still skipped."""
+    records = [
+        _make_cve(f"CVE-2026-{i:04d}", "2026-08-28T15:23:00Z", score=float(i % 10))
+        for i in range(1, 21)
+    ]
+    commits = _commits_response([c["cveMetadata"]["cveId"] for c in records])
+    handler = _serve(records, commits)
+
+    def flaky(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("CVE-2026-0009"):
+            return httpx.Response(503)
+        return handler(req)
+
+    result = get_latest_cve_fact_sheet(client=_make_client(flaky))
+
+    # 0009 (score 9.0) failed; 0019 (score 9.0) is the remaining top score.
+    assert result.startswith("CVE_ID: CVE-2026-0019")
+    assert "RECORDS_RETRIEVED: 19" in result
+
+
+def test_fallback_note_survives_truncation_of_huge_description():
+    unscored = _make_cve("CVE-2026-1000", "2026-11-15T21:10:00Z", score=None)
+    scored = _make_cve(
+        "CVE-2026-0001", "2026-11-15T20:40:00Z", score=8.8, description="D" * 5000
+    )
+    commits = _commits_response(["CVE-2026-1000", "CVE-2026-0001"])
+
+    result = get_latest_cve_fact_sheet(
+        client=_make_client(_serve([unscored, scored], commits)),
+        max_output_chars=600,
+    )
+
+    assert "[truncated " in result
+    assert (
+        "FALLBACK_NOTE: the newest 1 CVE(s) (published 2026-11-15T21:10:00Z)" in result
+    )
+
+
+# --- Aggregate fetch deadline -------------------------------------------------
+
+
+def _blocking_handler(
+    records: list[dict[str, Any]],
+    commits: list[dict[str, Any]],
+    slow_ids: set[str],
+    release: threading.Event,
+):
+    serve = _serve(records, commits)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cve_id = str(req.url).rsplit("/", 1)[-1]
+        if cve_id in slow_ids:
+            release.wait(10.0)
+        return serve(req)
+
+    return handler
+
+
+def test_fetch_phase_stops_at_deadline():
+    """Slow fetches are abandoned at the deadline (80 % of the timeout) and the
+    selection uses the records that arrived in time."""
+    records = [
+        _make_cve(f"CVE-2026-{i:04d}", "2026-08-28T15:23:00Z", score=float(i))
+        for i in range(1, 11)
+    ]
+    commits = _commits_response([c["cveMetadata"]["cveId"] for c in records])
+    slow = {f"CVE-2026-{i:04d}" for i in range(6, 11)}  # the high scores
+    release = threading.Event()
+    client = _make_client(_blocking_handler(records, commits, slow, release))
+    try:
+        start = time.monotonic()
+        result = get_latest_cve_fact_sheet(client=client, timeout=1.0)
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+
+    assert elapsed < 1.5
+    assert result.startswith("CVE_ID: CVE-2026-0005")
+    assert "RECORDS_RETRIEVED: 5" in result
+
+
+def test_deadline_with_no_records_returns_failure_message():
+    records = [_make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=9.0)]
+    commits = _commits_response(["CVE-2026-0001"])
+    release = threading.Event()
+    client = _make_client(
+        _blocking_handler(records, commits, {"CVE-2026-0001"}, release)
+    )
+    try:
+        start = time.monotonic()
+        result = get_latest_cve_fact_sheet(client=client, timeout=0.5)
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+
+    assert elapsed < 1.0
+    assert result == "Failed to retrieve any CVE records from cveawg.mitre.org."

@@ -109,7 +109,7 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `agent/conversation.py` | `ConversationManager` — per-chat context, `/new` command |
 | `agent/rate_limit.py` | `RateLimiter` — per-user one in-flight run + sliding window (`try_acquire` → `RateDecision(ok, reason)`, idempotent `release`, one lock, injectable clock) |
 | `agent/validation.py` | `validate_input()` → `Verdict` (reject empty/blank and >4096 chars, strip zero-width/bidi controls) and `split_reply()` (UTF-16-unit reply splitting at paragraph → sentence → word boundaries) — pure, no I/O |
-| `agent/cve_selector.py` | `select_cve()` — deterministic latest-window + highest-score CVE selection |
+| `agent/cve_selector.py` | `select_cve()` / `select_cve_window()` — deterministic windowed + highest-score CVE selection; falls back past newer all-unscored windows (`CVESelection` reports it) |
 | `tools/base.py` | Abstract `Tool` interface, `ToolError` |
 | `tools/registry.py` | `ToolRegistry` — agent invokes tools via registry |
 | `tools/exec.py` | `ExecTool` — allowlisted, shell-free command execution (metachar rejection, `shlex`, allowlist on a safe `PATH`, per-binary argument allowlists), isolated child (scrubbed env, temp cwd, rlimits, own session, byte-capped output, process-group kill on timeout); returns stdout/stderr/exit code |
@@ -187,7 +187,7 @@ The agent receives a user message, calls the LLM with conversation history, tool
 The Agent invokes tools through the `ToolRegistry`, never directly. Adding a tool requires only implementing `Tool` and registering it — the agent loop does not change.
 
 - `ExecTool` — runs one allowlisted, network read-only command **without a shell**; its controls hold even if the model fully complies. The raw string is rejected on shell metacharacters (`| ; & $ \` > < ( )`, newline, CR, NUL), split with `shlex`, and `argv[0]` must be a bare name from the allowlist (`EXEC_ALLOWED_COMMANDS`, default `curl, dig, nslookup, whois, host`) resolved on `/usr/bin:/bin:/usr/sbin:/sbin`. Per-binary argument allowlists: curl takes only `-s -S -I -i -f -v --compressed`, `-H/-A/-w` (no `@`), `-X GET|HEAD`, numeric timeouts and exactly one `https://` URL to a public host (no `@`, no `%` in the host, no globbing, no loopback/private/link-local literals, no `-L`), with `--globoff`/`--max-time`/`--max-filesize`/`--proto =https` forced; dig/host/nslookup/whois take only a query name plus an optional record type. The child gets a scrubbed env (`PATH`, `LANG`, `HOME` only), a fresh temp cwd, best-effort rlimits (CPU, address space, file size, core), its own session, stdin from `/dev/null`, and byte-capped output (max(64 KiB, 4 × `EXEC_MAX_OUTPUT_CHARS`)); overflow or timeout SIGKILLs the process group. Rejections return `Command rejected: …\nexit_code: -1` (never raise). Combined stdout/stderr is capped at `EXEC_MAX_OUTPUT_CHARS` (head+tail with a truncation marker; the `exit_code:` line is always preserved).
-- `CveTool` — retrieves recent CVE records from official CVE.org endpoints and selects the most critical one programmatically (via `select_cve()`). Returns a compact fact sheet so the LLM only needs to summarize — no JSON parsing, score comparison, or windowing on the LLM side. The fact sheet is capped with the same `EXEC_MAX_OUTPUT_CHARS` truncation.
+- `CveTool` — retrieves recent CVE records from official CVE.org endpoints and selects the most critical one programmatically (via `select_cve_window()`; see CVE selection for the unscored-window fallback). Returns a compact fact sheet so the LLM only needs to summarize — no JSON parsing, score comparison, or windowing on the LLM side. The fact sheet is capped with the same `EXEC_MAX_OUTPUT_CHARS` truncation.
 
 ### Skills
 
@@ -202,12 +202,14 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 `select_cve()` in `agent/cve_selector.py` is a pure function that takes raw CVE record dicts (as returned by `cveawg.mitre.org/api/cve/:id`) and selects the correct one:
 
 1. Extract CVEInfo from each record.
-2. Determine the latest publication timestamp from ALL records.
-3. Latest window = CVEs published within 5 minutes of that timestamp.
-4. Filter out CVEs without CVSS — they cannot win.
-5. Within the window, select the highest CVSS baseScore.
+2. Group ALL records into 5-minute publication windows, walking backwards from the newest timestamp: window 1 is `[newest − 5 min, newest]`; each next window is anchored at the newest timestamp strictly older than the previous window's cutoff (naive timestamps count as UTC; unparseable ones join window 1).
+3. CVEs without CVSS define windows but cannot win.
+4. Use the newest window that contains at least one scored CVE — newer all-unscored windows (e.g. a bulk CNA batch without metrics) are skipped. An older window never beats a newer scored one.
+5. Within that window, select the highest CVSS baseScore.
 6. If scores tie, select the most recently published.
-7. Returns None if no CVE with CVSS exists in the latest window.
+7. Returns None only if no record has CVSS.
+
+`select_cve_window()` returns a `CVESelection` (`cve`, `fallback`, `skipped_unscored`, `skipped_newest`, `skipped_oldest`); `select_cve()` returns just the `CVEInfo`. On a fallback the fact sheet carries a `FALLBACK_NOTE:` line (placed before `DESCRIPTION` so truncation keeps it), which `skills/cve.md` tells the model to relay. `cve_core` reads the last 5 `cvelistV5` commits and fetches up to 50 records (module constants `_DEFAULT_COMMIT_COUNT`/`_DEFAULT_MAX_RECORDS`) over an 8-worker thread pool (`_FETCH_WORKERS`). The whole run is bounded by a deadline at 80 % of `EXEC_TIMEOUT` from the call start (`_DEADLINE_FRACTION`): fetches not started by then are cancelled, in-flight ones are abandoned (each request's timeout is capped to the time left), and selection uses the records fetched so far, so a slow `cveawg.mitre.org` still returns inside the `EXEC_TIMEOUT` MCP round-trip.
 
 ### Retrieval
 
@@ -290,12 +292,12 @@ python -m pytest
 ### Test coverage
 
 - Agent: normal request, tool call → execution → result → next LLM call, multiple iterations, max iteration protection, wall-clock budget (between iterations and between tool calls of one reply, skipped results per call id, first iteration always runs, metric, env parsing), tool-call cap per reply, tool failure, unknown tool, LLM error, no Ollama dependency.
-- CVE selector: latest-window selection, highest-score selection, equal-score tie-breaking, missing CVSS, first API result not automatically selected, CVE ID not used as recency proxy, ADP CVSS, CVSS v4, complex multi-window scenarios.
+- CVE selector: latest-window selection, highest-score selection, equal-score tie-breaking, missing CVSS, first API result not automatically selected, CVE ID not used as recency proxy, ADP CVSS, CVSS v4, complex multi-window scenarios, unscored-window fallback (bulk unscored batch, several unscored windows skipped, deterministic window anchoring, no CVSS anywhere → None, scored latest window is not a fallback, mixed timezone formats).
 - Conversation: persistence within a chat, chat isolation, `/new`, `/new` only clears current chat.
 - Tools: registration, execution, failure handling, unknown tool, adding tools without loop changes.
 - Exec policy: `kill`/`ps`/`rm`/`sh`/path-prefixed binaries rejected with the allowlist shown, shell operators (pipe, `$`, redirects, backticks, `;`, `&&`, parens, newline, CR, NUL), parse errors, curl option allowlist (output/upload/data/config/proxy/resolve/unix-socket/`--url-query`/`-L` rejected, `@` in values and URLs, percent-encoded hosts, loopback/private/link-local/numeric/IPv4-mapped/compatible/NAT64/SIIT literals, globbing, multiple URLs), DNS/whois rules (no server, port, transport or second positional), forced curl flags, no spawn on reject, metric per reason, no secrets in logs, scrubbed env, temp cwd, rlimits requested, process-group kill, output byte cap, `killpg` fallback.
 - Rate limit: in-flight and window rejections with one reply, no LLM call and untouched history, uploads/`/new`/validation rejects counted, independent users, release after errors, auth gate first, env fallbacks, worker-thread clamp.
-- CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, data-source attribution.
+- CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, default discovery (5 commits / 50 records), concurrent fetch keeps results deterministic, fetch deadline (slow fetches abandoned, selection from in-time records, nothing in time → failure message), `FALLBACK_NOTE:` present on fallback (and kept under truncation) and absent otherwise, data-source attribution.
 - Skill loader: discovers `.md` files, ignores non-`.md`, system prompt generation.
 - Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling, document flow (download/extract/ingest roundtrip, staged progress sequence ordering with the agent reply via the upload notice [+ caption], ingestion searchable via kb_search, upload context propagating to follow-up messages, PDF page numbers reaching the store while txt chunks keep a NULL page and the fact sheet omits it, user A's upload invisible to user B, documents row written with owner and file type, auth gate with no download, KB-disabled reply, error paths — unknown ext, corrupt bytes, API error, embedder failure, agent-turn LLM/agent errors, missing file_path — and document-wins-over-text).
 - Bot commands: `/documents` listing (filename, created date, chunk count) scoped to the caller, empty state, auth gates, KB-disabled; `/delete` cascade visible in search, unknown/not-yours replies, usage hint (incl. filenames with spaces), command registration and precedence over the catch-all handler.
