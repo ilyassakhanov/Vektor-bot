@@ -4,7 +4,9 @@ This module does all the heavy lifting programmatically so the LLM doesn't have
 to: it discovers recently published CVE IDs from the official CVE Program
 GitHub repository, retrieves each CVE record from the official CVE Services
 API, and runs the deterministic :func:`select_cve` selector to pick the
-single most critical CVE (highest CVSS in the latest publication window).
+single most critical CVE (highest CVSS in the newest publication window
+that has scored CVEs; newer all-unscored windows are skipped and reported
+in a ``FALLBACK_NOTE:`` line).
 
 The LLM receives a compact, pre-formatted fact sheet and only needs to
 write the final natural-language summary — no JSON parsing, score
@@ -16,11 +18,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
 
-from agent.cve_selector import select_cve
+from agent.cve_selector import CVESelection, select_cve_window
 from tools.truncation import max_output_chars_from_env, truncate
 
 log = logging.getLogger("vektor.cve_core")
@@ -31,8 +34,13 @@ _CVELIST_COMMITS_URL = (
 _CVE_RECORD_URL = "https://cveawg.mitre.org/api/cve/{cve_id}"
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d+")
 _DEFAULT_TIMEOUT = 30.0
-_DEFAULT_COMMIT_COUNT = 2
-_DEFAULT_MAX_RECORDS = 20
+# Wide enough that an earlier scored window is reachable when the newest
+# commits are one large unscored CNA batch.
+_DEFAULT_COMMIT_COUNT = 5
+_DEFAULT_MAX_RECORDS = 50
+# Records are fetched concurrently so 50 fetches fit inside the EXEC_TIMEOUT
+# MCP round-trip (sequential fetches could take longer than 30 s).
+_FETCH_WORKERS = 8
 
 
 def _exec_timeout_from_env() -> float:
@@ -66,7 +74,8 @@ def get_latest_cve_fact_sheet(
     Discovers recent CVE IDs from the official CVE Program GitHub repo
     (``CVEProject/cvelistV5``), fetches each record from the official CVE
     Services API (``cveawg.mitre.org``), and deterministically selects the
-    highest-scoring CVE from the latest publication window. Returns a
+    highest-scoring CVE from the newest publication window that has CVSS
+    data (falling back past newer all-unscored windows). Returns a
     compact fact sheet for the selected CVE (or an error message).
 
     All network access uses :mod:`httpx`. Failures are returned as strings
@@ -100,19 +109,20 @@ def get_latest_cve_fact_sheet(
         if not records:
             return "Failed to retrieve any CVE records from cveawg.mitre.org."
 
-        selected = select_cve(records)
-        if selected is None:
+        selection = select_cve_window(records)
+        if selection is None:
             return (
                 f"Retrieved {len(records)} recent CVE records, but none had "
-                "CVSS score data in the latest publication window."
+                "CVSS score data."
             )
 
         log.info(
-            "cve_core: selected %s (score=%s)",
-            selected.cve_id,
-            selected.cvss_score,
+            "cve_core: selected %s (score=%s, fallback=%s)",
+            selection.cve.cve_id,
+            selection.cve.cvss_score,
+            selection.fallback,
         )
-        fact_sheet = _format_cve(selected, total_retrieved=len(records))
+        fact_sheet = _format_cve(selection, total_retrieved=len(records))
         return truncate(fact_sheet, cap)
     finally:
         if own_client:
@@ -149,21 +159,35 @@ def _discover_cve_ids(client: httpx.Client, commit_count: int) -> list[str]:
 
 
 def _fetch_records(client: httpx.Client, cve_ids: list[str]) -> list[dict[str, Any]]:
-    """Fetch CVE records for the given IDs from the CVE Services API."""
-    records: list[dict[str, Any]] = []
-    for cve_id in cve_ids:
+    """Fetch CVE records for the given IDs from the CVE Services API.
+
+    Fetches run on a bounded thread pool (the ``httpx.Client`` is
+    thread-safe); results keep discovery order and failed fetches are
+    skipped.
+    """
+
+    def fetch(cve_id: str) -> dict[str, Any] | None:
         url = _CVE_RECORD_URL.format(cve_id=cve_id)
         try:
             resp = client.get(url)
             resp.raise_for_status()
-            records.append(resp.json())
+            data: dict[str, Any] = resp.json()
+            return data
         except (httpx.HTTPError, ValueError) as exc:
             log.warning("Failed to fetch CVE record %s: %s", cve_id, exc)
-    return records
+            return None
+
+    if not cve_ids:
+        return []
+    workers = min(_FETCH_WORKERS, len(cve_ids))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(fetch, cve_ids))
+    return [r for r in results if r is not None]
 
 
-def _format_cve(cve: object, total_retrieved: int) -> str:
-    """Format a CVEInfo into a compact fact sheet for the LLM."""
+def _format_cve(selection: CVESelection, total_retrieved: int) -> str:
+    """Format a CVE selection into a compact fact sheet for the LLM."""
+    cve = selection.cve
     cve_id = getattr(cve, "cve_id", "unknown")
     score = getattr(cve, "cvss_score", None)
     severity = getattr(cve, "cvss_severity", None)
@@ -178,6 +202,11 @@ def _format_cve(cve: object, total_retrieved: int) -> str:
         f"CVSS_SCORE: {score if score is not None else 'N/A'}",
         f"CVSS_SEVERITY: {severity or 'N/A'}",
         f"PUBLISHED: {date_pub or 'N/A'}",
+    ]
+    # Placed before DESCRIPTION so head+tail truncation never drops it.
+    if selection.fallback:
+        lines.append(_fallback_note(selection))
+    lines += [
         f"VENDOR: {vendor or 'N/A'}",
         f"PRODUCT: {product or 'N/A'}",
         f"DESCRIPTION: {description or 'N/A'}",
@@ -186,7 +215,24 @@ def _format_cve(cve: object, total_retrieved: int) -> str:
         "DATA_SOURCE: CVE.org (cveawg.mitre.org/api/cve, CVEProject/cvelistV5)",
         (
             "NOTE: This CVE was selected programmatically (highest CVSS baseScore in "
-            "the latest publication window). Do not fabricate any fields."
+            "the newest publication window with scored CVEs). Do not fabricate "
+            "any fields."
         ),
     ]
     return "\n".join(lines)
+
+
+def _fallback_note(selection: CVESelection) -> str:
+    """Describe the skipped unscored windows in one line."""
+    newest, oldest = selection.skipped_newest, selection.skipped_oldest
+    if newest and oldest and newest != oldest:
+        when = f"published {oldest} to {newest}"
+    elif newest or oldest:
+        when = f"published {newest or oldest}"
+    else:
+        when = "publication time unknown"
+    return (
+        f"FALLBACK_NOTE: the newest {selection.skipped_unscored} CVE(s) "
+        f"({when}) have no CVSS score yet; showing the most critical CVE "
+        "from the latest scored window."
+    )

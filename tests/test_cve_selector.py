@@ -4,16 +4,18 @@ The selector takes raw CVE record dicts (as returned by cveawg.mitre.org/api/cve
 and selects the correct one. It is a pure function: no network, no side effects.
 
 Selection algorithm:
-1. Find the latest publication timestamp among all records.
-2. Latest window = records published within 5 minutes of that latest timestamp.
-3. Within the window, select the highest CVSS baseScore.
+1. Group records into 5-minute windows walking backwards from the newest
+   publication timestamp (each next window is anchored at the newest
+   timestamp strictly older than the previous window's cutoff).
+2. Use the newest window that holds at least one CVE with CVSS.
+3. Within that window, select the highest CVSS baseScore.
 4. If scores tie, select the most recently published.
-5. CVEs without CVSS data cannot win.
+5. CVEs without CVSS data cannot win; None only if no record has CVSS.
 """
 
 from __future__ import annotations
 
-from agent.cve_selector import select_cve
+from agent.cve_selector import CVESelection, select_cve, select_cve_window
 
 
 def _make_cve(
@@ -127,16 +129,14 @@ def test_all_missing_cvss_returns_none():
     assert result is None
 
 
-def test_missing_cvss_in_latest_window_loses_to_older_with_score():
-    """A CVE without CVSS in the latest window must not win over a CVE with
-    CVSS from an older window — but only if the older one is in a different window."""
-    # Actually, per the spec: "CVEs without CVSS data cannot win the comparison"
-    # This means they're excluded, and if all in the latest window lack CVSS,
-    # the selector should return None (not fall back to older windows).
+def test_unscored_latest_window_falls_back_to_older_scored_window():
+    """An unscored latest window no longer blocks selection: the newest
+    earlier window with a scored CVE supplies the winner."""
     cve_no_score_new = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=None)
     cve_with_score_old = _make_cve("CVE-2026-0002", "2026-08-28T07:30:00Z", score=9.0)
     result = select_cve([cve_no_score_new, cve_with_score_old])
-    assert result is None
+    assert result is not None
+    assert result.cve_id == "CVE-2026-0002"
 
 
 # --- First API result not automatically selected ---------------------------
@@ -368,3 +368,130 @@ def test_complex_scenario_multiple_windows_and_scores():
     # Tiebreak = most recent → CVE-0006 (15:23:30 > 15:23:15)
     assert result.cve_id == "CVE-2026-0006"
     assert result.cvss_score == 9.0
+
+
+# --- Unscored-window fallback -----------------------------------------------
+
+
+def test_bulk_unscored_batch_falls_back_with_metadata():
+    """A bulk unscored batch (like a CNA dump) is skipped; the most critical
+    CVE of the newest scored window is chosen and the fallback is reported."""
+    batch = [
+        _make_cve(f"CVE-2026-1{i:03d}", f"2026-11-15T21:1{i % 5}:00Z", score=None)
+        for i in range(20)
+    ]
+    older = [
+        _make_cve("CVE-2026-0001", "2026-11-15T20:40:00Z", score=6.5),
+        _make_cve("CVE-2026-0002", "2026-11-15T20:42:00Z", score=8.8),
+        _make_cve("CVE-2026-0003", "2026-11-15T19:00:00Z", score=10.0),
+    ]
+    selection = select_cve_window(batch + older)
+    assert isinstance(selection, CVESelection)
+    assert selection.cve.cve_id == "CVE-2026-0002"
+    assert selection.fallback is True
+    assert selection.skipped_unscored == 20
+    assert selection.skipped_newest == "2026-11-15T21:14:00Z"
+    assert selection.skipped_oldest == "2026-11-15T21:10:00Z"
+
+
+def test_multiple_unscored_windows_skipped():
+    records = [
+        _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=None),
+        _make_cve("CVE-2026-0002", "2026-08-28T15:22:00Z", score=None),
+        _make_cve("CVE-2026-0003", "2026-08-28T15:10:00Z", score=None),
+        _make_cve("CVE-2026-0004", "2026-08-28T15:00:00Z", score=4.0),
+        _make_cve("CVE-2026-0005", "2026-08-28T14:57:00Z", score=7.0),
+        _make_cve("CVE-2026-0006", "2026-08-28T14:00:00Z", score=9.9),
+    ]
+    selection = select_cve_window(records)
+    assert selection is not None
+    # Window 1 = 15:18–15:23 (0001, 0002), window 2 = 15:05–15:10 (0003),
+    # window 3 = 14:55–15:00 (0004, 0005) → 0005 wins with 7.0.
+    assert selection.cve.cve_id == "CVE-2026-0005"
+    assert selection.fallback is True
+    assert selection.skipped_unscored == 3
+    assert selection.skipped_newest == "2026-08-28T15:23:00Z"
+    assert selection.skipped_oldest == "2026-08-28T15:10:00Z"
+
+
+def test_windows_anchor_on_newest_timestamp_older_than_cutoff():
+    """Windows are anchored deterministically: the second window starts at
+    the newest timestamp strictly older than the first window's cutoff, not
+    at a fixed 5-minute grid."""
+    records = [
+        _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=None),
+        # 15:17:59 is just older than the 15:18:00 cutoff → anchors window 2,
+        # which spans 15:12:59–15:17:59.
+        _make_cve("CVE-2026-0002", "2026-08-28T15:17:59Z", score=None),
+        _make_cve("CVE-2026-0003", "2026-08-28T15:13:30Z", score=5.0),
+        _make_cve("CVE-2026-0004", "2026-08-28T15:12:00Z", score=9.0),
+    ]
+    selection = select_cve_window(records)
+    assert selection is not None
+    # Window 2 holds 0002 (unscored) and 0003 (5.0); 0004 at 15:12:00 falls
+    # outside it, so its higher 9.0 score does not compete.
+    assert selection.cve.cve_id == "CVE-2026-0003"
+    assert selection.fallback is True
+    assert selection.skipped_unscored == 1
+
+
+def test_no_cvss_anywhere_returns_none_across_windows():
+    records = [
+        _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=None),
+        _make_cve("CVE-2026-0002", "2026-08-28T10:00:00Z", score=None),
+        _make_cve("CVE-2026-0003", "2026-08-27T10:00:00Z", score=None),
+    ]
+    assert select_cve_window(records) is None
+    assert select_cve(records) is None
+
+
+def test_scored_latest_window_is_not_a_fallback():
+    records = [
+        _make_cve("CVE-2026-0001", "2026-08-28T07:00:00Z", score=9.9),
+        _make_cve("CVE-2026-0002", "2026-08-28T15:23:00Z", score=3.0),
+        _make_cve("CVE-2026-0003", "2026-08-28T15:23:30Z", score=None),
+    ]
+    selection = select_cve_window(records)
+    assert selection is not None
+    assert selection.cve.cve_id == "CVE-2026-0002"
+    assert selection.fallback is False
+    assert selection.skipped_unscored == 0
+    assert selection.skipped_newest is None
+    assert selection.skipped_oldest is None
+
+
+def test_fallback_tie_picks_most_recent_in_window():
+    records = [
+        _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=None),
+        _make_cve("CVE-2026-0002", "2026-08-28T12:00:00Z", score=8.0),
+        _make_cve("CVE-2026-0003", "2026-08-28T12:01:00Z", score=8.0),
+    ]
+    result = select_cve(records)
+    assert result is not None
+    assert result.cve_id == "CVE-2026-0003"
+
+
+def test_fallback_ignores_record_order():
+    scored = _make_cve("CVE-2026-0002", "2026-08-28T12:00:00Z", score=6.0)
+    older_higher = _make_cve("CVE-2026-0003", "2026-08-28T09:00:00Z", score=9.8)
+    unscored = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=None)
+    for order in (
+        [older_higher, scored, unscored],
+        [unscored, older_higher, scored],
+        [scored, unscored, older_higher],
+    ):
+        result = select_cve(order)
+        assert result is not None
+        assert result.cve_id == "CVE-2026-0002"
+
+
+def test_mixed_timezone_formats_are_comparable():
+    """Naive timestamps are treated as UTC and compare with Z/offset ones."""
+    records = [
+        _make_cve("CVE-2026-0001", "2026-08-28T15:23:00.000", score=None),
+        _make_cve("CVE-2026-0002", "2026-08-28T15:00:00+00:00", score=7.0),
+    ]
+    selection = select_cve_window(records)
+    assert selection is not None
+    assert selection.cve.cve_id == "CVE-2026-0002"
+    assert selection.fallback is True
