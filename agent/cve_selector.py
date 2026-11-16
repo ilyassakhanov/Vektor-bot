@@ -20,8 +20,8 @@ Algorithm:
    the raw timestamp strings.
 6. Return None only if no record at all has CVSS data.
 
-Malformed records never raise: a record that is not an object, or whose
-structure breaks extraction, is skipped with a warning; nested values of the
+Malformed records never raise: a record that is not an object, has no CVE
+id, or whose structure breaks extraction, is skipped with a warning; nested values of the
 wrong type (``cveMetadata``/``containers``/``cna`` not objects, ``adp``/
 ``descriptions``/``affected`` not lists) are treated as empty; and a
 non-numeric or non-finite ``baseScore`` counts as unscored.
@@ -111,10 +111,15 @@ def select_cve_window(records: list[dict[str, Any]]) -> CVESelection | None:
             log.warning("Skipping malformed CVE record #%d", i)
             continue
         try:
-            infos.append(_extract_cve_info(record))
+            info = _extract_cve_info(record)
         except (AttributeError, TypeError, ValueError, KeyError, IndexError) as exc:
             log.warning("Skipping malformed CVE record #%d: %s", i, type(exc).__name__)
             continue
+        if not info.cve_id:
+            # A record without a CVE id cannot be cited, so it never competes.
+            log.warning("Skipping CVE record #%d without a CVE id", i)
+            continue
+        infos.append(info)
     if not infos:
         return None
     # Each timestamp is parsed once; grouping, tie-break and the skipped range

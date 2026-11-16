@@ -656,11 +656,10 @@ def test_bad_nested_types_never_raise():
 
     sel = select_cve_window([good, bad_meta, bad_containers, bad_cna, bad_lists])
 
-    # bad_meta keeps its score but has no id/date (undated → window 1) and
-    # outscores the rest; containers/cna-broken records are unscored.
+    # bad_meta has no CVE id, so it is skipped despite its score;
+    # containers/cna-broken records are unscored, so the good record wins.
     assert sel is not None
-    assert sel.cve.cvss_score == 9.9
-    assert sel.cve.cve_id == ""
+    assert sel.cve.cve_id == "CVE-2026-0001"
     assert select_cve_window([bad_containers, bad_cna, bad_lists]) is None
 
 
