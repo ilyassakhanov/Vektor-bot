@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import threading
 import time
@@ -25,6 +26,7 @@ from mcp.client.stdio import (
 )
 
 import metrics
+from config import exec_timeout_from_env
 from llm.base import ToolSpec
 from tools.base import Tool
 
@@ -41,19 +43,6 @@ _KEEP_VARS: tuple[str, ...] = (
     "https_proxy",
     "no_proxy",
 )
-
-_DEFAULT_CALL_TIMEOUT = 30.0
-
-
-def _exec_timeout_from_env() -> float:
-    """Resolve the call timeout from ``EXEC_TIMEOUT``, falling back to default."""
-    raw = os.environ.get("EXEC_TIMEOUT")
-    if raw is None:
-        return _DEFAULT_CALL_TIMEOUT
-    try:
-        return float(raw)
-    except ValueError:
-        return _DEFAULT_CALL_TIMEOUT
 
 
 def build_server_env() -> dict[str, str]:
@@ -148,7 +137,13 @@ class McpStdioClient:
             else:
                 self._env["PYTHONPATH"] = pythonpath
         self._startup_timeout = startup_timeout
-        self._call_timeout = call_timeout or _exec_timeout_from_env()
+        if call_timeout is None:
+            call_timeout = exec_timeout_from_env()
+        elif not (math.isfinite(call_timeout) and call_timeout > 0):
+            raise ValueError(
+                f"call_timeout must be a positive finite number, got {call_timeout!r}"
+            )
+        self._call_timeout = call_timeout
         self._cwd = cwd
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None

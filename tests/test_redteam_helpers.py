@@ -284,7 +284,7 @@ def test_chat_payload_matches_what_chat_sends() -> None:
     llm.chat(messages, tools, system="SYS")
 
     assert sent == [llm.chat_payload(messages, tools, "SYS")]
-    streamed = llm.chat_payload(messages, tools, "SYS", stream=True)
-    assert streamed["stream"] is True
-    assert streamed["options"]["num_ctx"] == 4096
-    assert streamed["keep_alive"] == "30m"
+    payload = llm.chat_payload(messages, tools, "SYS")
+    assert payload["stream"] is False
+    assert payload["options"]["num_ctx"] == 4096
+    assert payload["keep_alive"] == "30m"

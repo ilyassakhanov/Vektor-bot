@@ -13,7 +13,11 @@ Algorithm:
 3. Scan windows newest first and use the first one containing a CVE with
    CVSS data (CVEs without CVSS define windows but cannot win).
 4. Within that window, select the highest CVSS baseScore.
-5. If scores tie, select the most recently published.
+5. If scores tie, select the most recently published (compared as parsed
+   instants, naive = UTC; unparseable timestamps rank oldest). If the instants
+   are equal too, the highest CVE id wins, compared as a parsed
+   ``(year, sequence number)`` tuple (unparseable ids rank lowest) — never on
+   the raw timestamp strings.
 6. Return None only if no record at all has CVSS data.
 
 When newer windows were skipped because they were unscored, the selection is
@@ -24,6 +28,7 @@ and their publication range so callers can say so transparently.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -31,6 +36,17 @@ from typing import Any
 log = logging.getLogger("vektor.agent.cve_selector")
 
 _WINDOW_MINUTES = 5.0
+_OLDEST = datetime.min.replace(tzinfo=UTC)
+_CVE_ID_RE = re.compile(r"^CVE-(\d{4})-(\d{4,})$", re.IGNORECASE)
+_UNPARSEABLE_ID = (-1, -1)
+
+
+def _cve_id_key(cve_id: str) -> tuple[int, int]:
+    """``CVE-YYYY-NNNN`` → ``(year, number)``; unparseable ids rank lowest."""
+    match = _CVE_ID_RE.match(cve_id.strip())
+    if match is None:
+        return _UNPARSEABLE_ID
+    return int(match.group(1)), int(match.group(2))
 
 
 @dataclass(frozen=True)
@@ -64,14 +80,12 @@ class CVESelection:
     skipped_oldest: str | None = None
 
 
-def select_cve(records: list[dict[str, Any]]) -> CVEInfo | None:
-    """Select the highest-scoring CVE from the newest scored window.
+@dataclass(frozen=True)
+class _Dated:
+    """A CVE paired with its publication instant, parsed once (None = unparseable)."""
 
-    Returns None if no record has CVSS data. See :func:`select_cve_window`
-    for the fallback details.
-    """
-    selection = select_cve_window(records)
-    return selection.cve if selection is not None else None
+    cve: CVEInfo
+    at: datetime | None
 
 
 def select_cve_window(records: list[dict[str, Any]]) -> CVESelection | None:
@@ -83,19 +97,29 @@ def select_cve_window(records: list[dict[str, Any]]) -> CVESelection | None:
         return None
 
     infos = [_extract_cve_info(r) for r in records]
-    windows = _group_windows(infos)
+    # Each timestamp is parsed once; grouping, tie-break and the skipped range
+    # all reuse the same instant.
+    dated = [_Dated(info, _parse_ts(info.date_published)) for info in infos]
+    windows = _group_windows(dated)
     log.info("CVE windows: %d (records=%d)", len(windows), len(infos))
 
-    skipped: list[CVEInfo] = []
+    skipped: list[_Dated] = []
     for window in windows:
-        with_scores = [c for c in window if c.cvss_score is not None]
+        with_scores = [d for d in window if d.cve.cvss_score is not None]
         if not with_scores:
             skipped.extend(window)
             continue
-        winner = max(
+        # Ties break on the parsed instant (mixed offsets compare correctly;
+        # unparseable timestamps rank oldest), then on the parsed CVE id.
+        best = max(
             with_scores,
-            key=lambda c: (c.cvss_score or 0.0, c.date_published),
+            key=lambda d: (
+                d.cve.cvss_score or 0.0,
+                d.at or _OLDEST,
+                _cve_id_key(d.cve.cve_id),
+            ),
         )
+        winner = best.cve
         log.info(
             "Selected: %s (score=%s, published=%s, skipped_unscored=%d)",
             winner.cve_id,
@@ -105,14 +129,16 @@ def select_cve_window(records: list[dict[str, Any]]) -> CVESelection | None:
         )
         if not skipped:
             return CVESelection(cve=winner)
-        stamps = [c.date_published for c in skipped if _parse_ts(c.date_published)]
-        stamps.sort(key=lambda ts: _parse_ts(ts) or datetime.min.replace(tzinfo=UTC))
+        stamped = sorted(
+            (d for d in skipped if d.at is not None),
+            key=lambda d: d.at or _OLDEST,
+        )
         return CVESelection(
             cve=winner,
             fallback=True,
             skipped_unscored=len(skipped),
-            skipped_newest=stamps[-1] if stamps else None,
-            skipped_oldest=stamps[0] if stamps else None,
+            skipped_newest=stamped[-1].cve.date_published,
+            skipped_oldest=stamped[0].cve.date_published,
         )
 
     log.info("No CVEs with CVSS data in any window")
@@ -130,37 +156,37 @@ def _parse_ts(value: str) -> datetime | None:
     return dt
 
 
-def _group_windows(cves: list[CVEInfo]) -> list[list[CVEInfo]]:
+def _group_windows(cves: list[_Dated]) -> list[list[_Dated]]:
     """Group CVEs into deterministic windows, newest window first.
 
     Records with an unparseable timestamp join the first (newest) window, as
     in the original single-window behaviour. If no timestamp parses, all
     records form one window.
+
+    Membership is tested as ``anchor - at > span`` (equivalent to
+    ``at < anchor - span``): the difference of two aware datetimes never
+    overflows, whereas ``anchor - span`` raises OverflowError for an anchor
+    within 5 minutes of ``datetime.min`` (e.g. ``0001-01-01T00:00:00Z``).
     """
-    dated: list[tuple[datetime, CVEInfo]] = []
-    undated: list[CVEInfo] = []
-    for cve in cves:
-        dt = _parse_ts(cve.date_published)
-        if dt is None:
-            undated.append(cve)
-        else:
-            dated.append((dt, cve))
+    dated = [d for d in cves if d.at is not None]
+    undated = [d for d in cves if d.at is None]
 
     if not dated:
         return [undated]
 
-    dated.sort(key=lambda pair: pair[0], reverse=True)
+    dated.sort(key=lambda d: d.at or _OLDEST, reverse=True)
     span = timedelta(minutes=_WINDOW_MINUTES)
-    windows: list[list[CVEInfo]] = []
-    current: list[CVEInfo] = []
-    cutoff: datetime | None = None
-    for dt, cve in dated:
-        if cutoff is None or dt < cutoff:
+    windows: list[list[_Dated]] = []
+    current: list[_Dated] = []
+    anchor: datetime | None = None
+    for d in dated:
+        at = d.at or _OLDEST
+        if anchor is None or anchor - at > span:
             if current:
                 windows.append(current)
             current = []
-            cutoff = dt - span
-        current.append(cve)
+            anchor = at
+        current.append(d)
     windows.append(current)
     windows[0].extend(undated)
     return windows

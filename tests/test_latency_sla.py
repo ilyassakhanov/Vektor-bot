@@ -56,12 +56,12 @@ def _production_chat_payload(model: str, *, stream: bool) -> dict[str, Any]:
     specs = bot.build_tool_registry(None).specs()
     llm = OllamaLLM(base_url=ollama_base_url(), model=model)
     try:
-        return llm.chat_payload(
+        payload = llm.chat_payload(
             [Message(role="user", content=_TINY_PROMPT)],
             specs,
             system,
-            stream=stream,
         )
+        return {**payload, "stream": stream}
     finally:
         llm.close()
 

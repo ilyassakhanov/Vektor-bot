@@ -375,7 +375,7 @@ def _build_argv(resolved: str, argv: Sequence[str], timeout: float) -> list[str]
     The forced curl flags come last so they win over any user-supplied value.
     """
     out = [resolved, *argv[1:]]
-    if os.path.basename(argv[0]) == "curl":
+    if argv[0] == "curl":
         out += [
             "--globoff",
             "--max-time",
@@ -383,8 +383,6 @@ def _build_argv(resolved: str, argv: Sequence[str], timeout: float) -> list[str]
             "--max-filesize",
             _CURL_MAX_FILESIZE,
             "--proto",
-            "=https",
-            "--proto-redir",
             "=https",
         ]
     return out
@@ -462,9 +460,6 @@ class ExecTool(Tool):
             argv = shlex.split(command)
         except ValueError:
             return self._reject(_first_word(command), "parse", _PARSE_REJECT)
-        if not argv:
-            return self._format("", "", 0)
-
         name = argv[0]
         if "/" in name or name not in self._allowed:
             msg = (

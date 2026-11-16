@@ -62,6 +62,13 @@ rate_limited_total = Counter(
     ["reason"],
 )
 
+chat_busy_total = Counter(
+    "vektor_chat_busy_total",
+    "Messages rejected because their chat already has a run in flight, by path"
+    " (text, upload, new)",
+    ["path"],
+)
+
 agent_budget_exceeded_total = Counter(
     "vektor_agent_budget_exceeded_total",
     "Agent runs stopped by the wall-clock budget (AGENT_MAX_RUN_SECONDS)",

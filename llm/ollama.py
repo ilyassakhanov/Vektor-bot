@@ -173,21 +173,19 @@ class OllamaLLM(LLM):
         messages: list[Message],
         tools: list[ToolSpec],
         system: str = "",
-        *,
-        stream: bool = False,
     ) -> dict[str, Any]:
-        """The ``/api/chat`` request body :meth:`chat` sends.
+        """The ``/api/chat`` request body :meth:`chat` sends (always ``"stream": False``).
 
         Public so callers that need the exact production shape (e.g. the
-        streaming latency test) do not rebuild it by hand. ``chat`` always
-        uses ``stream=False``.
+        streaming latency test, which copies it with ``"stream": True``) do
+        not rebuild it by hand.
         """
         ollama_messages = [_message_to_ollama(m) for m in messages]
         if system:
             ollama_messages.insert(0, {"role": "system", "content": system})
         payload: dict[str, Any] = {
             "model": self._model,
-            "stream": stream,
+            "stream": False,
             "messages": ollama_messages,
         }
         if tools:

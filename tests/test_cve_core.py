@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+import cve_core
 from cve_core import get_latest_cve_fact_sheet
 
 
@@ -635,3 +636,214 @@ def test_deadline_with_no_records_returns_failure_message():
 
     assert elapsed < 1.0
     assert result == "Failed to retrieve any CVE records from cveawg.mitre.org."
+
+
+def test_discovery_request_timeout_is_capped_to_the_deadline():
+    """The GitHub discovery request shares the run deadline: its timeout is
+    capped to the time left (80 % of the timeout), not the full client timeout."""
+    records = [_make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=9.0)]
+    serve = _serve(records, _commits_response(["CVE-2026-0001"]))
+    discovery_timeouts: list[dict[str, float]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            discovery_timeouts.append(req.extensions["timeout"])
+        return serve(req)
+
+    client = _make_client(handler)  # client timeout 5.0 s
+    result = get_latest_cve_fact_sheet(client=client, timeout=1.0)
+
+    assert result.startswith("CVE_ID: CVE-2026-0001")
+    assert len(discovery_timeouts) == 1
+    assert 0 < discovery_timeouts[0]["read"] <= 0.8
+
+
+def test_slow_discovery_keeps_whole_call_inside_the_timeout():
+    """Discovery eating most of the budget leaves the fetches only what remains,
+    so the whole call still returns inside the timeout."""
+    records = [_make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=9.0)]
+    commits = _commits_response(["CVE-2026-0001"])
+    release = threading.Event()
+    serve = _serve(records, commits)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            time.sleep(0.7)  # most of the 0.8 s budget
+            return serve(req)
+        release.wait(10.0)  # record fetches never answer in time
+        return serve(req)
+
+    client = _make_client(handler)
+    try:
+        start = time.monotonic()
+        result = get_latest_cve_fact_sheet(client=client, timeout=1.0)
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+
+    assert elapsed < 1.0
+    assert result == "Failed to retrieve any CVE records from cveawg.mitre.org."
+
+
+def test_discovery_past_the_deadline_is_not_requested():
+    requests: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        requests.append(str(req.url))
+        return httpx.Response(200, json=[])
+
+    result = get_latest_cve_fact_sheet(client=_make_client(handler), timeout=0.0)
+
+    assert requests == []
+    assert result == cve_core._DISCOVERY_TIMEOUT_MESSAGE
+    assert "No recent CVE IDs" not in result
+
+
+def test_discovery_request_timeout_yields_timeout_message():
+    """A timed-out discovery request is reported as a timeout, not as
+    "no CVEs published"."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow github", request=req)
+
+    result = get_latest_cve_fact_sheet(client=_make_client(handler), timeout=1.0)
+
+    assert result.startswith("CVE lookup timed out")
+    assert "No recent CVE IDs" not in result
+
+
+def test_discovery_http_error_yields_failure_message():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
+
+    assert result == cve_core._DISCOVERY_FAILED_MESSAGE
+    assert "No recent CVE IDs" not in result
+
+
+def test_genuinely_empty_discovery_keeps_no_ids_message():
+    result = get_latest_cve_fact_sheet(
+        client=_make_client(lambda req: httpx.Response(200, json=[])), timeout=1.0
+    )
+
+    assert result.startswith("No recent CVE IDs found")
+
+
+# --- _capped_timeout -----------------------------------------------------------
+
+
+def _client_with(timeout: httpx.Timeout) -> httpx.Client:
+    return httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200)), timeout=timeout
+    )
+
+
+def test_capped_timeout_keeps_stricter_phase_and_caps_looser_ones():
+    with _client_with(httpx.Timeout(30.0, connect=3.0)) as client:
+        capped = cve_core._capped_timeout(client, deadline=110.0, clock=lambda: 100.0)
+
+    assert capped is not None
+    assert capped.connect == 3.0
+    assert capped.read == 10.0
+    assert capped.write == 10.0
+    assert capped.pool == 10.0
+
+
+def test_capped_timeout_none_phases_become_remaining():
+    with _client_with(httpx.Timeout(None, pool=1.0)) as client:
+        capped = cve_core._capped_timeout(client, deadline=5.0, clock=lambda: 3.0)
+
+    assert capped is not None
+    assert (capped.connect, capped.read, capped.write, capped.pool) == (
+        2.0,
+        2.0,
+        2.0,
+        1.0,
+    )
+
+
+def test_capped_timeout_returns_none_past_deadline():
+    with _client_with(httpx.Timeout(30.0)) as client:
+        assert cve_core._capped_timeout(client, 10.0, clock=lambda: 10.0) is None
+        assert cve_core._capped_timeout(client, 10.0, clock=lambda: 11.0) is None
+
+
+def test_both_request_sites_use_capped_timeout(monkeypatch):
+    """Discovery and record fetches go through ``_capped_timeout``; the
+    stricter client connect timeout reaches the wire for both."""
+    records = [_make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=9.0)]
+    serve = _serve(records, _commits_response(["CVE-2026-0001"]))
+    seen: dict[str, dict[str, float]] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        kind = "discovery" if "api.github.com" in str(req.url) else "record"
+        seen[kind] = req.extensions["timeout"]
+        return serve(req)
+
+    calls: list[float] = []
+    real = cve_core._capped_timeout
+
+    def spy(client: httpx.Client, deadline: float, *a: Any) -> httpx.Timeout | None:
+        calls.append(deadline)
+        return real(client, deadline, *a)
+
+    monkeypatch.setattr(cve_core, "_capped_timeout", spy)
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), timeout=httpx.Timeout(30.0, connect=0.1)
+    )
+    result = get_latest_cve_fact_sheet(client=client, timeout=10.0)
+
+    assert result.startswith("CVE_ID: CVE-2026-0001")
+    assert len(calls) == 2
+    for kind in ("discovery", "record"):
+        assert seen[kind]["connect"] == 0.1
+        assert 0 < seen[kind]["read"] <= 8.0
+        assert 0 < seen[kind]["pool"] <= 8.0
+
+
+# --- Malformed commit entries never escape the never-raises contract ---------
+
+
+def test_partly_malformed_commits_skip_bad_entries():
+    """Malformed entries are skipped; well-formed ones still yield CVE IDs."""
+    cve = _make_cve("CVE-2026-0042", "2026-08-28T15:23:00Z", score=7.5)
+    commits: list[Any] = [
+        {"commit": "not-a-dict"},
+        {"commit": {"message": 12345}},
+        {"commit": {"message": ["CVE-2026-9999"]}},
+        "a bare string",
+        None,
+        {"commit": None},
+        {"commit": {"message": "Update CVE-2026-0042"}},
+    ]
+    fetched: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            return httpx.Response(200, json=commits)
+        fetched.append(str(req.url).rsplit("/", 1)[-1])
+        return httpx.Response(200, json=cve)
+
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
+
+    assert "CVE_ID: CVE-2026-0042" in result
+    assert fetched == ["CVE-2026-0042"]
+
+
+def test_fully_malformed_commits_return_discovery_failure():
+    """A non-empty payload with no well-formed entry is a discovery failure."""
+    commits: list[Any] = [
+        {"commit": "not-a-dict"},
+        {"commit": {"message": 12345}},
+        42,
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            return httpx.Response(200, json=commits)
+        raise AssertionError("no record fetch expected")
+
+    result = get_latest_cve_fact_sheet(client=_make_client(handler))
+
+    assert result == cve_core._DISCOVERY_FAILED_MESSAGE

@@ -15,6 +15,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 log = logging.getLogger("vektor.agent.rate_limit")
 
@@ -30,7 +31,7 @@ class RateDecision:
     """
 
     ok: bool
-    reason: str | None = None
+    reason: Literal["in_flight", "window"] | None = None
 
 
 class RateLimiter:

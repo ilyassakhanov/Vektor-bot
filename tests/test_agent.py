@@ -742,3 +742,41 @@ def test_build_agent_reads_max_tool_calls_per_turn(monkeypatch, value, expected)
         monkeypatch.setenv("AGENT_MAX_TOOL_CALLS_PER_TURN", value)
     agent = bot.build_agent(ScriptedLLM([]), _make_registry())
     assert agent._max_tool_calls_per_turn == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 8), ("3", 3), ("0", 8), ("-2", 8), ("eight", 8), ("2.5", 8)],
+)
+def test_build_agent_reads_max_iterations(monkeypatch, caplog, value, expected):
+    import bot
+
+    if value is None:
+        monkeypatch.delenv("AGENT_MAX_ITERATIONS", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_MAX_ITERATIONS", value)
+    with caplog.at_level("WARNING", logger="vektor"):
+        agent = bot.build_agent(ScriptedLLM([]), _make_registry())
+    assert agent._max_iterations == expected
+    warned = any("AGENT_MAX_ITERATIONS" in r.getMessage() for r in caplog.records)
+    assert warned is (value is not None and expected == 8)
+
+
+def test_build_agent_zero_max_iterations_still_calls_the_llm(monkeypatch):
+    import bot
+
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "0")
+    llm = ScriptedLLM([ChatResponse(content="hi")])
+    assert bot.build_agent(llm, _make_registry()).run("hello") == "hi"
+    assert len(llm.chat_calls) == 1
+
+
+@pytest.mark.parametrize("bad", [0, -1, -8])
+def test_agent_rejects_max_iterations_below_one(bad):
+    with pytest.raises(ValueError, match="max_iterations"):
+        Agent(ScriptedLLM([]), _make_registry(), max_iterations=bad)
+
+
+def test_agent_accepts_max_iterations_of_one():
+    llm = ScriptedLLM([ChatResponse(content="hi")])
+    assert Agent(llm, _make_registry(), max_iterations=1).run("hello") == "hi"

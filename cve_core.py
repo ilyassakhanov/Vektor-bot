@@ -3,7 +3,7 @@
 This module does all the heavy lifting programmatically so the LLM doesn't have
 to: it discovers recently published CVE IDs from the official CVE Program
 GitHub repository, retrieves each CVE record from the official CVE Services
-API, and runs the deterministic :func:`select_cve` selector to pick the
+API, and runs the deterministic :func:`select_cve_window` selector to pick the
 single most critical CVE (highest CVSS in the newest publication window
 that has scored CVEs; newer all-unscored windows are skipped and reported
 in a ``FALLBACK_NOTE:`` line).
@@ -16,15 +16,16 @@ comparison, or windowing logic on the LLM side.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any
 
 import httpx
 
 from agent.cve_selector import CVESelection, select_cve_window
+from config import exec_timeout_from_env
 from tools.truncation import max_output_chars_from_env, truncate
 
 log = logging.getLogger("vektor.cve_core")
@@ -34,7 +35,6 @@ _CVELIST_COMMITS_URL = (
 )
 _CVE_RECORD_URL = "https://cveawg.mitre.org/api/cve/{cve_id}"
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d+")
-_DEFAULT_TIMEOUT = 30.0
 # Wide enough that an earlier scored window is reachable when the newest
 # commits are one large unscored CNA batch.
 _DEFAULT_COMMIT_COUNT = 5
@@ -48,24 +48,50 @@ _FETCH_WORKERS = 8
 # pool waves of per-request timeouts.
 _DEADLINE_FRACTION = 0.8
 
+_NO_IDS_MESSAGE = (
+    "No recent CVE IDs found from the official CVE Program "
+    "repository (CVEProject/cvelistV5). Try again later."
+)
+_DISCOVERY_TIMEOUT_MESSAGE = (
+    "CVE lookup timed out before recent CVE IDs could be discovered from the "
+    "official CVE Program repository (CVEProject/cvelistV5). Try again later."
+)
+_DISCOVERY_FAILED_MESSAGE = (
+    "Failed to discover recent CVE IDs from the official CVE Program "
+    "repository (CVEProject/cvelistV5). Try again later."
+)
 
-def _exec_timeout_from_env() -> float:
-    """Resolve the exec timeout from ``EXEC_TIMEOUT``, falling back to default.
 
-    Reads the ``EXEC_TIMEOUT`` environment variable. Unset or non-numeric
-    values fall back to ``_DEFAULT_TIMEOUT`` (30.0). A valid numeric value
-    is returned as ``float``.
+class _DiscoveryError(Exception):
+    """Discovery could not run to completion; ``str(exc)`` is the user message."""
+
+
+def _capped_timeout(
+    client: httpx.Client,
+    deadline: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> httpx.Timeout | None:
+    """Return the client's timeout with every phase capped to the time left.
+
+    Each httpx phase (connect/read/write/pool) becomes
+    ``min(client phase, remaining)``; a phase the client leaves unlimited
+    (``None``) becomes ``remaining``. A stricter client phase is kept.
+    Returns None once ``deadline`` (a ``clock()`` value) has passed.
     """
-    raw = os.environ.get("EXEC_TIMEOUT")
-    if raw is None:
-        return _DEFAULT_TIMEOUT
-    try:
-        return float(raw)
-    except ValueError:
-        log.warning(
-            "Invalid EXEC_TIMEOUT %r, using default %.1f", raw, _DEFAULT_TIMEOUT
-        )
-        return _DEFAULT_TIMEOUT
+    remaining = deadline - clock()
+    if remaining <= 0:
+        return None
+
+    def cap(phase: float | None) -> float:
+        return remaining if phase is None else min(phase, remaining)
+
+    base = client.timeout
+    return httpx.Timeout(
+        connect=cap(base.connect),
+        read=cap(base.read),
+        write=cap(base.write),
+        pool=cap(base.pool),
+    )
 
 
 def get_latest_cve_fact_sheet(
@@ -90,10 +116,12 @@ def get_latest_cve_fact_sheet(
     default 4000) via the shared head+tail truncation helper.
 
     When ``timeout is None``, the timeout is resolved from the
-    ``EXEC_TIMEOUT`` environment variable (default 30.0).
+    ``EXEC_TIMEOUT`` environment variable via :func:`config.positive_env`
+    (default 30.0; invalid, ``<= 0``, NaN or inf → default with a warning;
+    above ``config.MAX_TIMEOUT_S`` → clamped with a warning).
     """
     own_client = client is None
-    resolved_timeout = _exec_timeout_from_env() if timeout is None else timeout
+    resolved_timeout = exec_timeout_from_env() if timeout is None else timeout
     deadline = time.monotonic() + resolved_timeout * _DEADLINE_FRACTION
     http_client = client or httpx.Client(
         timeout=resolved_timeout,
@@ -102,12 +130,12 @@ def get_latest_cve_fact_sheet(
     cap = max_output_chars_from_env(max_output_chars)
     try:
         log.info("cve_core: discovering recent CVE IDs")
-        cve_ids = _discover_cve_ids(http_client, commit_count)
+        try:
+            cve_ids = _discover_cve_ids(http_client, commit_count, deadline)
+        except _DiscoveryError as exc:
+            return str(exc)
         if not cve_ids:
-            return (
-                "No recent CVE IDs found from the official CVE Program "
-                "repository (CVEProject/cvelistV5). Try again later."
-            )
+            return _NO_IDS_MESSAGE
 
         cve_ids = cve_ids[:max_records]
         log.info("cve_core: retrieving %d CVE records", len(cve_ids))
@@ -136,33 +164,84 @@ def get_latest_cve_fact_sheet(
             http_client.close()
 
 
-def _discover_cve_ids(client: httpx.Client, commit_count: int) -> list[str]:
-    """Fetch recent commits and extract unique CVE IDs."""
+def _discover_cve_ids(
+    client: httpx.Client, commit_count: int, deadline: float
+) -> list[str]:
+    """Fetch recent commits and extract unique CVE IDs.
+
+    The request timeout is capped to the time left before ``deadline`` (a
+    ``time.monotonic()`` value), so discovery shares the run's budget with
+    the record fetches; past the deadline nothing is requested.
+
+    An empty list means discovery succeeded but found no CVE IDs. A deadline
+    hit or request timeout raises :class:`_DiscoveryError` with the timeout
+    message; any other HTTP/parse failure raises it with the failure message.
+    Malformed commit entries (non-dict entry, non-dict ``commit``, non-str
+    ``message``) are skipped; a non-empty payload with no well-formed entry
+    counts as a parse failure.
+    """
+    timeout = _capped_timeout(client, deadline)
+    if timeout is None:
+        log.warning("cve_core: deadline hit before CVE ID discovery")
+        raise _DiscoveryError(_DISCOVERY_TIMEOUT_MESSAGE)
     url = _CVELIST_COMMITS_URL.format(count=commit_count)
     try:
-        resp = client.get(url)
+        resp = client.get(url, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
+    except httpx.TimeoutException as exc:
+        log.warning("cvelistV5 commits request timed out: %s", type(exc).__name__)
+        raise _DiscoveryError(_DISCOVERY_TIMEOUT_MESSAGE) from exc
     except (httpx.HTTPError, ValueError) as exc:
         log.warning("Failed to fetch cvelistV5 commits: %s", exc)
-        return []
+        raise _DiscoveryError(_DISCOVERY_FAILED_MESSAGE) from exc
 
     if not isinstance(data, list):
-        return []
+        log.warning("cvelistV5 commits response is not a list")
+        raise _DiscoveryError(_DISCOVERY_FAILED_MESSAGE)
 
     seen: set[str] = set()
     ids: list[str] = []
+    well_formed = 0
     for commit in data:
-        if not isinstance(commit, dict):
+        message = _commit_message(commit)
+        if message is None:
             continue
-        msg_obj = commit.get("commit") or {}
-        message = msg_obj.get("message") or ""
+        well_formed += 1
         for match in _CVE_ID_RE.findall(message):
             if match not in seen:
                 seen.add(match)
                 ids.append(match)
+    if data and not well_formed:
+        log.warning("cvelistV5 commits response has no well-formed commit entries")
+        raise _DiscoveryError(_DISCOVERY_FAILED_MESSAGE)
+    if well_formed < len(data):
+        log.warning(
+            "Skipped %d malformed cvelistV5 commit entries", len(data) - well_formed
+        )
     log.info("Discovered %d unique CVE IDs", len(ids))
     return ids
+
+
+def _commit_message(commit: object) -> str | None:
+    """Return a GitHub commit entry's message, or None if the entry is malformed.
+
+    Well-formed means ``{"commit": {"message": str}}``; a missing/null
+    ``commit`` or ``message`` counts as an empty message (no CVE IDs).
+    """
+    if not isinstance(commit, dict):
+        return None
+    msg_obj = commit.get("commit")
+    if msg_obj is None:
+        return ""
+    if not isinstance(msg_obj, dict):
+        return None
+    message = msg_obj.get("message")
+    if message is None:
+        return ""
+    if not isinstance(message, str):
+        return None
+    return message
 
 
 def _fetch_records(
@@ -178,15 +257,13 @@ def _fetch_records(
     """
 
     def fetch(cve_id: str) -> dict[str, Any] | None:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        # Cap the request so an abandoned fetch ends near the deadline.
+        timeout = _capped_timeout(client, deadline)
+        if timeout is None:
             return None
         url = _CVE_RECORD_URL.format(cve_id=cve_id)
         try:
-            # Cap the request so an abandoned fetch ends near the deadline.
-            resp = client.get(
-                url, timeout=min(client.timeout.read or remaining, remaining)
-            )
+            resp = client.get(url, timeout=timeout)
             resp.raise_for_status()
             data: dict[str, Any] = resp.json()
             return data
@@ -227,29 +304,20 @@ def _fetch_records(
 def _format_cve(selection: CVESelection, total_retrieved: int) -> str:
     """Format a CVE selection into a compact fact sheet for the LLM."""
     cve = selection.cve
-    cve_id = getattr(cve, "cve_id", "unknown")
-    score = getattr(cve, "cvss_score", None)
-    severity = getattr(cve, "cvss_severity", None)
-    date_pub = getattr(cve, "date_published", None)
-    vendor = getattr(cve, "vendor", None)
-    product = getattr(cve, "product", None)
-    description = getattr(cve, "description", None)
-    attack_vector = getattr(cve, "attack_vector", None)
-
     lines = [
-        f"CVE_ID: {cve_id}",
-        f"CVSS_SCORE: {score if score is not None else 'N/A'}",
-        f"CVSS_SEVERITY: {severity or 'N/A'}",
-        f"PUBLISHED: {date_pub or 'N/A'}",
+        f"CVE_ID: {cve.cve_id}",
+        f"CVSS_SCORE: {cve.cvss_score if cve.cvss_score is not None else 'N/A'}",
+        f"CVSS_SEVERITY: {cve.cvss_severity or 'N/A'}",
+        f"PUBLISHED: {cve.date_published or 'N/A'}",
     ]
     # Placed before DESCRIPTION so head+tail truncation never drops it.
     if selection.fallback:
         lines.append(_fallback_note(selection))
     lines += [
-        f"VENDOR: {vendor or 'N/A'}",
-        f"PRODUCT: {product or 'N/A'}",
-        f"DESCRIPTION: {description or 'N/A'}",
-        f"ATTACK_VECTOR: {attack_vector or 'N/A'}",
+        f"VENDOR: {cve.vendor or 'N/A'}",
+        f"PRODUCT: {cve.product or 'N/A'}",
+        f"DESCRIPTION: {cve.description or 'N/A'}",
+        f"ATTACK_VECTOR: {cve.attack_vector or 'N/A'}",
         f"RECORDS_RETRIEVED: {total_retrieved}",
         "DATA_SOURCE: CVE.org (cveawg.mitre.org/api/cve, CVEProject/cvelistV5)",
         (
@@ -264,12 +332,10 @@ def _format_cve(selection: CVESelection, total_retrieved: int) -> str:
 def _fallback_note(selection: CVESelection) -> str:
     """Describe the skipped unscored windows in one line."""
     newest, oldest = selection.skipped_newest, selection.skipped_oldest
-    if newest and oldest and newest != oldest:
-        when = f"published {oldest} to {newest}"
-    elif newest or oldest:
-        when = f"published {newest or oldest}"
+    if newest == oldest:
+        when = f"published {newest}"
     else:
-        when = "publication time unknown"
+        when = f"published {oldest} to {newest}"
     return (
         f"FALLBACK_NOTE: the newest {selection.skipped_unscored} CVE(s) "
         f"({when}) have no CVSS score yet; showing the most critical CVE "

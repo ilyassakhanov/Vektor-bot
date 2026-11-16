@@ -47,7 +47,8 @@ class Agent:
         llm: The LLM provider (must implement the ``chat()`` interface).
         tools: ToolRegistry with available tools.
         system_prompt: System prompt (may include loaded skill instructions).
-        max_iterations: Maximum number of LLM calls before stopping.
+        max_iterations: Maximum number of LLM calls before stopping
+            (must be >= 1, otherwise ``ValueError``).
         max_run_seconds: Wall-clock budget per run, checked before every
             iteration after the first and before every tool call (``None`` or ``<= 0`` = no budget). It
             cannot interrupt an in-flight LLM call or tool, so a run can
@@ -68,6 +69,9 @@ class Agent:
         clock: Callable[[], float] = time.monotonic,
         max_tool_calls_per_turn: int | None = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     ) -> None:
+        if max_iterations < 1:
+            # 0 or negative would build an agent that never calls the LLM.
+            raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
         self._llm = llm
         self._tools = tools
         self._system = system_prompt
@@ -132,7 +136,8 @@ class Agent:
                 messages.append(
                     Message(role="tool", content=result, tool_call_id=tc.id)
                 )
-            if over_budget and budget is not None:
+            if over_budget:
+                assert budget is not None  # over_budget implies a budget
                 return self._budget_exceeded(messages, iteration + 1, budget)
 
         log.warning("Max iterations (%d) reached", self._max_iterations)

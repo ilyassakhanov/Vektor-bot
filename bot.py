@@ -23,7 +23,12 @@ import documents
 import logging_config
 import metrics
 from agent.agent import DEFAULT_MAX_TOOL_CALLS_PER_TURN, Agent
-from agent.conversation import ConversationManager
+from agent.conversation import (
+    NEW_COMMAND,
+    ChatBusyError,
+    ChatReservation,
+    ConversationManager,
+)
 from agent.rate_limit import (
     DEFAULT_MAX_PER_WINDOW,
     DEFAULT_WINDOW_S,
@@ -67,6 +72,7 @@ _DEFAULT_METRICS_PORT = 9100
 _DEFAULT_WORKER_THREADS = 4
 _MAX_WORKER_THREADS = 64
 _DEFAULT_MAX_RUN_SECONDS = 120.0
+_DEFAULT_MCP_STARTUP_TIMEOUT = 10.0
 _DEFAULT_MCP_COMMAND: list[str] = [
     sys.executable,
     str(_PROJECT_ROOT / "mcp_servers" / "cve_server.py"),
@@ -87,10 +93,18 @@ _VALIDATION_REPLIES = {
 _BUSY_REPLY = (
     "I'm still working on your previous message — please wait for it to finish."
 )
+_CHAT_BUSY_REPLY = (
+    "I'm still answering another message in this chat — please send yours again"
+    " once that reply arrives."
+)
 _RATE_LIMITED_REPLY = (
     "You're sending messages too fast. Please wait a minute and try again."
 )
 _RATE_LIMIT_REPLIES = {"in_flight": _BUSY_REPLY, "window": _RATE_LIMITED_REPLY}
+_DOCUMENT_BUSY_REPLY = (
+    "I'm still answering another message in this chat, so your document was NOT"
+    " ingested — please send it again once that reply arrives."
+)
 _DOCUMENT_RECEIVED_REPLY = "📄 Document received"
 _EXTRACTING_REPLY = "⏳ Extracting text…"
 _EMBEDDING_REPLY = "⏳ Generating embeddings…"
@@ -211,7 +225,7 @@ def build_tool_registry(
     registry; KBModelError propagates; False = degraded, never retried).
     """
     reg = InstrumentedToolRegistry()
-    timeout = float(os.environ.get("EXEC_TIMEOUT", "30"))
+    timeout = config.exec_timeout_from_env()
     reg.register(ExecTool(timeout=timeout))
     if mcp_client is not None:
         for spec in mcp_client.specs():
@@ -250,8 +264,9 @@ def build_agent(
     loader = SkillLoader(skills_dir)
     system_prompt = build_system_prompt(loader.system_prompt())
     if max_iterations is None:
-        max_iterations = int(
-            os.environ.get("AGENT_MAX_ITERATIONS", str(_DEFAULT_MAX_ITERATIONS))
+        # Invalid or < 1 warns and falls back (0 would never call the LLM).
+        max_iterations = config.positive_env(
+            "AGENT_MAX_ITERATIONS", _DEFAULT_MAX_ITERATIONS, int
         )
     return Agent(
         llm=llm,
@@ -259,27 +274,10 @@ def build_agent(
         system_prompt=system_prompt,
         max_iterations=max_iterations,
         max_run_seconds=_max_run_seconds_from_env(),
-        max_tool_calls_per_turn=_max_tool_calls_per_turn_from_env(),
+        max_tool_calls_per_turn=config.positive_env(
+            "AGENT_MAX_TOOL_CALLS_PER_TURN", DEFAULT_MAX_TOOL_CALLS_PER_TURN, int
+        ),
     )
-
-
-def _max_tool_calls_per_turn_from_env() -> int:
-    """Read ``AGENT_MAX_TOOL_CALLS_PER_TURN`` (default 4; invalid or < 1 warns)."""
-    raw = os.environ.get("AGENT_MAX_TOOL_CALLS_PER_TURN")
-    if raw is None:
-        return DEFAULT_MAX_TOOL_CALLS_PER_TURN
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    if value < 1:
-        log.warning(
-            "Invalid AGENT_MAX_TOOL_CALLS_PER_TURN %r, using default %d",
-            raw,
-            DEFAULT_MAX_TOOL_CALLS_PER_TURN,
-        )
-        return DEFAULT_MAX_TOOL_CALLS_PER_TURN
-    return value
 
 
 def _max_run_seconds_from_env() -> float:
@@ -341,56 +339,31 @@ def _metrics_port_from_env() -> int:
 
 
 def _worker_threads_from_env() -> int:
-    """Read ``BOT_WORKER_THREADS`` — default 4; invalid or < 1 warns and uses 4.
-
-    Values above 64 warn and are clamped to 64.
-    """
-    raw = os.environ.get("BOT_WORKER_THREADS")
-    if raw is None:
-        return _DEFAULT_WORKER_THREADS
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    if value < 1:
-        log.warning(
-            "Invalid BOT_WORKER_THREADS %r, using default %d",
-            raw,
-            _DEFAULT_WORKER_THREADS,
-        )
-        return _DEFAULT_WORKER_THREADS
-    if value > _MAX_WORKER_THREADS:
-        log.warning(
-            "BOT_WORKER_THREADS %d is above the maximum, using %d",
-            value,
-            _MAX_WORKER_THREADS,
-        )
-        return _MAX_WORKER_THREADS
-    return value
-
-
-def _positive_env(name: str, default: float, parse: Callable[[str], float]) -> float:
-    """Read a positive number from ``name``; warn and fall back on bad values."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = parse(raw)
-    except ValueError:
-        value = math.nan
-    if not (math.isfinite(value) and value > 0):
-        log.warning("Invalid %s %r, using default %s", name, raw, default)
-        return default
-    return value
+    """Read ``BOT_WORKER_THREADS`` — default 4; invalid or < 1 warns and uses 4;
+    above 64 warns and is clamped to 64."""
+    return config.positive_env(
+        "BOT_WORKER_THREADS", _DEFAULT_WORKER_THREADS, int, _MAX_WORKER_THREADS
+    )
 
 
 def build_rate_limiter() -> RateLimiter:
     """Build the per-user limiter from ``RATE_LIMIT_MAX_MESSAGES``/``RATE_LIMIT_WINDOW_S``."""
-    max_messages = int(
-        _positive_env("RATE_LIMIT_MAX_MESSAGES", DEFAULT_MAX_PER_WINDOW, int)
+    max_messages = config.positive_env(
+        "RATE_LIMIT_MAX_MESSAGES", DEFAULT_MAX_PER_WINDOW, int
     )
-    window_s = _positive_env("RATE_LIMIT_WINDOW_S", DEFAULT_WINDOW_S, float)
+    window_s = config.positive_env("RATE_LIMIT_WINDOW_S", DEFAULT_WINDOW_S, float)
     return RateLimiter(max_per_window=max_messages, window_s=window_s)
+
+
+def _mcp_startup_timeout_from_env() -> float:
+    """Read ``MCP_STARTUP_TIMEOUT`` — default 10; invalid/``<= 0``/NaN/inf warn
+    and use the default; above ``config.MAX_TIMEOUT_S`` warn and clamp."""
+    return config.positive_env(
+        "MCP_STARTUP_TIMEOUT",
+        _DEFAULT_MCP_STARTUP_TIMEOUT,
+        float,
+        config.MAX_TIMEOUT_S,
+    )
 
 
 def _mcp_command_from_env() -> list[str]:
@@ -519,7 +492,84 @@ def build_document_handler(
 
     Downloads/extracts/ingests BEFORE any agent run via ``ingest_document``
     (pages only for PDFs); failures end with exactly one friendly reply.
+    The chat is reserved (``conv.reserve``) before any download and held across
+    ingestion and the agent turn: a busy chat gets exactly one
+    ``_DOCUMENT_BUSY_REPLY`` and nothing is downloaded or ingested.
     """
+
+    def _ingest_and_answer(
+        message: telebot.types.Message,
+        doc: telebot.types.Document,
+        reservation: ChatReservation,
+        reply_to: Callable[..., None],
+    ) -> None:
+        """Download → extract → ingest → agent turn, all under ``reservation``."""
+        file_id = doc.file_id
+        file_name = doc.file_name or _DOCUMENT_FALLBACK_NAME
+        reply_to(message, _DOCUMENT_RECEIVED_REPLY)
+        reply_to(message, _EXTRACTING_REPLY)
+        try:
+            file_info = bot.get_file(file_id)
+            file_path = file_info.file_path
+            if not file_path:
+                raise DocumentError("Telegram returned no file path")
+            content = bot.download_file(file_path)
+            file_type = Path(file_name).suffix.lstrip(".").lower()
+            pages = documents.extract_pages(content, file_name)
+            text = "\n".join(page_text for _, page_text in pages if page_text)
+            reply_to(message, _EMBEDDING_REPLY)
+            ingest = KbIngestTool(
+                store=kb.store,
+                embedder=kb.embedder,
+                chunk_size=kb.cfg.kb_chunk_size,
+                chunk_overlap=kb.cfg.kb_chunk_overlap,
+            )
+            ingest_result = ingest.ingest_document(
+                text=text,
+                title=file_name,
+                filename=file_name,
+                file_type=file_type,
+                pages=pages if file_type == "pdf" else None,
+            )
+        except (ApiTelegramException, DocumentError, ToolError) as exc:
+            log.warning(
+                "document ingest failed for %r: %s", file_name, type(exc).__name__
+            )
+            reply_to(message, _DOCUMENT_ERROR_REPLY)
+            return
+        except Exception:
+            log.warning(
+                "document ingest failed for %r: unexpected error",
+                file_name,
+                exc_info=True,
+            )
+            reply_to(message, _DOCUMENT_ERROR_REPLY)
+            return
+        log.info(
+            "document %r ingested: %s chunks",
+            file_name,
+            _chunk_count(ingest_result),
+        )
+        reply_to(message, f"{_INGESTED_OK_PREFIX}{ingest_result}")
+        reply_to(message, _DOCUMENT_READY_REPLY)
+        notice = (
+            f'[document uploaded: "{file_name}", '
+            f"{_chunk_count(ingest_result)} chunks ingested; "
+            "content is now searchable via kb_search]"
+        )
+        caption = (getattr(message, "caption", None) or "").strip()
+        prompt = f"{notice}\n\n{caption}" if caption else notice
+        try:
+            response = conv.handle(message.chat.id, prompt, reservation=reservation)
+        except LLMError as exc:
+            log.warning("LLM error on document upload: %s", exc)
+            reply_to(message, _LLM_ERROR_REPLY)
+            return
+        except Exception:
+            log.warning("agent error on document upload", exc_info=True)
+            reply_to(message, _LLM_ERROR_REPLY)
+            return
+        _send_reply(reply_to, message, response)
 
     def handle_document(
         message: telebot.types.Message,
@@ -533,76 +583,25 @@ def build_document_handler(
                 log.warning("document message without a document payload")
                 reply_to(message, _DOCUMENT_ERROR_REPLY)
                 return
-            file_id = doc.file_id
-            file_name = doc.file_name or _DOCUMENT_FALLBACK_NAME
-            reply_to(message, _DOCUMENT_RECEIVED_REPLY)
-            reply_to(message, _EXTRACTING_REPLY)
             try:
-                file_info = bot.get_file(file_id)
-                file_path = file_info.file_path
-                if not file_path:
-                    raise DocumentError("Telegram returned no file path")
-                content = bot.download_file(file_path)
-                file_type = Path(file_name).suffix.lstrip(".").lower()
-                pages = documents.extract_pages(content, file_name)
-                text = "\n".join(page_text for _, page_text in pages if page_text)
-                reply_to(message, _EMBEDDING_REPLY)
-                ingest = KbIngestTool(
-                    store=kb.store,
-                    embedder=kb.embedder,
-                    chunk_size=kb.cfg.kb_chunk_size,
-                    chunk_overlap=kb.cfg.kb_chunk_overlap,
-                )
-                ingest_result = ingest.ingest_document(
-                    text=text,
-                    title=file_name,
-                    filename=file_name,
-                    file_type=file_type,
-                    pages=pages if file_type == "pdf" else None,
-                )
-            except (ApiTelegramException, DocumentError, ToolError) as exc:
-                log.warning(
-                    "document ingest failed for %r: %s", file_name, type(exc).__name__
-                )
-                reply_to(message, _DOCUMENT_ERROR_REPLY)
-                return
-            except Exception:
-                log.warning(
-                    "document ingest failed for %r: unexpected error",
-                    file_name,
-                    exc_info=True,
-                )
-                reply_to(message, _DOCUMENT_ERROR_REPLY)
-                return
-            log.info(
-                "document %r ingested: %s chunks",
-                file_name,
-                _chunk_count(ingest_result),
-            )
-            reply_to(message, f"{_INGESTED_OK_PREFIX}{ingest_result}")
-            reply_to(message, _DOCUMENT_READY_REPLY)
-            notice = (
-                f'[document uploaded: "{file_name}", '
-                f"{_chunk_count(ingest_result)} chunks ingested; "
-                "content is now searchable via kb_search]"
-            )
-            caption = (getattr(message, "caption", None) or "").strip()
-            prompt = f"{notice}\n\n{caption}" if caption else notice
-            try:
-                response = conv.handle(message.chat.id, prompt)
-            except LLMError as exc:
-                log.warning("LLM error on document upload: %s", exc)
-                reply_to(message, _LLM_ERROR_REPLY)
-                return
-            except Exception:
-                log.warning("agent error on document upload", exc_info=True)
-                reply_to(message, _LLM_ERROR_REPLY)
-                return
-            _send_reply(reply_to, message, response)
+                with conv.reserve(message.chat.id) as reservation:
+                    _ingest_and_answer(message, doc, reservation, reply_to)
+            except ChatBusyError:
+                _count_chat_busy("upload")
+                log.info("document upload rejected: chat busy")
+                reply_to(message, _DOCUMENT_BUSY_REPLY)
         finally:
             reset_user(principal_token)
 
     return handle_document
+
+
+def _count_chat_busy(path: str) -> None:
+    """Record a message rejected because its chat already has a run in flight.
+
+    ``path`` is an enum label: ``text``, ``upload`` or ``new``.
+    """
+    metrics.chat_busy_total.labels(path=path).inc()
 
 
 def _chunk_count(ingest_result: str) -> str:
@@ -649,7 +648,8 @@ def handle_message(
         principal = _principal_id(message)
         decision = rate_limiter.try_acquire(principal)
         if not decision.ok:
-            reason = decision.reason or "window"
+            reason = decision.reason
+            assert reason is not None  # try_acquire always sets it when not ok
             log.info("rate limited user=%s reason=%s", principal, reason)
             metrics.rate_limited_total.labels(reason=reason).inc()
             reply_to(message, _RATE_LIMIT_REPLIES[reason])
@@ -683,6 +683,10 @@ def _route_message(
         return
     try:
         response = conv.handle(message.chat.id, verdict.text)
+    except ChatBusyError:
+        _count_chat_busy("new" if verdict.text.strip() == NEW_COMMAND else "text")
+        reply_to(message, _CHAT_BUSY_REPLY)
+        return
     except LLMError as exc:
         log.warning("LLM error: %s", exc)
         reply_to(message, _LLM_ERROR_REPLY)
@@ -740,7 +744,7 @@ def main() -> None:
     mcp_client = McpStdioClient(
         command=_mcp_command_from_env(),
         env=build_server_env(),
-        startup_timeout=float(os.environ.get("MCP_STARTUP_TIMEOUT", "10")),
+        startup_timeout=_mcp_startup_timeout_from_env(),
         cwd=str(_PROJECT_ROOT),
         pythonpath=str(_PROJECT_ROOT),
     )

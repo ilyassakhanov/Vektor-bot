@@ -35,8 +35,6 @@ _FORCED_CURL_TAIL = [
     "10485760",
     "--proto",
     "=https",
-    "--proto-redir",
-    "=https",
 ]
 
 
