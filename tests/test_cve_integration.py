@@ -14,9 +14,15 @@ import json
 
 import pytest
 
-from agent.cve_selector import select_cve
+from agent.cve_selector import CVEInfo, select_cve_window
 from cve_core import get_latest_cve_fact_sheet
 from tools.exec import ExecTool
+
+
+def _select(records: list[dict]) -> CVEInfo | None:
+    sel = select_cve_window(records)
+    return sel.cve if sel else None
+
 
 _CVE_API = "https://cveawg.mitre.org/api/cve"
 _CVELIST_COMMITS = (
@@ -98,7 +104,7 @@ def test_cve_selector_with_real_records(exec_tool: ExecTool, online: None) -> No
     assert len(records) > 0
 
     # Step 3: run the selector
-    selected = select_cve(records)
+    selected = _select(records)
     # We can't assert specific values (they change), but we can verify structure
     if selected is not None:
         assert selected.cve_id.startswith("CVE-")

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import threading
+
+import pytest
+
 from agent.agent import Agent
-from agent.conversation import ConversationManager
-from llm.base import ChatResponse, ToolCall
+from agent.conversation import ChatBusyError, ConversationManager
+from llm.base import LLM, ChatResponse, LLMResponse, Message, ToolCall, ToolSpec
 from tests.fakes import ScriptedLLM
 from tools.base import Tool
 from tools.registry import ToolRegistry
@@ -362,3 +366,372 @@ def test_invalid_env_max_messages_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("CONVERSATION_MAX_MESSAGES", "0")
     conv = ConversationManager(_make_agent(ScriptedLLM([])))
     assert conv._max_messages == 12
+
+
+# --- Per-chat serialization -------------------------------------------------
+
+
+class _GatedTool(Tool):
+    """Tool whose first call blocks until ``release`` is set."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    @property
+    def name(self) -> str:
+        return "gate"
+
+    @property
+    def description(self) -> str:
+        return "Blocks until released."
+
+    @property
+    def parameters(self) -> dict[str, object]:
+        return {"type": "object", "properties": {}}
+
+    def execute(self, **kwargs: object) -> str:
+        self.entered.set()
+        assert self.release.wait(5), "gate never released"
+        return "gate result"
+
+
+class _PerQuestionLLM(LLM):
+    """Thread-safe LLM: a "slow" question calls the gate tool once, others answer."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.chat_calls: list[list[Message]] = []
+
+    def generate(self, message: str) -> LLMResponse:
+        return LLMResponse(text="ok")
+
+    def chat(
+        self, messages: list[Message], tools: list[ToolSpec], system: str = ""
+    ) -> ChatResponse:
+        with self._lock:
+            self.chat_calls.append(list(messages))
+        last = messages[-1]
+        if last.role == "user" and last.content.startswith("slow"):
+            return ChatResponse(
+                content="",
+                tool_calls=[ToolCall(id="g1", name="gate", arguments={})],
+            )
+        question = next(m.content for m in reversed(messages) if m.role == "user")
+        return ChatResponse(content=f"answer to {question}")
+
+
+def _gated_conv() -> tuple[ConversationManager, _PerQuestionLLM, _GatedTool]:
+    llm = _PerQuestionLLM()
+    gate = _GatedTool()
+    reg = ToolRegistry()
+    reg.register(gate)
+    return ConversationManager(Agent(llm, reg)), llm, gate
+
+
+def _start_slow_run(
+    conv: ConversationManager, gate: _GatedTool, chat_id: int = 7
+) -> tuple[threading.Thread, dict[str, str]]:
+    """Start a run that blocks inside its tool call until ``gate.release``."""
+    result: dict[str, str] = {}
+    thread = threading.Thread(
+        target=lambda: result.__setitem__("a", conv.handle(chat_id, "slow question A")),
+        daemon=True,
+    )
+    thread.start()
+    assert gate.entered.wait(5), "slow run never reached its tool call"
+    return thread, result
+
+
+def _call_with_timeout(fn, timeout: float = 2.0) -> object:
+    """Run ``fn`` in a thread; fail (instead of hanging) if it blocks."""
+    out: dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            out["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - relayed to the test thread
+            out["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "call blocked instead of returning immediately"
+    if "error" in out:
+        raise out["error"]  # type: ignore[misc]
+    return out.get("value")
+
+
+def test_second_run_in_same_chat_is_rejected_immediately():
+    conv, llm, gate = _gated_conv()
+    first, result = _start_slow_run(conv, gate)
+    try:
+        history_before = [(m.role, m.content) for m in conv._chats[7]]
+        with pytest.raises(ChatBusyError) as excinfo:
+            _call_with_timeout(lambda: conv.handle(7, "question B"))
+        assert excinfo.value.chat_id == 7
+        # No LLM call for B and the history is untouched by it.
+        assert len(llm.chat_calls) == 1
+        assert [(m.role, m.content) for m in conv._chats[7]] == history_before
+    finally:
+        gate.release.set()
+        first.join(5)
+    assert not first.is_alive()
+    assert result == {"a": "answer to slow question A"}
+    assert [(m.role, m.content) for m in conv._chats[7]] == [
+        ("user", "slow question A"),
+        ("assistant", ""),
+        ("tool", "gate result"),
+        ("assistant", "answer to slow question A"),
+    ]
+    # Once the run finished, the chat accepts messages again.
+    assert conv.handle(7, "question B") == "answer to question B"
+
+
+def test_new_during_run_is_rejected_and_does_not_clear():
+    conv, _, gate = _gated_conv()
+    first, _ = _start_slow_run(conv, gate)
+    try:
+        with pytest.raises(ChatBusyError):
+            _call_with_timeout(lambda: conv.handle(7, "/new"))
+        # Still mid-run: user + assistant tool_call, nothing cleared.
+        assert len(conv._chats[7]) == 2
+    finally:
+        gate.release.set()
+        first.join(5)
+    assert not first.is_alive()
+    assert len(conv._chats[7]) == 4
+    # /new works normally once the run finished.
+    assert (
+        conv.handle(7, "/new")
+        == "Started a new conversation. Previous context cleared."
+    )
+    assert 7 not in conv._chats
+
+
+def test_other_chats_are_not_blocked_by_a_running_chat():
+    conv, _, gate = _gated_conv()
+    first, _ = _start_slow_run(conv, gate)
+    try:
+        reply = _call_with_timeout(lambda: conv.handle(8, "question C"))
+        assert reply == "answer to question C"
+        assert conv._in_flight == {7}
+    finally:
+        gate.release.set()
+        first.join(5)
+    assert not first.is_alive()
+
+
+def test_busy_mark_cleared_when_run_raises(monkeypatch):
+    llm = ScriptedLLM([ChatResponse(content="recovered")])
+    conv = ConversationManager(_make_agent(llm))
+    real_run = conv._agent.run
+
+    def boom(text: str, messages: list[Message]) -> str:
+        raise RuntimeError("agent failed")
+
+    monkeypatch.setattr(conv._agent, "run", boom)
+    with pytest.raises(RuntimeError):
+        conv.handle(7, "hello")
+    assert conv._in_flight == set()
+    monkeypatch.setattr(conv._agent, "run", real_run)
+    assert conv.handle(7, "again") == "recovered"
+
+
+def test_in_flight_set_is_empty_after_runs():
+    conv = ConversationManager(
+        _make_agent(ScriptedLLM([ChatResponse(content="x")] * 3))
+    )
+    for chat_id in (1, 2, 3):
+        conv.handle(chat_id, "hi")
+    conv.handle(1, "/new")
+    assert conv._in_flight == set()
+
+
+# --- reserve(): a chat held across work done before the agent turn --------------
+
+
+def test_reserve_busy_chat_raises_immediately_without_waiting():
+    conv, _, gate = _gated_conv()
+    first, _ = _start_slow_run(conv, gate)
+    try:
+
+        def enter() -> None:
+            with conv.reserve(7):
+                raise AssertionError("reserved a busy chat")
+
+        with pytest.raises(ChatBusyError):
+            _call_with_timeout(enter)
+    finally:
+        gate.release.set()
+        first.join(5)
+    assert not first.is_alive()
+    assert conv._in_flight == set()
+
+
+def test_reservation_blocks_same_chat_not_other_chats():
+    conv = ConversationManager(
+        _make_agent(ScriptedLLM([ChatResponse(content="other chat")]))
+    )
+    with conv.reserve(7):
+        assert conv._in_flight == {7}
+        with pytest.raises(ChatBusyError):
+            _call_with_timeout(lambda: conv.handle(7, "question"))
+        with pytest.raises(ChatBusyError):
+            _call_with_timeout(lambda: conv.handle(7, "/new"))
+        assert _call_with_timeout(lambda: conv.handle(8, "hi")) == "other chat"
+    assert conv._in_flight == set()
+    assert 7 not in conv._chats
+
+
+def test_reservation_handle_runs_turn_and_keeps_history():
+    llm = ScriptedLLM([ChatResponse(content="first"), ChatResponse(content="second")])
+    conv = ConversationManager(_make_agent(llm))
+    with conv.reserve(7) as reservation:
+        assert conv.handle(7, "notice", reservation=reservation) == "first"
+        assert conv._in_flight == {7}  # still held after the turn
+    assert conv._in_flight == set()
+    assert conv.handle(7, "follow-up") == "second"
+    assert [m.content for m in llm.chat_calls[1][0]] == ["notice", "first", "follow-up"]
+
+
+def test_reservation_released_on_exception_and_unusable_after_exit():
+    conv = ConversationManager(_make_agent(ScriptedLLM([ChatResponse(content="x")])))
+    with (
+        pytest.raises(RuntimeError, match="ingest failed"),
+        conv.reserve(7) as reservation,
+    ):
+        raise RuntimeError("ingest failed")
+    assert conv._in_flight == set()
+    with pytest.raises(RuntimeError, match="no longer held"):
+        conv.handle(7, "late", reservation=reservation)
+    assert conv.handle(7, "now") == "x"
+
+
+def test_reservation_handles_new_command():
+    conv = ConversationManager(_make_agent(ScriptedLLM([ChatResponse(content="a")])))
+    conv.handle(7, "hi")
+    with conv.reserve(7) as reservation:
+        assert (
+            conv.handle(7, "/new", reservation=reservation)
+            == "Started a new conversation. Previous context cleared."
+        )
+    assert 7 not in conv._chats
+
+
+# --- failed runs roll the history back to its pre-turn state -------------------
+
+
+class _StepLLM(LLM):
+    """Plays back responses; an ``Exception`` item is raised instead."""
+
+    def __init__(self, steps: list[ChatResponse | Exception]) -> None:
+        self._steps = list(steps)
+        self.chat_calls: list[list[Message]] = []
+
+    def generate(self, message: str) -> LLMResponse:
+        raise NotImplementedError
+
+    def chat(
+        self, messages: list[Message], tools: list[ToolSpec], system: str = ""
+    ) -> ChatResponse:
+        self.chat_calls.append(list(messages))
+        step = self._steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+def test_consecutive_llm_errors_leave_history_unchanged():
+    from llm.base import LLMError
+
+    n = 5
+    llm = _StepLLM(
+        [ChatResponse(content="first")]
+        + [LLMError("down")] * n
+        + [ChatResponse(content="back")]
+    )
+    conv = ConversationManager(Agent(llm, ToolRegistry()), max_messages=4)
+    assert conv.handle(7, "hello") == "first"
+    before = list(conv._chats[7])
+    for i in range(n):
+        with pytest.raises(LLMError):
+            conv.handle(7, f"retry {i}")
+        assert conv._chats[7] == before
+    assert conv._in_flight == set()
+
+    assert conv.handle(7, "again") == "back"
+    sent = llm.chat_calls[-1]
+    assert [(m.role, m.content) for m in sent] == [
+        ("user", "hello"),
+        ("assistant", "first"),
+        ("user", "again"),
+    ]
+    assert [m.role for m in conv._chats[7]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+
+def test_failed_run_rolls_back_partial_tool_messages():
+    from llm.base import LLMError
+
+    reg = ToolRegistry()
+    reg.register(StubTool())
+    llm = _StepLLM(
+        [
+            ChatResponse(
+                content="", tool_calls=[ToolCall(id="c1", name="stub", arguments={})]
+            ),
+            LLMError("died mid-run"),
+            ChatResponse(content="ok"),
+        ]
+    )
+    conv = ConversationManager(Agent(llm, reg))
+    with pytest.raises(LLMError):
+        conv.handle(7, "use the tool")
+    # The failed run had appended user + assistant(tool_call) + tool result.
+    assert len(llm.chat_calls[1]) == 3
+    assert conv._chats[7] == []
+
+    assert conv.handle(7, "plain") == "ok"
+    assert [(m.role, m.content) for m in conv._chats[7]] == [
+        ("user", "plain"),
+        ("assistant", "ok"),
+    ]
+
+
+def test_unexpected_error_also_rolls_back():
+    llm = _StepLLM([ChatResponse(content="a"), RuntimeError("bug")])
+    conv = ConversationManager(Agent(llm, ToolRegistry()))
+    conv.handle(7, "hi")
+    before = list(conv._chats[7])
+    with pytest.raises(RuntimeError, match="bug"):
+        conv.handle(7, "boom")
+    assert conv._chats[7] == before
+
+
+# --- handle(reservation=...) is the single turn entry point --------------------
+
+
+def test_handle_with_reservation_runs_inside_held_mark():
+    conv = ConversationManager(_make_agent(ScriptedLLM([ChatResponse(content="r")])))
+    with conv.reserve(7) as reservation:
+        assert conv.handle(7, "notice", reservation=reservation) == "r"
+        assert conv._in_flight == {7}
+    assert conv._in_flight == set()
+
+
+def test_handle_rejects_mismatched_or_stale_reservation():
+    conv = ConversationManager(_make_agent(ScriptedLLM([ChatResponse(content="r")])))
+    other = ConversationManager(_make_agent(ScriptedLLM([])))
+    with conv.reserve(7) as reservation:
+        with pytest.raises(ValueError):
+            conv.handle(8, "x", reservation=reservation)
+        with pytest.raises(ValueError):
+            other.handle(7, "x", reservation=reservation)
+    with pytest.raises(RuntimeError, match="no longer held"):
+        conv.handle(7, "late", reservation=reservation)
+    assert 7 not in conv._chats or conv._chats[7] == []

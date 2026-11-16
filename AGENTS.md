@@ -21,6 +21,33 @@ python bot.py
 
 Long-polling — no webhook or server needed. Ctrl-C to stop.
 
+### Docker (alternative)
+
+```bash
+docker compose up -d --build   # hardened single container; Ollama stays on the host
+docker compose logs -f vektor
+```
+
+Same `.env`. The image is non-root (10001), with a read-only root filesystem, all capabilities dropped, no-new-privileges, pids/mem/cpu caps, tini and `restart: unless-stopped`. The process-control binaries (`ps`, `kill`, …) are removed from the image. The KB lives in the `vektor-data` volume at `/data`. README "Run in Docker" covers migration, monitoring, the hardening table and the manual checklist. Don't build images locally on a resource-limited machine; CI builds them.
+
+Compose `environment:` overrides these `.env` keys inside the container:
+
+| Key | Container value |
+|---|---|
+| `OLLAMA_BASE_URL` | `${VEKTOR_OLLAMA_BASE_URL:-http://host.docker.internal:11434}` |
+| `KB_DB_PATH` | `/data/vektor.db` |
+| `METRICS_PORT` | `9101` (published on `127.0.0.1:9101` only) |
+| `LOKI_PUSH_URL` | `${VEKTOR_LOKI_PUSH_URL:-}` (empty = stderr only) |
+
+Compose-only knobs (shell variables read by `compose.yaml`, not `.env` keys):
+
+| Key | Default | Purpose |
+|---|---|---|
+| `VEKTOR_ENV_FILE` | `.env` | Env file passed to the container (CI uses a dummy file) |
+| `VEKTOR_IMAGE` | `vektor:local` | Image tag to build/run (CI reuses `vektor:ci`) |
+| `VEKTOR_OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Ollama URL seen from the container |
+| `VEKTOR_LOKI_PUSH_URL` | empty | Loki push URL, e.g. `http://loki.192.168.5.15.nip.io/loki/api/v1/push` (routed through `extra_hosts` → `host-gateway`) |
+
 ## Environment
 
 Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and sets `os.environ` — real environment variables always take precedence (uses `setdefault`, never overwrites).
@@ -33,16 +60,22 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `OLLAMA_NUM_CTX` | no | Ollama context window size sent as payload `options.num_ctx`; unset = Ollama's own default (a too-small value silently truncates context — set only if prompts approach the default window) |
 | `OLLAMA_KEEP_ALIVE` | no | Ollama model keep-alive duration (e.g. `30m`) sent as payload `keep_alive` — keeps the model (and its prompt cache) loaded between calls; unset = Ollama default |
 | `ALLOWED_USERNAMES` | no | Comma-separated Telegram usernames (tags) allowed to use the bot, e.g. `@some-user,@another-user` (empty = none allowed). Auth gate only — multiple users are fine; each user's KB data is scoped by their Telegram numeric id |
-| `EXEC_TIMEOUT` | no | Timeout in seconds for the `exec` tool, the MCP CVE server httpx calls, and the MCP round-trip (default `30`) |
+| `EXEC_ALLOWED_COMMANDS` | no | Comma-separated bare command names the `exec` tool may run (default `curl,dig,nslookup,whois,host`; empty = default with a warning). Names are resolved on a fixed safe `PATH`; per-binary argument rules apply only to the defaults |
+| `EXEC_TIMEOUT` | no | Timeout in seconds for the `exec` tool, the MCP CVE server httpx calls, and the MCP round-trip (default `30`; all three read it via `config.positive_env` — invalid, ≤ 0, NaN, inf or too large for a float → default `30` with a warning; above `3600` (`config.MAX_TIMEOUT_S`) → clamped to `3600` with a warning). An explicit `McpStdioClient(call_timeout=…)` that is not positive and finite raises `ValueError` |
 | `EXEC_MAX_OUTPUT_CHARS` | no | Cap for tool output (combined exec stdout/stderr body and CVE fact sheet); over-cap output keeps head+tail with a `... [truncated N chars] ...` marker, exit-code line always preserved (default `4000`) |
-| `AGENT_MAX_ITERATIONS` | no | Maximum agent loop iterations (default `8`) |
+| `AGENT_MAX_ITERATIONS` | no | Maximum agent loop iterations (default `8`; invalid or < 1 → default with a warning) |
+| `AGENT_MAX_RUN_SECONDS` | no | Wall-clock budget per agent run, checked before every iteration after the first and before every tool call (default `120`; `0` or less disables it; non-numeric/NaN/inf → default with a warning) |
+| `AGENT_MAX_TOOL_CALLS_PER_TURN` | no | Maximum tool calls executed from one LLM reply; extra calls get a `skipped` result (default `4`; invalid or < 1 → default with a warning) |
+| `RATE_LIMIT_MAX_MESSAGES` | no | Per-user accepted messages per sliding window (default `10`; invalid or ≤ 0 → default with a warning) |
+| `RATE_LIMIT_WINDOW_S` | no | Per-user sliding-window length in seconds (default `60`; invalid, ≤ 0, NaN or inf → default with a warning) |
+| `BOT_WORKER_THREADS` | no | TeleBot worker threads (default `4`; invalid or < 1 → 4, above 64 → 64, both with a warning) |
 | `CONVERSATION_MAX_MESSAGES` | no | Maximum messages kept per chat conversation; oldest trimmed after each agent run, latest user message always kept (default `12`) |
 | `LLM_PRICE_IN_PER_1M` | no | Notional input price in $/1M tokens for `estimate_cost` (default table value `0.35`; prices are notional — local Ollama costs $0) |
 | `LLM_PRICE_OUT_PER_1M` | no | Notional output price in $/1M tokens for `estimate_cost` (default table value `1.25`; prices are notional — local Ollama costs $0) |
 | `METRICS_PORT` | no | Prometheus metrics port (default `9100`; use `9101` when the dashboard stack is up — Rancher Desktop forwards node-exporter's 9100 to the host) |
 | `LOKI_PUSH_URL` | no | Loki push endpoint; empty = logs only to stderr |
 | `LOG_LEVEL` | no | Log level (default `INFO`) |
-| `MCP_STARTUP_TIMEOUT` | no | Seconds to wait for the MCP CVE server subprocess to initialize before falling back to exec-only mode (default `10`) |
+| `MCP_STARTUP_TIMEOUT` | no | Seconds to wait for the MCP CVE server subprocess to initialize before falling back to exec-only mode (default `10`; read via `config.positive_env` — invalid, ≤ 0, NaN or inf → `10` with a warning; above `3600` → clamped to `3600` with a warning) |
 | `MCP_CVE_SERVER_CMD` | no | MCP CVE server subprocess command (space-separated; first token is the executable). Default: `python mcp_servers/cve_server.py` |
 | `KB_ENABLED` | no | Register the knowledge-base tools `kb_ingest`/`kb_search` (default `1`; `0` = exact pre-kb tool set) |
 | `KB_DB_PATH` | no | SQLite file holding documents + chunks + FTS5 + sqlite-vec vec0 vectors (default `data/vektor.db`) |
@@ -66,18 +99,20 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | File | Purpose |
 |---|---|
 | `bot.py` | Entrypoint — composition root, wires TeleBot with Agent + ConversationManager + LLM |
-| `config.py` | `.env` loader (stdlib only) |
+| `config.py` | `.env` loader and `positive_env(name, default, parse, maximum=None)` — shared warn-and-fallback parser for positive numeric env knobs (overflow → default; above `maximum` → clamped with a warning, like `BOT_WORKER_THREADS`); `MAX_TIMEOUT_S = 3600`; `DEFAULT_EXEC_TIMEOUT_S = 30.0` + `exec_timeout_from_env()` — the single `EXEC_TIMEOUT` resolver used by `bot.build_tool_registry`, `cve_core` and `McpStdioClient` (stdlib only) |
 | `.env.example` | Template for `.env` |
 | `documents.py` | Document text extraction — `extract_pages()` (per-page) / `extract_text()` (join wrapper), `DocumentError`, `SUPPORTED_EXTENSIONS`; .txt/.md/.pdf/.docx via pypdf + python-docx (Telegram-free) |
 | `llm/base.py` | Abstract `LLM` interface, `LLMResponse`, `ChatResponse`, `Message`, `ToolSpec`, `ToolCall`, `ToolResult`, `LLMError` |
 | `llm/ollama.py` | `OllamaLLM` — Ollama HTTP API via `httpx` (no Ollama SDK) |
 | `llm/__init__.py` | Re-exports LLM types; lazy-loads `OllamaLLM` |
-| `agent/agent.py` | `Agent` — bounded agentic loop (default 8 iterations) |
-| `agent/conversation.py` | `ConversationManager` — per-chat context, `/new` command |
-| `agent/cve_selector.py` | `select_cve()` — deterministic latest-window + highest-score CVE selection |
+| `agent/agent.py` | `Agent` — bounded agentic loop (default 8 iterations, wall-clock budget `AGENT_MAX_RUN_SECONDS`, per-reply tool-call cap) |
+| `agent/conversation.py` | `ConversationManager` — per-chat context, `/new` command, non-blocking per-chat busy check (`ChatBusyError`), `reserve(chat_id)` → `ChatReservation` (holds the busy mark across a block), `handle(chat_id, text, *, reservation=None)` — the single public turn entry point; a failed run rolls the history back |
+| `agent/rate_limit.py` | `RateLimiter` — per-user one in-flight run + sliding window (`try_acquire` → `RateDecision(ok, reason)`, idempotent `release`, one lock, injectable clock) |
+| `agent/validation.py` | `validate_input()` → `Verdict` (reject empty/blank and >4096 chars, strip zero-width/bidi controls) and `split_reply()` (UTF-16-unit reply splitting at paragraph → sentence → word boundaries) — pure, no I/O |
+| `agent/cve_selector.py` | `select_cve_window()` — deterministic windowed + highest-score CVE selection; falls back past newer all-unscored windows (`CVESelection` reports it) |
 | `tools/base.py` | Abstract `Tool` interface, `ToolError` |
 | `tools/registry.py` | `ToolRegistry` — agent invokes tools via registry |
-| `tools/exec.py` | `ExecTool` — generic shell execution with timeout, returns stdout/stderr/exit code |
+| `tools/exec.py` | `ExecTool` — allowlisted, shell-free command execution (metachar rejection, `shlex`, allowlist on a safe `PATH`, per-binary argument allowlists), isolated child (scrubbed env, temp cwd, rlimits, own session, byte-capped output, process-group kill on timeout); returns stdout/stderr/exit code |
 | `cve_core.py` | CVE logic extracted from the old `CveTool` — module-level functions for discover/fetch/select/format/truncate (no `Tool` base, no MCP deps) |
 | `mcp_servers/cve_server.py` | `MCPServer` wrapping `cve_core.get_latest_cve()` as the `get_latest_cve` MCP tool (stdio transport, stderr-only logging) |
 | `tools/mcp.py` | `McpStdioClient` — launches the CVE server subprocess, async/sync bridge; `McpTool` — `Tool` adapter delegating to the client; `build_server_env()` — scrubbed env for the subprocess |
@@ -101,18 +136,22 @@ Secrets live in `.env` (gitignored). The custom `config.load_env()` reads it and
 | `retrieval/rerank.py` | `Reranker` — pointwise LLM rerank of fused hits (ONE call, 0–10 scores, stable re-sort, truncate top-k); never raises, falls back to RRF order |
 | `retrieval/hybrid.py` | `HybridRetriever` — expand → batch embed → vector ‖ FTS → RRF → top-k → rerank; per-source degradation; `vektor_retrieval_*` instrumentation |
 | `tools/kb.py` | `KbIngestTool`/`KbSearchTool` (`kb_ingest`/`kb_search`), `KbStack`, `StoreVecAdapter`/`StoreFtsAdapter` adapters |
+| `agent/system_prompt.py` | `BASE_PROMPT` + `build_system_prompt()` — code-defined base prompt (persona, honesty, confidentiality, role integrity) that always leads the skills |
 | `benchmarks/` | LLM benchmark (`prompts.json` + `run.py`) and retrieval benchmark (`retrieval_bench.py`) — require Ollama |
 | `tasks/` | Plan + checklist for the hybrid-search feature (`plan.md`, `todo.md`) |
 | `openspec/` | OpenSpec workspace: `specs/` — behavior source of truth; `changes/` — in-flight changes and the archive |
 | `scripts/` | Repo maintenance scripts (`check_openspec_archived.py` — CI archive-discipline check) |
 | `mypy.ini` | mypy configuration |
+| `Dockerfile` | Hardened runtime image — `python:3.14-slim-trixie`, venv builder stage, exec binaries (`curl dig nslookup whois host`) present, process-control binaries removed (build fails otherwise), non-root 10001, `/metrics` `HEALTHCHECK` |
+| `compose.yaml` | `vektor` service — read-only rootfs, `cap_drop: ALL`, no-new-privileges, pids/mem/cpu limits, tini, `restart: unless-stopped`, loopback-only port, `vektor-data` volume on `/data` |
+| `.dockerignore` | Keeps `.env`, `data/`, `tests/`, `.git/`, `.venv/`, tooling dirs out of the build context (`!.env.example` is the only re-include) |
 
 ## Architecture
 
 ```text
 Telegram → ConversationManager → Agent → LLM interface → OllamaLLM
                                     │
-                                    ├── ToolRegistry → ExecTool (shell, curl)
+                                    ├── ToolRegistry → ExecTool (allowlisted argv: curl, dig, …)
                                     │                → McpTool(Tool) → [stdio JSON-RPC] → mcp_servers/cve_server.py → cve_core.py
                                     │                → KbIngestTool / KbSearchTool → retrieval stack (see Retrieval)
                                     └── SkillLoader → skills/*.md
@@ -139,13 +178,16 @@ The agent receives a user message, calls the LLM with conversation history, tool
 
 - Default maximum: 8 iterations (configurable via `AGENT_MAX_ITERATIONS`).
 - Never allows an infinite loop.
+- Wall-clock budget (`AGENT_MAX_RUN_SECONDS`, default 120): checked before every iteration after the first and before every tool call. When it trips, remaining tool calls get `skipped: run budget exceeded` (one result per call id), and `BUDGET_EXCEEDED_REPLY` is returned without another LLM call. In-flight calls are never interrupted, so a run overruns by at most one LLM or tool call.
+- Tool calls per reply are capped (`AGENT_MAX_TOOL_CALLS_PER_TURN`, default 4); extra calls get a `skipped: too many tool calls…` result and the loop continues.
+- `BASE_PROMPT` ends with a `## Host safety` section (never stop/signal/modify processes, files or the host). It is defense in depth only; the exec tool is the boundary.
 
 ### Tools
 
 The Agent invokes tools through the `ToolRegistry`, never directly. Adding a tool requires only implementing `Tool` and registering it — the agent loop does not change.
 
-- `ExecTool` — executes a shell command, returns stdout/stderr/exit code, enforces a configurable timeout. Generic — no CVE-specific logic. Combined stdout/stderr is capped at `EXEC_MAX_OUTPUT_CHARS` (head+tail with a truncation marker; the `exit_code:` line is always preserved).
-- `CveTool` — retrieves recent CVE records from official CVE.org endpoints and selects the most critical one programmatically (via `select_cve()`). Returns a compact fact sheet so the LLM only needs to summarize — no JSON parsing, score comparison, or windowing on the LLM side. The fact sheet is capped with the same `EXEC_MAX_OUTPUT_CHARS` truncation.
+- `ExecTool` — runs one allowlisted, network read-only command **without a shell**; its controls hold even if the model fully complies. The raw string is rejected on shell metacharacters (`| ; & $ \` > < ( )`, newline, CR, NUL), split with `shlex`, and `argv[0]` must be a bare name from the allowlist (`EXEC_ALLOWED_COMMANDS`, default `curl, dig, nslookup, whois, host`) resolved on `/usr/bin:/bin:/usr/sbin:/sbin`. Per-binary argument allowlists: curl takes only `-s -S -I -i -f -v --compressed`, `-H/-A/-w` (no `@`), `-X GET|HEAD`, numeric timeouts and exactly one `https://` URL to a public host (no `@`, no `%` in the host, no globbing, no loopback/private/link-local literals, no `-L`), with `--globoff`/`--max-time`/`--max-filesize`/`--proto =https` forced; dig/host/nslookup/whois take only a query name plus an optional record type. The child gets a scrubbed env (`PATH`, `LANG`, `HOME` only), a fresh temp cwd, best-effort rlimits (CPU, address space, file size, core), its own session, stdin from `/dev/null`, and byte-capped output (max(64 KiB, 4 × `EXEC_MAX_OUTPUT_CHARS`)); overflow or timeout SIGKILLs the process group. Rejections return `Command rejected: …\nexit_code: -1` (never raise). Combined stdout/stderr is capped at `EXEC_MAX_OUTPUT_CHARS` (head+tail with a truncation marker; the `exit_code:` line is always preserved).
+- `CveTool` — retrieves recent CVE records from official CVE.org endpoints and selects the most critical one programmatically (via `select_cve_window()`; see CVE selection for the unscored-window fallback). Returns a compact fact sheet so the LLM only needs to summarize — no JSON parsing, score comparison, or windowing on the LLM side. The fact sheet is capped with the same `EXEC_MAX_OUTPUT_CHARS` truncation.
 
 ### Skills
 
@@ -153,19 +195,21 @@ Skills are `.md` files discovered by `SkillLoader` from the `skills/` directory.
 
 ### Conversation
 
-Each Telegram chat is one continuous conversation. `ConversationManager` maintains `chat_id → messages` in memory. `/new` clears only the current chat's context and does not send anything to the LLM. Different chats are isolated.
+Each Telegram chat is one continuous conversation. `ConversationManager` maintains `chat_id → messages` in memory. `/new` clears only the current chat's context and does not send anything to the LLM. Different chats are isolated. Runs never overlap within a chat, and no caller ever waits: `ConversationManager.handle` marks the chat busy (a set of in-flight chat ids behind one small lock, never held across a run) for the whole agent run plus the trim and unmarks it in `finally`. A message for a chat that already has a run in flight — `/new` and the document-upload turn included, e.g. from another user in a group chat — raises `ChatBusyError` immediately: no LLM call, history untouched, nothing cleared. `ConversationManager.reserve(chat_id)` is a context manager that takes the same busy mark up front (raises `ChatBusyError` at once if busy), holds it for the whole block and releases it in `finally`; `ConversationManager.handle(chat_id, text, *, reservation=None)` is the single public turn entry point: without a reservation it is `reserve` + one turn, with one it runs inside that held mark (a stale or other-chat reservation raises) — the document-upload turn calls it too, so an override of `handle` sees every turn. If the agent run raises, the history is rolled back to its exact pre-turn state (the user message and any partial assistant/tool messages are removed) and the error propagates, so repeated failures never pile up orphan user messages; the trim runs after every run, failed or not. `bot.py` maps a busy chat to exactly one `_CHAT_BUSY_REPLY` (text and `/new` — "still answering another message in this chat", distinct from the per-user `_BUSY_REPLY`) or `_DOCUMENT_BUSY_REPLY` (upload — the document was NOT ingested, resend it) and counts `vektor_chat_busy_total{path=text|upload|new}` (not the rate-limit metric). Trade-off: the document handler reserves the chat for the WHOLE upload — download, extraction, embedding/ingestion and the agent turn — so a busy-chat upload is rejected before any work is wasted; the price is that other members of a group chat get the chat-busy reply for the entire ingestion, which can take a while for a large PDF. TeleBot workers are therefore never parked behind a run, so one busy chat cannot starve the others; different chats run in parallel, and the busy set only holds chats currently running.
 
 ### CVE selection
 
-`select_cve()` in `agent/cve_selector.py` is a pure function that takes raw CVE record dicts (as returned by `cveawg.mitre.org/api/cve/:id`) and selects the correct one:
+`select_cve_window()` in `agent/cve_selector.py` is a pure function that takes raw CVE record dicts (as returned by `cveawg.mitre.org/api/cve/:id`) and selects the correct one:
 
 1. Extract CVEInfo from each record.
-2. Determine the latest publication timestamp from ALL records.
-3. Latest window = CVEs published within 5 minutes of that timestamp.
-4. Filter out CVEs without CVSS — they cannot win.
-5. Within the window, select the highest CVSS baseScore.
-6. If scores tie, select the most recently published.
-7. Returns None if no CVE with CVSS exists in the latest window.
+2. Group ALL records into 5-minute publication windows, walking backwards from the newest timestamp: window 1 is `[newest − 5 min, newest]`; each next window is anchored at the newest timestamp strictly older than the previous window's cutoff (naive timestamps count as UTC; unparseable ones join window 1; membership is tested as `anchor − at > 5 min`, so timestamps near `datetime.min` never overflow).
+3. CVEs without CVSS define windows but cannot win.
+4. Use the newest window that contains at least one scored CVE — newer all-unscored windows (e.g. a bulk CNA batch without metrics) are skipped. An older window never beats a newer scored one.
+5. Within that window, select the highest CVSS baseScore.
+6. If scores tie, select the most recently published (parsed instants, naive = UTC; unparseable timestamps rank oldest — never raw-string comparison). If the instants are equal too (e.g. the same instant in different offsets), the highest CVE id wins, compared as a parsed `(year, number)` tuple (unparseable ids rank lowest).
+7. Returns None only if no record has CVSS.
+
+`select_cve_window()` returns a `CVESelection` (`cve`, `fallback`, `skipped_unscored`, `skipped_newest`, `skipped_oldest`), or `None` only if no record has CVSS. Malformed records (non-object, bad nested types, non-numeric/non-finite scores) are skipped or treated as unscored with a warning and never raise; a non-object record response is skipped in `cve_core`, and an unexpected fetch error before the deadline logs a warning (CVE id + exception type only; after the deadline it stays a debug "Abandoned" line). On a fallback the fact sheet carries a `FALLBACK_NOTE:` line (placed before `DESCRIPTION` so truncation keeps it), which `skills/cve.md` tells the model to relay. `cve_core` reads the last 5 `cvelistV5` commits and fetches up to 50 records (module constants `_DEFAULT_COMMIT_COUNT`/`_DEFAULT_MAX_RECORDS`) over an 8-worker thread pool (`_FETCH_WORKERS`). The whole run is bounded by a deadline at 80 % of `EXEC_TIMEOUT` from the call start (`_DEADLINE_FRACTION`): the commit-discovery request and every record fetch get an `httpx.Timeout` from `_capped_timeout()` with each phase capped to the time left (a stricter client phase, e.g. connect, is kept; discovery is not sent past the deadline); a deadline hit or timed-out discovery returns the `CVE lookup timed out …` message, other discovery errors `Failed to discover recent CVE IDs …`, and `No recent CVE IDs found …` only means discovery succeeded with no IDs; malformed commit entries (non-object entry, non-object `commit`, non-string `message`) are skipped, and a non-empty commit list with no well-formed entry returns `Failed to discover …` (never raises); fetches not started by then are cancelled, in-flight ones are abandoned, and selection uses the records fetched so far, so a slow `cveawg.mitre.org` still returns inside the `EXEC_TIMEOUT` MCP round-trip.
 
 ### Retrieval
 
@@ -182,15 +226,25 @@ Each Telegram chat is one continuous conversation. `ConversationManager` maintai
 
 Messages with a document (.txt/.md/.pdf/.docx) are ingested by the bot before the agent runs:
 
+- **Chat reservation** — the upload reserves the chat (`conv.reserve`) BEFORE any download and holds it across download, extraction, ingestion and the agent turn (`conv.handle(..., reservation=...)`), released on every exit path. A busy chat gets exactly one `_DOCUMENT_BUSY_REPLY` (the document was NOT ingested — resend after the current reply): no download, no ingest, no progress replies, no LLM call; a text message or `/new` arriving in that chat during the upload gets `_CHAT_BUSY_REPLY`. Other chats are unaffected.
 - **Bot-level ingestion** — `build_document_handler` (`bot.py`) downloads the file (Telegram caps bot downloads at 20 MB — that is the size limit; no env knob), extracts pages via `documents.extract_pages`, and ingests it with a fresh `KbIngestTool` BEFORE the agent runs (PDF pages flow through so chunks carry page numbers). Rationale: extraction output (potentially megabytes) must never cross the LLM tool boundary as an argument.
 - **Staged-progress UX** — an upload produces staged replies (`📄 Document received` → `⏳ Extracting text…` → `⏳ Generating embeddings…` → `✅ Ingested N chunks (doc <id>, title '<file>')` → `✅ Document ready. Now you can ask questions.`) followed by the agent's response on the synthetic upload notice (`[document uploaded: "{file_name}", {N} chunks ingested; content is now searchable via kb_search]`, caption appended when present; no-caption uploads get an agent acknowledgement). The upload turn is recorded in the conversation context (`ConversationManager`), so follow-up questions can `kb_search` it.
 - **Never crash polling** — download/extract/ingest failures end with exactly one friendly reply (no agent run); LLM/agent errors on the upload turn produce the progress replies + exactly one friendly reply. Logs carry file name and outcome only, never file content or captions.
 - **Source attribution** — `skills/documents.md` mandates that every fact taken from `kb_search` is cited as `Источник: <filename>, стр. M` (or `, chunk #N` when there is no page) and that the model says so explicitly when nothing relevant is found, never answering from general knowledge.
 - **Gates** — the auth check runs FIRST (unauthorized users' documents are never downloaded); with the KB disabled (`kb=None` / `KB_ENABLED=0`) documents get "Document uploads are not enabled."; a message with both `text` and `document` takes the document branch.
 
+### Message I/O safety
+
+`agent/validation.py` holds two pure functions wired at the `bot.py` handler boundary (no validation inside `Agent`/`ConversationManager`):
+
+- **Input** — `validate_input` runs in `handle_message` after the auth gate **and after the document branch** (text path only; documents are never rejected for lacking text). Empty/whitespace-only text gets `_EMPTY_MESSAGE_REPLY`, text over 4096 characters gets `_TOO_LONG_MESSAGE_REPLY` (rejected, never truncated; the limit is a Telegram constant, no env knob); a rejection sends exactly one reply, makes no LLM call and leaves the conversation history untouched. Accepted text has zero-width (`U+200B`–`U+200D`, `U+2060`, `U+FEFF`) and bidi-control (`U+202A`–`U+202E`, `U+2066`–`U+2069`) characters stripped; visible Unicode passes through unchanged.
+- **Output** — both agent-reply send paths (text turn and document-upload turn) go through `_send_reply`, which sends `split_reply` chunks in order, each ≤4096 UTF-16 code units (Telegram's unit; surrogate pairs never split, concatenation equals the reply). Whitespace-only chunks are skipped; if nothing is left, exactly one `_LLM_ERROR_REPLY` fallback is sent.
+- **Plain text** — replies are never sent with a `parse_mode`; Markdown/MarkdownV2 metacharacters reach the user unchanged.
+- **Rate limiting** — with a `RateLimiter` (`build_rate_limiter()` in `main()`; `RATE_LIMIT_MAX_MESSAGES`/`RATE_LIMIT_WINDOW_S`), `handle_message` acquires a per-user slot after the auth gate and **before** the document branch, so uploads, `/new` and messages later rejected by validation all count (`/documents` and `/delete` are separate handlers and do not). A second message while one is in flight gets `_BUSY_REPLY`; an exhausted window gets `_RATE_LIMITED_REPLY` — exactly one reply, no LLM call, history untouched. The slot is released in `finally`, including on agent errors. Independently of the limiter, a message for a chat that already has a run or upload in flight (another user in a group chat) gets one `_CHAT_BUSY_REPLY` (or `_DOCUMENT_BUSY_REPLY` for an upload) without waiting (see Conversation). TeleBot runs `BOT_WORKER_THREADS` workers (default 4).
+
 ### Observability
 
-`build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `HybridRetriever` additionally records `vektor_retrieval_expansion_total{status=ok|fallback}`, `vektor_retrieval_latency_seconds{stage=expansion|vector|fts|rerank|total}`, `vektor_retrieval_results{source=vector|fts|final}`, and `vektor_retrieval_rerank_total{status=ok|fallback}` — enum labels only. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
+`build_llm()` and `build_tool_registry()` (`bot.py`) wrap the real LLM and registry in `InstrumentedLLM` / `InstrumentedToolRegistry`, which record `vektor_*` Prometheus metrics (tokens, latency, iterations, tool calls, notional cost) exposed on `/metrics` at `METRICS_PORT`. `HybridRetriever` additionally records `vektor_retrieval_expansion_total{status=ok|fallback}`, `vektor_retrieval_latency_seconds{stage=expansion|vector|fts|rerank|total}`, `vektor_retrieval_results{source=vector|fts|final}`, and `vektor_retrieval_rerank_total{status=ok|fallback}` — enum labels only. Hardening adds `vektor_exec_rejected_total{reason=metachar|not_allowed|bad_arg|parse}`, `vektor_rate_limited_total{reason=in_flight|window}`, `vektor_chat_busy_total{path=text|upload|new}` (chat already has a run in flight — a separate gate, not a rate limit) and `vektor_agent_budget_exceeded_total`. The exec tool logs only `argv0=<name>` (or `<other>` for a non-allowlisted name) and the outcome, never its arguments. `logging_config.configure_logging()` emits JSON logs with a `RedactionFilter`; when `LOKI_PUSH_URL` is set, a `LokiPushHandler` batches and pushes log records to Loki. Sensitive content (message text, prompts, responses, tool args/outputs) is never logged or metriced.
 
 ## Spec-driven workflow
 
@@ -226,21 +280,30 @@ python -m pytest
 - CveTool tests use `httpx.MockTransport` — no network access needed.
 - Integration tests (`tests/test_cve_integration.py`) are skipped when CVE.org is unreachable.
 - Retrieval tests (RRF, sqlite-vec store, chunking + per-page chunking, hybrid, expansion, rerank, kb tools, config, user isolation) use fakes, `httpx.MockTransport`, and tmp SQLite files — no Ollama/network needed.
+- Exec tests: `tests/test_exec_policy.py` (hermetic — fake binaries in `tmp_path`, `Popen` tripwire/recorder) covers metachars, parse errors, the allowlist and env override, curl/DNS argument rules, forced curl flags, the rejection metric and argv0-only logging; `tests/test_exec.py` drives the venv `python3` (allowlisted via the `allow_python` fixture, `dirname(sys.executable)` on the search path, payloads as script files) for the output contract, truncation, timeouts, process-group kill, escaped-child return, the output byte cap, env scrub and temp cwd.
+- Rate-limit tests: `tests/test_rate_limit.py` (fake clock, thread smoke) and `tests/test_bot_rate_limit.py` (handler wiring with `FakeLLM`/`ScriptedLLM`, fake TeleBot uploads, env parsing, worker threads) — offline.
+- Message I/O tests (`tests/test_input_validation.py`, `tests/test_output_safety.py`) cover the pure `agent/validation.py` functions plus handler-level wiring with `ScriptedLLM`/`FakeLLM` and a fake TeleBot recorder — offline.
 - Document tests (`tests/test_documents.py`) build fixtures in-test — a handcrafted minimal PDF (known `Tj` text operator), a python-docx-generated DOCX, plain bytes — fully offline, no binary fixtures committed.
 - Document bot-flow tests (`tests/test_bot_documents.py`) use a fake TeleBot (records get_file/download_file, canned bytes or raises), a real kb stack over tmp SQLite with a deterministic fake embedder, and `ScriptedLLM`/`FakeLLM` — no network, no Ollama.
 - Retrieval-benchmark tests cover only the scoring math and labeled dataset — offline.
+- Docker config tests (`tests/test_docker_config.py`) check the hardening invariants of `Dockerfile` (runtime stage only), `compose.yaml` (the `vektor` service block), `.dockerignore` and the CI `docker` job with plain text/regex parsing — no pyyaml, no docker daemon, offline. The CI `docker` job builds the image and asserts the same invariants inside it.
+- Live-model suites (`test_red_team.py`, `test_llm_judge.py`, `test_memory_behavior.py`, `test_latency_sla.py`) carry the `live` marker and are opt-in: `VEKTOR_LIVE_TESTS=1 python -m pytest -m live`. They skip when Ollama is down or a required model is not pulled (`tests/ollama_probe.py`). The red-team suite scrubs the environment to an allowlist (`tests/redteam_fragments.py`) before running model-chosen commands. Its dataset (`tests/datasets/redteam_dataset.json`) has 16 cases, 2 of them in Russian and 2 `exec-reject` cases (`exec-abuse-kill`, `exec-abuse-ps`) that assert via `exec_reject_violations` that no forbidden binary actually ran.
 - Benchmarks run via `python -m benchmarks.run` (agent, requires a running Ollama) and `python -m benchmarks.retrieval_bench` (retrieval modes; Recall@K/Precision@K/latency, requires a running Ollama); both are excluded from pytest.
 
 ### Test coverage
 
-- Agent: normal request, tool call → execution → result → next LLM call, multiple iterations, max iteration protection, tool failure, unknown tool, LLM error, no Ollama dependency.
-- CVE selector: latest-window selection, highest-score selection, equal-score tie-breaking, missing CVSS, first API result not automatically selected, CVE ID not used as recency proxy, ADP CVSS, CVSS v4, complex multi-window scenarios.
-- Conversation: persistence within a chat, chat isolation, `/new`, `/new` only clears current chat.
+- Agent: `AGENT_MAX_ITERATIONS` env fallback (invalid or < 1 → 8 with a warning), `Agent(max_iterations < 1)` raises `ValueError`, normal request, tool call → execution → result → next LLM call, multiple iterations, max iteration protection, wall-clock budget (between iterations and between tool calls of one reply, skipped results per call id, first iteration always runs, metric, env parsing), tool-call cap per reply, tool failure, unknown tool, LLM error, no Ollama dependency.
+- CVE selector: latest-window selection, highest-score selection, equal-score tie-breaking (on parsed instants across offsets, naive = UTC, unparseable ranks oldest; equal instants in different offsets → numeric CVE id, unparseable id lowest), missing CVSS, first API result not automatically selected, CVE ID not used as recency proxy, ADP CVSS, CVSS v4, complex multi-window scenarios, unscored-window fallback (bulk unscored batch, several unscored windows skipped, deterministic window anchoring, no CVSS anywhere → None, scored latest window is not a fallback, mixed timezone formats), extreme timestamps (`0001-01-01T00:00:00Z` beside recent records or alone, offsets near `datetime.min`/`datetime.max`) never raise, malformed records (non-object records, non-object `cveMetadata`/`containers`/`cna`, non-list nested values, `"N/A"`/NaN/inf scores → unscored, extraction errors skipped, all malformed → None, fallback with an undated skipped record keeps the dated bounds, forced no-dated fallback → `None` bounds) never raise.
+- Conversation: persistence within a chat, chat isolation, `/new`, `/new` only clears current chat, non-blocking per-chat exclusion (threaded: a second run or `/new` in a chat with a run in flight raises `ChatBusyError` without blocking, no LLM call, history untouched and not cleared; other chats proceed concurrently; busy mark cleared after an exception; in-flight set empty after runs; `reserve()` raises at once on a busy chat, blocks only its own chat, keeps the turn's history, releases on exception, `/new` inside it, reservation unusable after exit; `handle(reservation=…)` runs inside the held mark, stale/mismatched reservations rejected), history rollback on failure (N consecutive LLM errors leave history unchanged, partial tool messages removed, unexpected errors too, the next run sees no orphan user messages), `CONVERSATION_MAX_MESSAGES` env fallback.
 - Tools: registration, execution, failure handling, unknown tool, adding tools without loop changes.
-- CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, data-source attribution.
+- Exec policy: `kill`/`ps`/`rm`/`sh`/path-prefixed binaries rejected with the allowlist shown, shell operators (pipe, `$`, redirects, backticks, `;`, `&&`, parens, newline, CR, NUL), parse errors, curl option allowlist (output/upload/data/config/proxy/resolve/unix-socket/`--url-query`/`-L` rejected, `@` in values and URLs, percent-encoded hosts, loopback/private/link-local/numeric/IPv4-mapped/compatible/NAT64/SIIT literals, globbing, multiple URLs), DNS/whois rules (no server, port, transport or second positional), forced curl flags, no spawn on reject, metric per reason, no secrets in logs, scrubbed env, temp cwd, rlimits requested, process-group kill, output byte cap, `killpg` fallback.
+- EXEC_TIMEOUT: unset/valid/`abc`/`nan`/`inf`/`0`/`-5` at `cve_core`, `McpStdioClient` and `build_tool_registry` → value or default 30 with a warning, no crash; `1e15`/`3601` → clamped to 3600, an int too large for a float → 30; explicit MCP `call_timeout` of `0`/negative/NaN/inf → `ValueError`; `MCP_STARTUP_TIMEOUT` unset/valid/invalid/huge and `main()` passing the parsed value (`tests/test_exec_timeout_env.py`). `config.positive_env`: huge values never raise, clamp above `maximum` with a warning, value at `maximum` kept silently (`tests/test_config.py`).
+- Rate limit: in-flight and window rejections with one reply, no LLM call and untouched history, busy-chat rejection (another user's run in flight in the same chat: text and `/new` get one `_CHAT_BUSY_REPLY` while the per-user in-flight case keeps `_BUSY_REPLY`; an upload into a busy chat gets only one `_DOCUMENT_BUSY_REPLY` with no get_file/download, nothing ingested, no LLM call and the per-user slot released; a normal upload keeps the full staged sequence with the notice in history; the reservation held across ingest rejects a concurrent text message in the same chat while other chats are answered; the reservation is released after get_file/download/extract/embed/store/LLM/agent errors; `vektor_chat_busy_total{path}` metric per path and never `vektor_rate_limited_total`, with and without a limiter; an overridden `ConversationManager.handle` is invoked for the upload turn), uploads/`/new`/validation rejects counted, independent users, release after errors, auth gate first, env fallbacks, worker-thread clamp.
+- CveTool: highest-score selection, latest-window selection, tie-breaking, missing CVSS, partial fetch failures, deduplication, max-records limit, default discovery (5 commits / 50 records), concurrent fetch keeps results deterministic, fetch deadline (slow fetches abandoned, selection from in-time records, nothing in time → failure message, discovery request timeout capped to the time left, no discovery past the deadline → timeout message), discovery outcomes (timed out vs failed vs no IDs), malformed commit entries (partly malformed skipped, wholly malformed → failed message), per-phase `_capped_timeout` (stricter connect kept, unlimited phases → time left, `None` past the deadline, used by both request sites), `FALLBACK_NOTE:` present on fallback (and kept under truncation) and absent otherwise (range omitted when the bounds are missing), non-object record responses skipped with a warning, unexpected fetch errors (WARNING with CVE id + type name only before the deadline, DEBUG "Abandoned" after it), data-source attribution.
 - Skill loader: discovers `.md` files, ignores non-`.md`, system prompt generation.
 - Bot: agent routing, per-chat context in Telegram, `/new`, auth, LLM error handling, document flow (download/extract/ingest roundtrip, staged progress sequence ordering with the agent reply via the upload notice [+ caption], ingestion searchable via kb_search, upload context propagating to follow-up messages, PDF page numbers reaching the store while txt chunks keep a NULL page and the fact sheet omits it, user A's upload invisible to user B, documents row written with owner and file type, auth gate with no download, KB-disabled reply, error paths — unknown ext, corrupt bytes, API error, embedder failure, agent-turn LLM/agent errors, missing file_path — and document-wins-over-text).
 - Bot commands: `/documents` listing (filename, created date, chunk count) scoped to the caller, empty state, auth gates, KB-disabled; `/delete` cascade visible in search, unknown/not-yours replies, usage hint (incl. filenames with spaces), command registration and precedence over the catch-all handler.
+- Message I/O: empty/whitespace and 4096/4097-char rejection with one reply, no LLM call and untouched history, document-without-text still routed to the document flow, zero-width/bidi stripping with visible Unicode (emoji, Cyrillic) untouched, `split_reply` ordering/boundaries/content equality/unbreakable-token hard cut/astral emoji measured in UTF-16 units, long replies split on both text and document-upload turns, blank-chunk skip and single fallback, no `parse_mode` and metacharacters delivered unchanged.
 - Documents: extraction per format (.txt/.md replacement decode, handcrafted PDF `Tj` text, python-docx paragraphs), `extract_pages` (single first page for txt/md/docx, one entry per PDF page incl. empty pages, join wrapper), case-insensitive extensions, unsupported/missing extension and empty filename → `DocumentError`, corrupt bytes → `DocumentError`, content-independence from filename, exact `SUPPORTED_EXTENSIONS`, no Telegram imports (AST-checked).
 - Retrieval: RRF fusion and tie-breaking, vec0 store (one-transaction documents+chunks+FTS+vec0 writes, L2 normalization on write, zero-vector/multi-query min-distance merge, ties by chunk_id, lazy `vec_chunks` creation, page column persisted, legacy-schema DB → `KBModelError`), per-page chunking (page numbers pass through, chunks never span pages), HybridRetriever fallbacks/concurrency/metrics + rerank stage (reorders fused hits, fallback keeps RRF order), expansion ok/fallback parsing, kb ingest→search roundtrips, fact sheet with/without page, KB_ENABLED=0 regression, bot composition roots.
 - User isolation: same-text ingest by two users never leaks chunks across owners, per-user scoping of search/list, delete by a non-owner returns False.

@@ -54,3 +54,61 @@ jobs:
       # succeeds on its stdout.
       - shell: bash
         run: npx --yes @fission-ai/openspec@1.14.1 list --json | python3 scripts/check_openspec_archived.py
+
+  # The container is the host boundary for model-chosen exec commands, so its
+  # invariants are checked on the built image, not only in the source files
+  # (tests/test_docker_config.py). The image is built here, never locally.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        # `shell: bash` gives `-eo pipefail`; each step adds `set -u` too.
+        shell: bash
+    env:
+      VEKTOR_IMAGE: vektor:ci
+    steps:
+      - uses: actions/checkout@v7
+      # compose.yaml requires an env file; CI gets a dummy one, no secrets.
+      - name: Write dummy env file
+        run: |
+          set -euo pipefail
+          printf 'TELEGRAM_BOT_TOKEN=123:dummy\n' > "$RUNNER_TEMP/ci.env"
+          echo "VEKTOR_ENV_FILE=$RUNNER_TEMP/ci.env" >> "$GITHUB_ENV"
+      - name: Validate compose.yaml
+        run: |
+          set -euo pipefail
+          docker compose config -q
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker build -t vektor:ci .
+      # Imports the whole bot under the runtime flags that matter: a
+      # read-only root filesystem with only /tmp writable.
+      - name: Smoke test (import bot)
+        run: |
+          set -euo pipefail
+          docker run --rm --read-only --tmpfs /tmp -e TELEGRAM_BOT_TOKEN=123:dummy \
+            vektor:ci python -c "import bot"
+      # Each check names what failed; the first failure stops the step.
+      - name: Assert image invariants
+        run: |
+          set -euo pipefail
+          docker run --rm -i --read-only --tmpfs /tmp vektor:ci sh -s <<'SH'
+          set -eu
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+          uid="$(id -u)"
+          [ "$uid" = 10001 ] || fail "runs as uid $uid, want 10001"
+          for b in curl dig nslookup whois host; do
+            test -x "/usr/bin/$b" || fail "exec binary missing: /usr/bin/$b"
+          done
+          for b in ps kill pkill pgrep killall top; do
+            for d in /usr/bin /bin /usr/sbin /sbin; do
+              test ! -e "$d/$b" || fail "process-control binary present: $d/$b"
+            done
+          done
+          for p in /app/.env /app/data /app/tests; do
+            test ! -e "$p" || fail "must not be in the image: $p"
+          done
+          echo "image invariants OK"
+          SH
