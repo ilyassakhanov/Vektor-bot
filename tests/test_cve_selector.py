@@ -620,3 +620,150 @@ def test_same_instant_tiebreak_newer_year_wins_and_bad_id_ranks_lowest():
         result = _select(records)
         assert result is not None
         assert result.cve_id == "CVE-2026-0001"
+
+
+# --- Malformed records ---------------------------------------------------------
+
+
+def test_non_dict_record_skipped_among_valid_ones(caplog):
+    good = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=7.5)
+    records = ["oops", None, 42, ["x"], good]
+
+    with caplog.at_level("WARNING", logger="vektor.agent.cve_selector"):
+        result = _select(records)  # type: ignore[arg-type]
+
+    assert result is not None
+    assert result.cve_id == "CVE-2026-0001"
+    skipped = [
+        r for r in caplog.records if "Skipping malformed CVE record" in r.message
+    ]
+    assert len(skipped) == 4
+
+
+def test_bad_nested_types_never_raise():
+    good = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=7.5)
+    bad_meta = _make_cve("CVE-2026-0002", "2026-08-28T15:23:10Z", score=9.9)
+    bad_meta["cveMetadata"] = ["not", "a", "dict"]
+    bad_containers = _make_cve("CVE-2026-0003", "2026-08-28T15:23:20Z", score=9.9)
+    bad_containers["containers"] = "nope"
+    bad_cna = _make_cve("CVE-2026-0004", "2026-08-28T15:23:30Z", score=9.9)
+    bad_cna["containers"]["cna"] = ["nope"]
+    bad_lists = _make_cve("CVE-2026-0005", "2026-08-28T15:23:40Z", score=None)
+    bad_lists["containers"]["cna"]["descriptions"] = "text"
+    bad_lists["containers"]["cna"]["affected"] = {"vendor": "v"}
+    bad_lists["containers"]["cna"]["metrics"] = "metrics"
+    bad_lists["containers"]["adp"] = "adp"
+
+    sel = select_cve_window([good, bad_meta, bad_containers, bad_cna, bad_lists])
+
+    # bad_meta keeps its score but has no id/date (undated → window 1) and
+    # outscores the rest; containers/cna-broken records are unscored.
+    assert sel is not None
+    assert sel.cve.cvss_score == 9.9
+    assert sel.cve.cve_id == ""
+    assert select_cve_window([bad_containers, bad_cna, bad_lists]) is None
+
+
+def test_non_numeric_base_score_counts_as_unscored():
+    bad = _make_cve("CVE-2026-0002", "2026-08-28T15:23:30Z", score=9.9)
+    bad["containers"]["cna"]["metrics"][0]["cvssV3_1"]["baseScore"] = "N/A"
+    good = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=5.0)
+
+    result = _select([bad, good])
+
+    assert result is not None
+    assert result.cve_id == "CVE-2026-0001"
+
+
+def test_non_finite_base_score_counts_as_unscored():
+    nan = _make_cve("CVE-2026-0002", "2026-08-28T15:23:30Z", score=9.9)
+    nan["containers"]["cna"]["metrics"][0]["cvssV3_1"]["baseScore"] = float("nan")
+    inf = _make_cve("CVE-2026-0003", "2026-08-28T15:23:40Z", score=9.9)
+    inf["containers"]["cna"]["metrics"][0]["cvssV3_1"]["baseScore"] = "inf"
+    good = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=5.0)
+
+    result = _select([nan, inf, good])
+
+    assert result is not None
+    assert result.cve_id == "CVE-2026-0001"
+    assert result.cvss_score == 5.0
+
+
+def test_non_numeric_cna_score_falls_through_to_adp():
+    record = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=9.9)
+    record["containers"]["cna"]["metrics"][0]["cvssV3_1"]["baseScore"] = "N/A"
+    record["containers"]["adp"] = [
+        {"metrics": [{"cvssV3_1": {"baseScore": 6.1, "baseSeverity": "MEDIUM"}}]}
+    ]
+
+    result = _select([record])
+
+    assert result is not None
+    assert result.cvss_score == 6.1
+
+
+def test_every_record_malformed_returns_none():
+    assert select_cve_window(["a", 1, None]) is None  # type: ignore[list-item]
+
+
+def test_extraction_error_skips_record(monkeypatch, caplog):
+    import agent.cve_selector as selector
+
+    real = selector._extract_cve_info
+
+    def flaky(record: dict) -> CVEInfo:
+        if record["cveMetadata"]["cveId"] == "CVE-2026-0002":
+            raise TypeError("boom")
+        return real(record)
+
+    monkeypatch.setattr(selector, "_extract_cve_info", flaky)
+    records = [
+        _make_cve("CVE-2026-0002", "2026-08-28T15:23:30Z", score=9.9),
+        _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=5.0),
+    ]
+
+    with caplog.at_level("WARNING", logger="vektor.agent.cve_selector"):
+        result = _select(records)
+
+    assert result is not None
+    assert result.cve_id == "CVE-2026-0001"
+    assert any(
+        "Skipping malformed CVE record #0: TypeError" in r.message
+        for r in caplog.records
+    )
+
+
+def test_fallback_with_undated_skipped_record_uses_dated_bounds():
+    dated_unscored = _make_cve("CVE-2026-0003", "2026-08-28T15:23:00Z", score=None)
+    undated_unscored = _make_cve("CVE-2026-0004", "not-a-date", score=None)
+    scored = _make_cve("CVE-2026-0001", "2026-08-28T07:00:00Z", score=8.0)
+
+    sel = select_cve_window([undated_unscored, dated_unscored, scored])
+
+    assert sel is not None
+    assert sel.cve.cve_id == "CVE-2026-0001"
+    assert sel.fallback is True
+    assert sel.skipped_unscored == 2
+    assert sel.skipped_newest == "2026-08-28T15:23:00Z"
+    assert sel.skipped_oldest == "2026-08-28T15:23:00Z"
+
+
+def test_fallback_without_any_dated_skipped_record_has_none_bounds(monkeypatch):
+    """Unreachable through real grouping; forced via ``_group_windows``."""
+    import agent.cve_selector as selector
+
+    def fake_group(dated: list) -> list:
+        undated = [d for d in dated if d.at is None]
+        rest = [d for d in dated if d.at is not None]
+        return [undated, rest]
+
+    monkeypatch.setattr(selector, "_group_windows", fake_group)
+    undated = _make_cve("CVE-2026-0004", "not-a-date", score=None)
+    scored = _make_cve("CVE-2026-0001", "2026-08-28T07:00:00Z", score=8.0)
+
+    sel = select_cve_window([undated, scored])
+
+    assert sel is not None
+    assert sel.fallback is True
+    assert sel.skipped_newest is None
+    assert sel.skipped_oldest is None

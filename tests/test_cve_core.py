@@ -847,3 +847,113 @@ def test_fully_malformed_commits_return_discovery_failure():
     result = get_latest_cve_fact_sheet(client=_make_client(handler))
 
     assert result == cve_core._DISCOVERY_FAILED_MESSAGE
+
+
+# --- Malformed record responses and unexpected fetch errors -------------------
+
+
+def test_non_object_record_response_skipped_with_warning(caplog):
+    good = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=7.5)
+    commits = _commits_response(["CVE-2026-0001", "CVE-2026-0002"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            return httpx.Response(200, json=commits)
+        if str(req.url).endswith("CVE-2026-0002"):
+            return httpx.Response(200, json=[{"cveMetadata": {}}])
+        return httpx.Response(200, json=good)
+
+    with caplog.at_level("WARNING", logger="vektor"):
+        result = get_latest_cve_fact_sheet(client=_make_client(handler))
+
+    assert result.startswith("CVE_ID: CVE-2026-0001")
+    assert "RECORDS_RETRIEVED: 1" in result
+    assert any(
+        "CVE-2026-0002" in r.getMessage() and "not an object" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING"
+    )
+
+
+def _raising_handler(secret: str):
+    good = _make_cve("CVE-2026-0001", "2026-08-28T15:23:00Z", score=7.5)
+    commits = _commits_response(["CVE-2026-0001", "CVE-2026-0002"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api.github.com" in str(req.url):
+            return httpx.Response(200, json=commits)
+        if str(req.url).endswith("CVE-2026-0002"):
+            raise RuntimeError(secret)
+        return httpx.Response(200, json=good)
+
+    return handler
+
+
+def test_unexpected_fetch_error_before_deadline_logs_warning(caplog):
+    secret = "sensitive-body-text"
+    with caplog.at_level("DEBUG", logger="vektor"):
+        result = get_latest_cve_fact_sheet(
+            client=_make_client(_raising_handler(secret))
+        )
+
+    assert result.startswith("CVE_ID: CVE-2026-0001")
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and "Unexpected error" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "CVE-2026-0002" in warnings[0]
+    assert "RuntimeError" in warnings[0]
+    assert all(secret not in r.getMessage() for r in caplog.records)
+    assert not any("Abandoned" in r.getMessage() for r in caplog.records)
+
+
+def test_unexpected_fetch_error_after_deadline_logs_debug(caplog, monkeypatch):
+    """Past the deadline the error is an abandoned fetch: DEBUG, not WARNING.
+
+    The fake clock reads past the deadline only on fetch worker threads, so
+    the main thread's wait still blocks until every fetch has finished.
+    """
+    real_monotonic = time.monotonic
+    main = threading.main_thread()
+
+    class _FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            skew = 0.0 if threading.current_thread() is main else 1000.0
+            return real_monotonic() + skew
+
+    monkeypatch.setattr(cve_core, "time", _FakeTime)
+    deadline = real_monotonic() + 30.0
+    client = _make_client(_raising_handler("sensitive-body-text"))
+
+    with caplog.at_level("DEBUG", logger="vektor"):
+        records = cve_core._fetch_records(
+            client, ["CVE-2026-0001", "CVE-2026-0002"], deadline
+        )
+
+    assert [r["cveMetadata"]["cveId"] for r in records] == ["CVE-2026-0001"]
+    abandoned = [
+        r
+        for r in caplog.records
+        if r.levelname == "DEBUG" and "Abandoned" in r.getMessage()
+    ]
+    assert len(abandoned) == 1
+    assert "CVE-2026-0002" in abandoned[0].getMessage()
+    assert "RuntimeError" in abandoned[0].getMessage()
+    assert not any("Unexpected error" in r.getMessage() for r in caplog.records)
+
+
+def test_fallback_note_without_bounds_omits_range():
+    from agent.cve_selector import CVEInfo, CVESelection
+
+    cve = CVEInfo(
+        "CVE-2026-0001", "2026-08-28T07:00:00Z", 8.0, "HIGH", None, None, None, None
+    )
+    note = cve_core._fallback_note(
+        CVESelection(cve=cve, fallback=True, skipped_unscored=2)
+    )
+
+    assert note.startswith("FALLBACK_NOTE: the newest 2 CVE(s) have no CVSS score yet")
+    assert "None" not in note

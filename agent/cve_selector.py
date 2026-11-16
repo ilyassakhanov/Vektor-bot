@@ -20,6 +20,12 @@ Algorithm:
    the raw timestamp strings.
 6. Return None only if no record at all has CVSS data.
 
+Malformed records never raise: a record that is not an object, or whose
+structure breaks extraction, is skipped with a warning; nested values of the
+wrong type (``cveMetadata``/``containers``/``cna`` not objects, ``adp``/
+``descriptions``/``affected`` not lists) are treated as empty; and a
+non-numeric or non-finite ``baseScore`` counts as unscored.
+
 When newer windows were skipped because they were unscored, the selection is
 a *fallback*; :func:`select_cve_window` reports how many records were skipped
 and their publication range so callers can say so transparently.
@@ -28,6 +34,7 @@ and their publication range so callers can say so transparently.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -91,12 +98,25 @@ class _Dated:
 def select_cve_window(records: list[dict[str, Any]]) -> CVESelection | None:
     """Select the highest-scoring CVE from the newest window with CVSS data.
 
-    Returns None if no record has CVSS data.
+    Returns None if no record has CVSS data. Malformed records are skipped
+    with a warning (index and exception type only) and never raise; if every
+    record is malformed, None is returned.
     """
     if not records:
         return None
 
-    infos = [_extract_cve_info(r) for r in records]
+    infos: list[CVEInfo] = []
+    for i, record in enumerate(records):
+        if not isinstance(record, dict):
+            log.warning("Skipping malformed CVE record #%d", i)
+            continue
+        try:
+            infos.append(_extract_cve_info(record))
+        except (AttributeError, TypeError, ValueError, KeyError, IndexError) as exc:
+            log.warning("Skipping malformed CVE record #%d: %s", i, type(exc).__name__)
+            continue
+    if not infos:
+        return None
     # Each timestamp is parsed once; grouping, tie-break and the skipped range
     # all reuse the same instant.
     dated = [_Dated(info, _parse_ts(info.date_published)) for info in infos]
@@ -129,6 +149,10 @@ def select_cve_window(records: list[dict[str, Any]]) -> CVESelection | None:
         )
         if not skipped:
             return CVESelection(cve=winner)
+        # Invariant: undated records only ever join window 1, and window 1
+        # always holds a dated record when any record is dated, so every
+        # skipped window has at least one dated record and ``stamped`` is
+        # non-empty here. The ``None`` bounds are a defensive fallback only.
         stamped = sorted(
             (d for d in skipped if d.at is not None),
             key=lambda d: d.at or _OLDEST,
@@ -137,8 +161,8 @@ def select_cve_window(records: list[dict[str, Any]]) -> CVESelection | None:
             cve=winner,
             fallback=True,
             skipped_unscored=len(skipped),
-            skipped_newest=stamped[-1].cve.date_published,
-            skipped_oldest=stamped[0].cve.date_published,
+            skipped_newest=stamped[-1].cve.date_published if stamped else None,
+            skipped_oldest=stamped[0].cve.date_published if stamped else None,
         )
 
     log.info("No CVEs with CVSS data in any window")
@@ -194,13 +218,21 @@ def _group_windows(cves: list[_Dated]) -> list[list[_Dated]]:
 
 def _extract_cve_info(record: dict[str, Any]) -> CVEInfo:
     """Extract normalised CVEInfo from a raw CVE record dict."""
-    meta = record.get("cveMetadata") or {}
+    meta = record.get("cveMetadata")
+    if not isinstance(meta, dict):
+        meta = {}
     cve_id = str(meta.get("cveId") or "")
     date_published = str(meta.get("datePublished") or meta.get("dateUpdated") or "")
 
-    containers = record.get("containers") or {}
-    cna = containers.get("cna") or {}
-    adp = containers.get("adp") or []
+    containers = record.get("containers")
+    if not isinstance(containers, dict):
+        containers = {}
+    cna = containers.get("cna")
+    if not isinstance(cna, dict):
+        cna = {}
+    adp = containers.get("adp")
+    if not isinstance(adp, list):
+        adp = []
 
     description = _extract_description(cna)
     vendor, product = _extract_affected(cna)
@@ -219,7 +251,9 @@ def _extract_cve_info(record: dict[str, Any]) -> CVEInfo:
 
 
 def _extract_description(cna: dict[str, Any]) -> str | None:
-    descriptions = cna.get("descriptions") or []
+    descriptions = cna.get("descriptions")
+    if not isinstance(descriptions, list):
+        return None
     for d in descriptions:
         if isinstance(d, dict) and d.get("lang") == "en":
             return str(d.get("value") or "")
@@ -229,7 +263,9 @@ def _extract_description(cna: dict[str, Any]) -> str | None:
 
 
 def _extract_affected(cna: dict[str, Any]) -> tuple[str | None, str | None]:
-    affected = cna.get("affected") or []
+    affected = cna.get("affected")
+    if not isinstance(affected, list):
+        return None, None
     if affected and isinstance(affected[0], dict):
         a = affected[0]
         return (
@@ -243,33 +279,50 @@ def _extract_cvss(
     cna: dict[str, Any], adp: list[Any]
 ) -> tuple[float | None, str | None, str | None]:
     """Extract CVSS score/severity/vector, preferring CNA over ADP."""
-    score, severity, vector = _extract_cvss_from_metrics(cna.get("metrics") or [])
+    score, severity, vector = _extract_cvss_from_metrics(cna.get("metrics"))
     if score is not None:
         return score, severity, vector
 
     for adp_container in adp:
         if isinstance(adp_container, dict):
-            s, sev, vec = _extract_cvss_from_metrics(adp_container.get("metrics") or [])
+            s, sev, vec = _extract_cvss_from_metrics(adp_container.get("metrics"))
             if s is not None:
                 return s, sev, vec
     return None, None, None
 
 
 def _extract_cvss_from_metrics(
-    metrics: list[Any],
+    metrics: Any,
 ) -> tuple[float | None, str | None, str | None]:
-    """Extract CVSS from a metrics list, checking cvssV3_1, cvssV3_0, cvssV4_0."""
+    """Extract CVSS from a metrics list, checking cvssV3_1, cvssV3_0, cvssV4_0.
+
+    A non-list ``metrics`` is treated as empty; a non-numeric or non-finite
+    ``baseScore`` is skipped and the search continues (it counts as unscored).
+    """
+    if not isinstance(metrics, list):
+        return None, None, None
     for m in metrics:
         if not isinstance(m, dict):
             continue
         for key in ("cvssV3_1", "cvssV3_0", "cvssV4_0", "cvssV2_0"):
             cvss = m.get(key)
             if isinstance(cvss, dict):
-                score = cvss.get("baseScore")
+                score = _parse_score(cvss.get("baseScore"))
                 if score is not None:
                     return (
-                        float(score),
+                        score,
                         str(cvss.get("baseSeverity") or "") or None,
                         str(cvss.get("vectorString") or "") or None,
                     )
     return None, None, None
+
+
+def _parse_score(value: Any) -> float | None:
+    """A finite numeric baseScore as float; anything else (e.g. "N/A", nan) → None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None

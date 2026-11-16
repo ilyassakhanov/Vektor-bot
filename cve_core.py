@@ -265,13 +265,27 @@ def _fetch_records(
         try:
             resp = client.get(url, timeout=timeout)
             resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
-            return data
+            data = resp.json()
+            if not isinstance(data, dict):
+                log.warning("CVE record %s response is not an object", cve_id)
+                return None
+            record: dict[str, Any] = data
+            return record
         except (httpx.HTTPError, ValueError) as exc:
             log.warning("Failed to fetch CVE record %s: %s", cve_id, exc)
             return None
         except Exception as exc:  # noqa: BLE001 — e.g. client closed after the deadline
-            log.debug("Abandoned CVE record fetch %s: %s", cve_id, type(exc).__name__)
+            if time.monotonic() >= deadline:
+                log.debug(
+                    "Abandoned CVE record fetch %s: %s", cve_id, type(exc).__name__
+                )
+            else:
+                # Type name only: the message text may echo response content.
+                log.warning(
+                    "Unexpected error fetching CVE record %s: %s",
+                    cve_id,
+                    type(exc).__name__,
+                )
             return None
 
     if not cve_ids:
@@ -332,12 +346,14 @@ def _format_cve(selection: CVESelection, total_retrieved: int) -> str:
 def _fallback_note(selection: CVESelection) -> str:
     """Describe the skipped unscored windows in one line."""
     newest, oldest = selection.skipped_newest, selection.skipped_oldest
-    if newest == oldest:
-        when = f"published {newest}"
+    if newest is None or oldest is None:
+        when = ""  # no dated skipped record: omit the range
+    elif newest == oldest:
+        when = f" (published {newest})"
     else:
-        when = f"published {oldest} to {newest}"
+        when = f" (published {oldest} to {newest})"
     return (
-        f"FALLBACK_NOTE: the newest {selection.skipped_unscored} CVE(s) "
-        f"({when}) have no CVSS score yet; showing the most critical CVE "
+        f"FALLBACK_NOTE: the newest {selection.skipped_unscored} CVE(s)"
+        f"{when} have no CVSS score yet; showing the most critical CVE "
         "from the latest scored window."
     )
